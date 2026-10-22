@@ -1,0 +1,66 @@
+{
+ "date": "2026-10-23",
+ "what": "Qwen3.8 + XTier on SGLang main, 512K context, FP8 KV (SGLang QSA has no NVFP4 KV), chunked prefill 16384, MTP; speed_points.py of the production baselines (500K point with --exact)",
+ "rows": [
+  {
+   "target": 4096,
+   "prompt_tokens": 4109,
+   "completion_tokens": 1024,
+   "ttft_s": 1.48,
+   "prefill_tok_s": 2778,
+   "decode_tok_s": 230.7,
+   "accept_length": 3.22,
+   "recall": true,
+   "vram_peak_mib": 66080,
+   "error": null
+  },
+  {
+   "target": 32768,
+   "prompt_tokens": 33265,
+   "completion_tokens": 1024,
+   "ttft_s": 8.69,
+   "prefill_tok_s": 3828,
+   "decode_tok_s": 187.2,
+   "accept_length": 2.89,
+   "recall": true,
+   "vram_peak_mib": 71236,
+   "error": null
+  },
+  {
+   "target": 131072,
+   "prompt_tokens": 134941,
+   "completion_tokens": 1024,
+   "ttft_s": 26.96,
+   "prefill_tok_s": 5004,
+   "decode_tok_s": 185.0,
+   "accept_length": 2.79,
+   "recall": true,
+   "vram_peak_mib": 71260,
+   "error": null
+  },
+  {
+   "target": 240000,
+   "prompt_tokens": 252609,
+   "completion_tokens": 1024,
+   "ttft_s": 53.11,
+   "prefill_tok_s": 4756,
+   "decode_tok_s": 172.2,
+   "accept_length": 2.72,
+   "recall": true,
+   "vram_peak_mib": 71264,
+   "error": null
+  },
+  {
+   "target": 500000,
+   "prompt_tokens": 499966,
+   "completion_tokens": 1024,
+   "ttft_s": 123.84,
+   "prefill_tok_s": 4037,
+   "decode_tok_s": 212.3,
+   "accept_length": 2.78,
+   "recall": true,
+   "vram_peak_mib": 71266,
+   "error": null
+  }
+ ]
+}
