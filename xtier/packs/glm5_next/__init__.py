@@ -8,6 +8,9 @@
 - DSA attention on SM120: SGLang's FlashInfer sparse MLA backend (the SM120 path; the default TRT-LLM MLA kernels are
   SM100 only) accepts only the GLM-5 DSA architectures. GLM-5.3 Flash (``Glm5NextForConditionalGeneration`` and its
   NextN draft) uses the same DSA attention and passes the check as GLM-5.
+- NextN draft quantization: ``DeepseekModelNextN.__init__`` drops a ``modelopt_fp4`` quantization config (DeepSeek
+  NVFP4 checkpoints keep their NextN layer in BF16), but GLM-5.3's NextN experts are NVFP4: built as BF16, loading
+  fails on the packed tensors. For a GLM-5.3 draft the check does not fire (the config keeps its methods).
 """
 
 EXCLUDED = 'sglang.srt.layers.quantization.modelopt_quant.ModelOptQuantConfig.is_layer_excluded'
@@ -31,6 +34,25 @@ def _is_layer_excluded(original, self, prefix, *args, **kwargs):
     return bool(parts and head) and all(original(self, f'{head}.{p}', *args, **kwargs) for p in parts)
 
 
+NEXTN_MODEL = 'sglang.srt.models.deepseek_nextn.DeepseekModelNextN.__init__'
+
+
+def _is_glm5_next(config):
+    archs = ' '.join(getattr(config, 'architectures', None) or [])
+    return 'Glm5Next' in archs or str(getattr(config, 'model_type', '')).startswith('glm5_next')
+
+
+def _nextn_model_init(original, self, config, quant_config=None, *args, **kwargs):
+    if quant_config is None or quant_config.get_name() != 'modelopt_fp4' or not _is_glm5_next(config):
+        return original(self, config, quant_config, *args, **kwargs)
+    quant_config.get_name = lambda: 'modelopt_fp4 (GLM-5.3 NextN)'   # shadows the method while the draft is built
+    try:
+        return original(self, config, quant_config, *args, **kwargs)
+    finally:
+        del quant_config.get_name
+
+
 def install(registry, hook_type):
     registry.register(EXCLUDED, _is_layer_excluded, hook_type.AROUND)
     registry.register(SPARSE_MLA, _validate_sparse_mla, hook_type.AROUND)
+    registry.register(NEXTN_MODEL, _nextn_model_init, hook_type.AROUND)
