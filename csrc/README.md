@@ -9,6 +9,7 @@ The CPU expert engine and the CPU-GPU mailbox, ported from lkqmoe 0.5.6 (commit 
 | `engine/dispatch.cpp` | `libxtier_engine.so`: exports the API and loads the AVX512 or AVX2 build next to it on first use (`XTIER_ISA=avx512\|avx2` forces one). |
 | `mailbox/mailbox.cpp` | `libxtier_mailbox.so`: mapped host mailboxes polled by one dispatcher thread, stream memory operations instead of host callbacks (CUDA-graph capturable), and the expert-pool command ring with its policy thread. |
 | `include/xtier_engine.h`, `include/xtier_mailbox.h` | C APIs. |
+| `engram/rows.cpp` | `libxtier_engram.so`: DeepSeek V4.1 Engram rows on NVMe (O_DIRECT / AIO reads, bounded row cache, preloaded scales, TP row range), ported from the 1017 pipeline by [tools/port_engram.py](../tools/port_engram.py); its lookup calls no CUDA API. |
 
 Build: `tools/build_engine.sh [CUDA_ROOT]` (CMake; the AVX512 build uses the one-row Down microkernel, `XTIER_AVX512_DOWN_R4=1`,
 like the lkqmoe release). Check: `tests/engine_ab.py` (one real layer, output digests and timings).

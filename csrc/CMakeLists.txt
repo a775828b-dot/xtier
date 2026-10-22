@@ -49,3 +49,10 @@ if(XTIER_CUDA_ROOT)
   target_link_libraries(xtier_mailbox PRIVATE xtier_engine ${XTIER_CUDART} ${XTIER_CUDA_DRIVER} Threads::Threads)
   set_target_properties(xtier_mailbox PROPERTIES BUILD_RPATH "$ORIGIN;${XTIER_CUDA_ROOT}/lib")
 endif()
+
+# Engram rows on NVMe (DeepSeek V4.1, packs/deepseek_v4): exact FP8 row retrieval with O_DIRECT / AIO and a bounded row
+# cache; its lookup calls no CUDA API (a cudaLaunchHostFunc node).
+add_library(xtier_engram SHARED engram/rows.cpp)
+target_compile_features(xtier_engram PRIVATE cxx_std_17)
+target_compile_options(xtier_engram PRIVATE -O2)
+target_link_libraries(xtier_engram PRIVATE Threads::Threads)

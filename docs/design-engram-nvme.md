@@ -1,6 +1,6 @@
 # 设计：DeepSeek V4.1 的 Engram 行放在 NVMe（`packs/deepseek_v4`）
 
-状态：设计（2026-10-23），未实现。DeepSeek V4.1 1017 在官方 main 上跑通的前置条件。
+状态（2026-10-23）：行存储已移植（`csrc/engram/rows.cpp`、`xtier/packs/deepseek_v4/rows.py`），`tests/engram_rows_check.py` 在第 1、14 层（各约 3.84 亿行）整表和 TP 分片下与直接读文件逐字节一致；钩子（方案第 2 步）未做。DeepSeek V4.1 1017 在官方 main 上跑通的前置条件。
 
 ## 为什么
 
