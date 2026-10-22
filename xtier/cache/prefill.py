@@ -81,8 +81,6 @@ def resident_prefill(prefill, arena, x, ids, weights):
     H, I, E = prefill.hidden, prefill.inter, prefill.experts
     g13, g2 = prefill._globals()
     fixed_bm = _env_int('XTIER_CACHE_PREFILL_TILE_M', 0)
-    gbn, dbn = _env_int('XTIER_CACHE_PREFILL_GATE_BN', 32), _env_int('XTIER_CACHE_PREFILL_DOWN_BN', 64)
-    gw, dw = _env_int('XTIER_CACHE_PREFILL_GATE_WARPS', 4), _env_int('XTIER_CACHE_PREFILL_DOWN_WARPS', 4)
     bkh, bki = _tile_k(H), _tile_k(I)
     block = _env_int('XTIER_GPU_PREFILL_CHUNK', 8192)
     m, k = ids.shape
@@ -92,6 +90,15 @@ def resident_prefill(prefill, arena, x, ids, weights):
         # tiles of 32 routes while experts get few routes, 64 once they average 48 or more (Qwen3.8: from ~2.5K
         # tokens): fewer FP4 decodes per weight and better MMA use; 128 spills registers
         bm = fixed_bm or (64 if size * k >= 48 * E else 32)
+        # launch shapes per regime (Qwen3.8 layer, 2026-10-23 sweep; outputs bitwise unchanged): few routes per expert
+        # favour wide gate tiles, many routes deeper gate pipelines and wide down tiles
+        small = bm == 32
+        gbn = _env_int('XTIER_CACHE_PREFILL_GATE_BN', 64 if small else 32)
+        gw = _env_int('XTIER_CACHE_PREFILL_GATE_WARPS', 8 if small else 4)
+        gs = _env_int('XTIER_CACHE_PREFILL_GATE_STAGES', 2 if small else 3)
+        dbn = _env_int('XTIER_CACHE_PREFILL_DOWN_BN', 64 if small else 128)
+        dw = _env_int('XTIER_CACHE_PREFILL_DOWN_WARPS', 4 if small else 8)
+        ds = _env_int('XTIER_CACHE_PREFILL_DOWN_STAGES', 2)
         di = ids[start:start + size].reshape(-1)
         counts = torch.bincount(di, minlength=E)
         host = torch.cat([counts, di.min()[None], di.max()[None]]).cpu().tolist()
@@ -110,9 +117,9 @@ def resident_prefill(prefill, arena, x, ids, weights):
         nt = len(tiles)
         _gate_up_tiles[(nt, I // gbn)](x[start:start + size], order, meta[0], meta[1], meta[2], arena[0], arena[2], g13,
                                        mid, k, H, I, prefill.swiglu_limit, bm, gbn, bkh, MX=prefill.mxfp4,
-                                       num_warps=gw, num_stages=2)
+                                       num_warps=gw, num_stages=gs)
         _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], arena[1], arena[3], g2, routes, H, I, bm,
-                                    dbn, bki, MX=prefill.mxfp4, num_warps=dw, num_stages=2)
+                                    dbn, bki, MX=prefill.mxfp4, num_warps=dw, num_stages=ds)
         # M of _reduce is unused by the kernel body: a fixed value keeps one compiled variant for every length
         _reduce[(size, triton.cdiv(H, 256))](routes, weights[start:start + size], out[start:start + size], 1, k,
                                              256, H)
