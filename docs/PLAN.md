@@ -96,3 +96,4 @@ SGLang 官方 main（固定到验收通过的提交号，每周同步）
 - 2026-10-22：确定架构、名字（XTier）和本计划；仓库公开；开始第 0 步。
 - 2026-10-22 晚：0.1 盘点 v1（[docs/inventory.md](inventory.md)）、0.2 基线（`bench/baselines/`）完成；0.3 官方 main 环境安装中。
 - 2026-10-23：第 1 步 CPU 引擎迁入 `csrc/`（改名移植，删掉旧兼容入口）、Python 绑定 `xtier/engine`、构建脚本；三个模型的真实单层在 AVX512 和 AVX2 下都与 0.5.6 逐位一致（`bench/results/engine-ab-20261023.json`）。
+- 2026-10-23 凌晨：第 2 步进行中。后端（`xtier/backend`）接管官方 `FusedMoE`：插件钩住官方 KTransformers 混合推理的入口（`create_kt_config_from_server_args` / `KTEPWrapperMethod`），专家权重按检查点自己的量化方法的布局建在主机内存，每层一加载完就交给 CPU 引擎并原地释放；解码走信箱（CUDA 图可捕获），prefill 移植 0.5.6 的 GPU 分组 GEMM。Qwen3.8 在官方 main 8cd3c494 上 48 层全走 CPU 引擎：PPL 3.4659（13 段 × 4K，生产 3.4779），生成正确。全局热专家缓存（`xtier/cache`，每层槽数可不同，全部常驻的层不经 CPU）单层验证通过。顺带修了官方 main 在这台机器上的三个问题：PLE 锁页表在 NPS4 上分配不了（`packs/qwen4_exp`）、TileLang 在装了 ROCm 的 CUDA 机器上选错目标（`xtier/platform.py`）、transformers 5.19 读不了这个检查点的分词器（另存带 tokenizer.json 的分词器，用 `--tokenizer-path`）。
