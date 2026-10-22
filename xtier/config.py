@@ -73,6 +73,12 @@ def gpu_prefill_min() -> int:
     return _int('XTIER_GPU_PREFILL_MIN', 1024)
 
 
+def hybrid_prefill_max() -> int:
+    """XTIER_HYBRID_PREFILL_MAX=2560: prefill calls of a partly cached layer below this many tokens run their cached
+    routes on the GPU and the others on the CPU at the same time (0: off; above it the GPU prefill uploads the layer)."""
+    return _int('XTIER_HYBRID_PREFILL_MAX', 2560)
+
+
 def resident_prefill() -> bool:
     """XTIER_CACHE_PREFILL=packed (default): a fully cached layer's prefill runs on the packed slots in place;
     staged: through the GPU prefill's staging and BF16 unpack, like a host layer."""

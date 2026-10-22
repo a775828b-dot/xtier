@@ -11,9 +11,12 @@ Forward, per call of m tokens:
 - m <= XTIER_DECODE_MAX (and always inside CUDA-graph capture): through the mailbox, in slots of up to 8 tokens.
   A packing kernel stores the inputs into the slot's mapped pinned memory, stream memory operations hand the request
   to the CPU dispatcher and wait for it, an unpacking kernel reads the FP32 output. Capturable, no host sync.
-- prefill of at least XTIER_GPU_PREFILL_MIN tokens: on the GPU (backend/prefill.py: expert chunks uploaded from the
-  engine's pinned shards, grouped BF16 GEMMs, FP32 route sums);
-- other prefill: synchronously on the CPU in batches of XTIER_CPU_PREFILL_BATCH tokens.
+- prefill of a fully cached layer: on its slots in place (cache/prefill.py);
+- prefill of a partly cached layer below XTIER_HYBRID_PREFILL_MAX tokens: cached routes on the GPU, the others on the
+  CPU at the same time (cache/prefill.py, hybrid_prefill);
+- other prefill of at least XTIER_GPU_PREFILL_MIN tokens: on the GPU (backend/prefill.py: expert chunks uploaded
+  from the engine's pinned shards, grouped BF16 GEMMs, FP32 route sums);
+- the rest: synchronously on the CPU in batches of XTIER_CPU_PREFILL_BATCH tokens.
 Numerics are the engine's or the GPU prefill's (BF16 operands, FP32 accumulation); the output is rounded to the
 input dtype.
 """
@@ -58,7 +61,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self.plan = None
         self.prefill = None
         self.mailbox = None
-        self.calls = dict(decode=0, cpu_prefill=0, gpu_prefill=0)
+        self.calls = dict(decode=0, cpu_prefill=0, gpu_prefill=0, hybrid_prefill=0)
 
     # -- construction ---------------------------------------------------------------------------------------------
     def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype,
@@ -208,6 +211,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
             from xtier.cache.prefill import resident_prefill
             out = resident_prefill(self.prefill, self.pool.arena, x, ids, weights)
             self.calls['gpu_prefill'] += 1
+        elif self.pool is not None and not self.pool.full and m < config.hybrid_prefill_max():
+            from xtier.cache.prefill import hybrid_prefill
+            self._cache_start()
+            out = hybrid_prefill(self.pool, self.plan, x, ids, weights, config.cpu_prefill_batch())
+            self.calls['hybrid_prefill'] += 1
         elif 0 < config.gpu_prefill_min() <= m or (self.pool is not None and self.pool.full):
             self._cache_start()
             out = torch.empty_like(x)
