@@ -45,8 +45,39 @@ class ModelOptNvFp4(Format):
                 layer.w2_weight_scale_2.data.float().contiguous())
 
 
+def _ue8m0_bytes(t: torch.Tensor) -> torch.Tensor:
+    """UE8M0 block scales as bytes: SGLang keeps them as float32 powers of two (float8_e8m0fnu with aiter / XPU); the
+    exponent field of a float32 2^(e-127) is e, including 2^-127 (exponent field 0)."""
+    if t.dtype == torch.uint8:
+        return t.contiguous()
+    if t.dtype == torch.float8_e8m0fnu:
+        return t.view(torch.uint8).contiguous()
+    if t.dtype == torch.float32:
+        bits = t.contiguous().view(torch.int32)
+        if bool(((bits & 0x7FFFFF) != 0).logical_and((bits >> 23) != 0).any()):
+            raise ValueError('xtier: an MXFP4 block scale is not a power of two')
+        return ((bits >> 23) & 0xFF).to(torch.uint8)
+    raise TypeError(f'xtier: MXFP4 block scales of dtype {t.dtype}')
+
+
+class Fp8Fp4Experts(Format):
+    """DeepSeek V4 MXFP4 experts (quantization config fp8, expert_dtype fp4): E2M1 weights, UE8M0 scales per 32, no
+    global scales."""
+    name = 'mxfp4'
+    required = {'w13_weight': 'w13', 'w2_weight': 'w2', 'w13_weight_scale_inv': 'w13', 'w2_weight_scale_inv': 'w2'}
+
+    def engine_inputs(self, layer, up_first):
+        E = layer.w13_weight.data.shape[0]
+        return (_gate_up(layer.w13_weight.data.view(torch.uint8), up_first), layer.w2_weight.data.view(torch.uint8).contiguous(),
+                _gate_up(_ue8m0_bytes(layer.w13_weight_scale_inv.data), up_first),
+                _ue8m0_bytes(layer.w2_weight_scale_inv.data), torch.ones((E, 2), dtype=torch.float32),
+                torch.ones((E,), dtype=torch.float32))
+
+
 def detect(gpu_method) -> Format:
     name = type(gpu_method).__name__
     if name == 'ModelOptNvFp4FusedMoEMethod':
         return ModelOptNvFp4()
+    if name == 'Fp8MoEMethod' and getattr(gpu_method, 'is_fp4_expert', False):
+        return Fp8Fp4Experts()
     raise NotImplementedError(f'xtier: no CPU engine format for the MoE method {name}')
