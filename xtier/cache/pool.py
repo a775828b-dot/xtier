@@ -303,6 +303,7 @@ class LayerPool:
         self.used = torch.empty(max(self.S, 1), dtype=torch.int32, device=dev)
         self.rank = torch.empty(max(self.S, 1), dtype=torch.int32, device=dev)
         self.resident = [-1] * self.S
+        self.filled = False
         self.scratch = _scratch(H, I, dev)
         self.globals = None
         self._pool_on = False
@@ -328,6 +329,7 @@ class LayerPool:
             self.table.copy_(table, non_blocking=False); self.owner.copy_(owner, non_blocking=False)
         stream.synchronize()
         self.resident = experts + [-1] * (self.S - len(experts))
+        self.filled = True
         return len(experts)
 
     def _kernels(self, m, k, x, routing, gout):
@@ -403,20 +405,25 @@ def maybe_start():
                 'min gain %s', every, budget, decay, gain)
 
 
-_filled = [False]
-
-
 def fill_all():
-    """Once, outside capture, after the shards are pinned: load every layer's slots (profile order, or all experts)."""
-    if _filled[0] or not LayerPool.layers:
+    """Outside capture, after the shards are pinned: load the slots of every layer not filled yet (profile order, or
+    every expert). The partly cached layers of the first call get the adaptive policy (a speculative draft, loaded
+    later, is fully cached)."""
+    todo = [p for p in LayerPool.layers if not p.filled]
+    if not todo:
         return
-    _filled[0] = True
     t0 = time.time()
     stream = torch.cuda.Stream()
     n = 0
-    for pool in LayerPool.layers:
+    for pool in todo:
         n += pool.fill(Profile.ranking(pool.layer_id, pool.E), stream)
-    partial = [p for p in LayerPool.layers if not p.full]
+    partial = [p for p in todo if not p.full]
+    if partial and _glob.get('prepared'):
+        logger.warning('xtier cache: %d partly cached layers added after the adaptive policy started keep their '
+                       'initial residency', len(partial))
+        partial = []
+    if partial:
+        _glob['prepared'] = True
     if os.environ.get('XTIER_CACHE_ADAPT', '1') != '0' and partial:
         every, budget = int(os.environ.get('XTIER_CACHE_EVERY', '4')), int(os.environ.get('XTIER_CACHE_SWAPS', '16'))
         decay, gain = float(os.environ.get('XTIER_CACHE_DECAY', '0.7')), float(os.environ.get('XTIER_CACHE_MIN_GAIN', '1.5'))
@@ -428,8 +435,8 @@ def fill_all():
                                              C.cast(arena, C.c_void_p), C.cast(res, C.c_void_p)) < 0:
                 raise RuntimeError(pool.mailbox.error())
         _glob['adapt'] = (lib, every, budget, decay, gain)
-    gib = sum(p.bytes() for p in LayerPool.layers) / 2**30
-    full = [p.layer_id for p in LayerPool.layers if p.full]
+    gib = sum(p.bytes() for p in todo) / 2**30
+    full = [p.layer_id for p in todo if p.full]
     logger.info('xtier cache: %d layers (%d with every expert: %s), %.1f GiB, %d experts loaded from %s in %.1f s',
-                len(LayerPool.layers), len(full), full, gib, n, os.environ.get('XTIER_CACHE_PROFILE') or '(no profile)',
+                len(todo), len(full), full, gib, n, os.environ.get('XTIER_CACHE_PROFILE') or '(no profile)',
                 time.time() - t0)

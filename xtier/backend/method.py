@@ -48,7 +48,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
     layers = []          # every XTier layer of the process, in creation order
     _decode_out = {}     # hidden size -> FP32 decode output [DECODE_ROWS, H], shared (layers run one after another)
     _localized = False
-    _registered = False
+    _registered = 0      # layers whose shards are pinned and caches filled
 
     def __init__(self, gpu_method, layer_config: LayerConfig):
         self.gpu_method = gpu_method
@@ -147,7 +147,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if slots > 0:   # allocated now, so the KV cache is sized after it
             from xtier.cache.pool import LayerPool
             self.pool = LayerPool(self.prefill, slots, self.plan, self.mailbox, self.cfg.layer_id)
-            if self.pool.full:   # the prefill reads the experts from the slots instead of host memory
+            if self.pool.full:   # a staged prefill reads the experts from the slots instead of host memory
                 self.prefill._upload_chunk = self._upload_from_cache
         self.plan.pool = self.pool   # read by the prefill (residency of the FP4 path)
         for name in self.format.required:
@@ -164,8 +164,10 @@ class XTierMoEMethod(FusedMoEMethodBase):
             self._hand_off(layer)
 
     def _upload_from_cache(self, slot, e0, e1, stream, up_first=False):
-        """Prefill staging of a layer whose experts are all in the cache: device copies of slots e0..e1 (filled in
-        expert order, never swapped), bytes unchanged."""
+        """Staged prefill of a fully cached layer (XTIER_CACHE_PREFILL=staged): device copies of slots e0..e1 (filled
+        in expert order, never swapped), bytes unchanged. Partly cached layers upload whole chunks from host memory:
+        skipping their cached experts would cut every chunk into short runs of 48 copies each (8 NUMA shards x 6
+        tensors)."""
         if up_first:
             raise NotImplementedError('xtier: FP4 prefill of a fully cached layer')
         with torch.cuda.stream(torch.cuda.ExternalStream(stream)):
@@ -192,11 +194,19 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if not 1 <= k <= MAX_TOP_K:
             raise ValueError(f'xtier: top-k {k} not supported')
         capturing = torch.cuda.is_current_stream_capturing()
-        if not capturing and not XTierMoEMethod._registered:
+        if not capturing and XTierMoEMethod._registered < len(XTierMoEMethod.layers):
             XTierMoEMethod._register_all()
+        timed = config.timing() and not capturing and m > config.decode_max()
+        if timed:
+            torch.cuda.current_stream().synchronize()
+            t0 = time.perf_counter()
         if m <= config.decode_max() or capturing:
             out = self._decode(x, ids, weights, m, k)
             self.calls['decode'] += 1
+        elif self.pool is not None and self.pool.full and config.resident_prefill():
+            from xtier.cache.prefill import resident_prefill
+            out = resident_prefill(self.prefill, self.pool.arena, x, ids, weights)
+            self.calls['gpu_prefill'] += 1
         elif 0 < config.gpu_prefill_min() <= m or (self.pool is not None and self.pool.full):
             self._cache_start()
             out = torch.empty_like(x)
@@ -207,6 +217,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
             self._cache_start()
             out = self._cpu_prefill(x, ids, weights, m, k)
             self.calls['cpu_prefill'] += 1
+        if timed:
+            torch.cuda.current_stream().synchronize()
+            self._time(m, time.perf_counter() - t0)
         out = out.to(x.dtype)
         rsf = layer.moe_runner_config.routed_scaling_factor
         if rsf is not None and rsf != 1.0 and not layer.should_fuse_routed_scaling_factor_in_topk:
@@ -216,7 +229,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
     def _decode(self, x, ids, weights, m, k):
         H = self.hidden
         if m > DECODE_ROWS:
-            raise ValueError(f'xtier: {m} tokens exceed the decode buffer ({DECODE_ROWS}); lower XTIER_DECODE_MAX')
+            raise ValueError(f'xtier: a {m}-token call on the decode path (decode buffer: {DECODE_ROWS} tokens); prefill '
+                             'cannot be captured in a CUDA graph (--cuda-graph-backend-prefill disabled), and '
+                             'XTIER_DECODE_MAX must stay below the buffer')
         out = XTierMoEMethod._decode_out.get(H)
         if out is None:
             out = XTierMoEMethod._decode_out[H] = torch.empty((DECODE_ROWS, H), dtype=torch.float32, device=x.device)
@@ -265,17 +280,18 @@ class XTierMoEMethod(FusedMoEMethodBase):
 
     @classmethod
     def _register_all(cls):
-        """Once, at the first MoE call outside graph capture (SGLang's warm-up request): pin every layer's shards for
-        the GPU prefill upload, so the first user prompt does not pay for it. Pinning is not allowed during capture
-        and must follow the NUMA localize (pinned pages cannot migrate)."""
-        cls._registered = True
-        cached = any(method.pool is not None for method in cls.layers)
+        """At the first MoE call outside graph capture after layers were added (SGLang's warm-up runs; a speculative
+        draft loads after the target model): pin the new layers' shards for the GPU prefill upload, so the first user
+        prompt does not pay for it, and fill their expert caches. Pinning is not allowed during capture and must
+        follow the NUMA localize (pinned pages cannot migrate)."""
+        new, cls._registered = cls.layers[cls._registered:], len(cls.layers)
+        cached = any(method.pool is not None for method in new)
         if not config.gpu_prefill_min() and not cached:
             return
         t0 = time.perf_counter()
-        for method in cls.layers:
+        for method in new:
             method.prefill.ensure_registered()
-        logger.info('xtier: pinned the shards of %d layers for GPU prefill in %.1f s', len(cls.layers),
+        logger.info('xtier: pinned the shards of %d layers for GPU prefill in %.1f s', len(new),
                     time.perf_counter() - t0)
         if cached:
             from xtier.cache import pool
@@ -286,6 +302,19 @@ class XTierMoEMethod(FusedMoEMethodBase):
         """At a prefill: start the cache's adaptive policy once the decode graphs exist."""
         from xtier.cache import pool
         pool.maybe_start()
+
+    _timing = {}
+
+    def _time(self, m, seconds):
+        """XTIER_TIMING=1: prefill MoE time per kind of layer, logged once per forward (at the last layer)."""
+        kind = 'cpu' if self.pool is None else 'full' if self.pool.full else 'cached'
+        t = XTierMoEMethod._timing.setdefault(kind, [0, 0.0])
+        t[0] += 1
+        t[1] += seconds
+        if self is XTierMoEMethod.layers[-1] or self.cfg.layer_id == max(x.cfg.layer_id for x in XTierMoEMethod.layers):
+            logger.info('xtier timing: %d tokens: %s', m, ', '.join(f'{k} {n} layers {s * 1e3:.1f} ms'
+                                                                    for k, (n, s) in XTierMoEMethod._timing.items()))
+            XTierMoEMethod._timing = {}
 
     def stats(self):
         return dict(layer=self.cfg.layer_id, **self.calls)

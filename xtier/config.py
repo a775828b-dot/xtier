@@ -2,7 +2,7 @@
 
   XTIER=1                    master switch (off: the plugin registers nothing)
   XTIER_LAYERS=all|0-11,20   model layers whose routed experts XTier runs (default all MoE layers of the target model)
-  XTIER_DRAFT=0              1: also take the MoE layers of a speculative draft model
+  XTIER_DRAFT=0              1: also take the MoE layers of a speculative draft model (every expert on the GPU)
   XTIER_THREADS=64           CPU expert workers (a multiple of the NUMA node count)
   XTIER_MAIN_CPUS=auto|list  CPUs of every other thread of the process (auto: all but the expert workers and the
                              mailbox dispatcher); unset: unchanged
@@ -10,8 +10,9 @@
   XTIER_DECODE_MAX=64        calls of up to this many tokens use the mailbox (CUDA-graph capturable); larger ones
                              are prefill
   XTIER_CPU_PREFILL_BATCH=1024  tokens per synchronous CPU engine call in prefill
-  XTIER_GPU_PREFILL_MIN=4096 prefill calls of at least this many tokens upload the experts and run on the GPU
-                             (0: always on the CPU); switches of the GPU prefill: backend/prefill.py (XTIER_PREFILL_*)
+  XTIER_GPU_PREFILL_MIN=1024 prefill calls of at least this many tokens upload the experts and run on the GPU
+                             (0: always on the CPU; Qwen3.8 on PCIe 5: the CPU engine and the upload break even near
+                             1000 tokens); switches of the GPU prefill: backend/prefill.py (XTIER_PREFILL_*)
   XTIER_CACHE_SLOTS=0        GPU expert cache slots per layer (xtier.cache; 0: no cache)
   XTIER_CACHE_FULL=list      layers that keep every expert on the GPU (no CPU part)
   XTIER_CACHE_PROFILE=file   ranking profile that fills the slots at start (LKQstrata format)
@@ -69,7 +70,18 @@ def cpu_prefill_batch() -> int:
 
 
 def gpu_prefill_min() -> int:
-    return _int('XTIER_GPU_PREFILL_MIN', 4096)
+    return _int('XTIER_GPU_PREFILL_MIN', 1024)
+
+
+def resident_prefill() -> bool:
+    """XTIER_CACHE_PREFILL=packed (default): a fully cached layer's prefill runs on the packed slots in place;
+    staged: through the GPU prefill's staging and BF16 unpack, like a host layer."""
+    return os.environ.get('XTIER_CACHE_PREFILL', 'packed') == 'packed'
+
+
+def timing() -> bool:
+    """XTIER_TIMING=1: log the prefill MoE time per forward and kind of layer (synchronizes around each call)."""
+    return _flag('XTIER_TIMING')
 
 
 def cache_slots() -> int:

@@ -34,7 +34,7 @@ bench/         回归验收（速度、PPL、照抄测试、长上下文召回�
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
 | DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 计划中 |
-| Qwen3.8 Flash Next | `qwen4_exp` | 计划中 |
+| Qwen3.8 Flash Next | `qwen4_exp` | 开发中：官方 main 上跑通，速度与精度接近生产（[报告](docs/reports/2026-10-23-step2-qwen.md)） |
 | GLM-5.3 Flash | `glm5_next` | 计划中 |
 
 ## 许可
