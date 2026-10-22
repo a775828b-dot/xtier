@@ -1,0 +1,281 @@
+{
+ "date": "2026-10-22",
+ "hardware": "RTX PRO 5000 72GB (SM120) + 2x EPYC 9334 + 24x16 GiB DDR5-4800 (NPS4, 8 NUMA nodes)",
+ "gate": "decode within 2% of the baseline, prefill not slower, PPL within noise, copy test 0 errors, recall correct",
+ "model": "LibertAIDAI/GLM-5.3-Flash-NVFP4",
+ "pipeline": "lsglang_glm5.3 (launch/run-glm53-nvfp4-24ch-nps4.sh)",
+ "settings": {
+  "context": 524288,
+  "max_running_requests": 2,
+  "moe_layers_on_cpu": 42,
+  "hot_expert_slots_per_layer": 60,
+  "cpu_threads": 112,
+  "speculative": "EAGLE adaptive 1-5 steps, lossless rejection sampling, truncated verify"
+ },
+ "speed_points": {
+  "method": "8 prompt lengths 4K-500K, temperature 0, buried-fact recall",
+  "rows": [
+   {
+    "target": 4096,
+    "prompt_tokens": 3995,
+    "ttft_s": 3.24,
+    "prefill_tok_s": 1233,
+    "decode_tok_s": 117.0,
+    "accept_length": 4.51,
+    "recall": true,
+    "vram_peak_mib": 66734
+   },
+   {
+    "target": 16384,
+    "prompt_tokens": 16262,
+    "ttft_s": 6.07,
+    "prefill_tok_s": 2681,
+    "decode_tok_s": 102.8,
+    "accept_length": 4.05,
+    "recall": true,
+    "vram_peak_mib": 70676
+   },
+   {
+    "target": 32768,
+    "prompt_tokens": 32824,
+    "ttft_s": 12.98,
+    "prefill_tok_s": 2528,
+    "decode_tok_s": 108.8,
+    "accept_length": 3.98,
+    "recall": true,
+    "vram_peak_mib": 70706
+   },
+   {
+    "target": 65536,
+    "prompt_tokens": 66155,
+    "ttft_s": 27.66,
+    "prefill_tok_s": 2392,
+    "decode_tok_s": 126.5,
+    "accept_length": 4.18,
+    "recall": true,
+    "vram_peak_mib": 70846
+   },
+   {
+    "target": 131072,
+    "prompt_tokens": 133047,
+    "ttft_s": 53.62,
+    "prefill_tok_s": 2481,
+    "decode_tok_s": 104.9,
+    "accept_length": 4.1,
+    "recall": true,
+    "vram_peak_mib": 70850
+   },
+   {
+    "target": 262144,
+    "prompt_tokens": 268640,
+    "ttft_s": 106.03,
+    "prefill_tok_s": 2534,
+    "decode_tok_s": 92.9,
+    "accept_length": 3.94,
+    "recall": true,
+    "vram_peak_mib": 70870
+   },
+   {
+    "target": 393216,
+    "prompt_tokens": 413016,
+    "ttft_s": 166.42,
+    "prefill_tok_s": 2482,
+    "decode_tok_s": 96.9,
+    "accept_length": 3.83,
+    "recall": true,
+    "vram_peak_mib": 70892
+   },
+   {
+    "target": 500000,
+    "prompt_tokens": 500031,
+    "ttft_s": 200.98,
+    "prefill_tok_s": 2488,
+    "decode_tok_s": 105.4,
+    "accept_length": 3.7,
+    "recall": true,
+    "vram_peak_mib": 70886
+   }
+  ],
+  "mean_decode": 106.9
+ },
+ "temperature1": {
+  "runs": 16,
+  "mean_decode_tok_s": 84.3
+ },
+ "concurrency": {
+  "1": {
+   "per_request": 82.3,
+   "aggregate": 82.5,
+   "accept": 2.54,
+   "ttft": 16.29,
+   "rows": [
+    {
+     "round": 0,
+     "aggregate": 85.75703041288921,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 63.77562379837036,
+       "first": 1792656975.6500454,
+       "last": 1792656981.6204014,
+       "decode": 85.58953621286403,
+       "accept": 2.6666666666666665
+      }
+     ]
+    },
+    {
+     "round": 1,
+     "aggregate": 82.20334226214526,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.4689316749572754,
+       "first": 1792656982.0905893,
+       "last": 1792656988.3190465,
+       "decode": 82.0427888592895,
+       "accept": 2.5728643216080402
+      }
+     ]
+    },
+    {
+     "round": 2,
+     "aggregate": 80.98104323986975,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.4052155017852783,
+       "first": 1792656988.7257495,
+       "last": 1792656995.0482168,
+       "decode": 80.82287713979188,
+       "accept": 2.359447004608295
+      }
+     ]
+    },
+    {
+     "round": 3,
+     "aggregate": 80.9159463993618,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.5039212703704834,
+       "first": 1792656995.5535336,
+       "last": 1792657001.8810873,
+       "decode": 80.75790744155054,
+       "accept": 2.56
+      }
+     ]
+    }
+   ]
+  },
+  "2": {
+   "per_request": 58.0,
+   "aggregate": 112.4,
+   "accept": 2.54,
+   "ttft": 0.6,
+   "rows": [
+    {
+     "round": 0,
+     "aggregate": 110.92273089555769,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.6785223484039307,
+       "first": 1792657002.5612454,
+       "last": 1792657011.0435355,
+       "decode": 60.24316525623092,
+       "accept": 2.5098039215686274
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.6774191856384277,
+       "first": 1792657002.5613585,
+       "last": 1792657011.792897,
+       "decode": 55.353720087813294,
+       "accept": 2.226086956521739
+      }
+     ]
+    },
+    {
+     "round": 1,
+     "aggregate": 113.93234765053396,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.5577366352081299,
+       "first": 1792657012.352246,
+       "last": 1792657021.340036,
+       "decode": 56.85491176701451,
+       "accept": 2.473429951690821
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.5570785999298096,
+       "first": 1792657012.3524802,
+       "last": 1792657020.7701674,
+       "decode": 60.7055108149276,
+       "accept": 2.723404255319149
+      }
+     ]
+    },
+    {
+     "round": 2,
+     "aggregate": 119.77105222333715,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.555689811706543,
+       "first": 1792657021.8970404,
+       "last": 1792657030.4466856,
+       "decode": 59.76856219348172,
+       "accept": 2.752688172043011
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.5550241470336914,
+       "first": 1792657021.8972185,
+       "last": 1792657030.2515063,
+       "decode": 61.16619494005538,
+       "accept": 2.8444444444444446
+      }
+     ]
+    },
+    {
+     "round": 3,
+     "aggregate": 104.99952110563895,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.5983219146728516,
+       "first": 1792657031.0463347,
+       "last": 1792657040.7987602,
+       "decode": 52.39722195798975,
+       "accept": 2.2555066079295156
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.5977685451507568,
+       "first": 1792657031.046456,
+       "last": 1792657039.917542,
+       "decode": 57.602869230032624,
+       "accept": 2.5728643216080402
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "ppl": {
+  "method": "bench/ppl_eval.py, 13 segments x 4K",
+  "all": {
+   "segments": 13,
+   "nll": 1.40114,
+   "ppl": 4.0598
+  }
+ },
+ "sources": [
+  "lsglang_glm5.3/results/speed-points-20261022-24ch-nps4.json",
+  "lsglang_glm5.3/results/concurrency-20261022-24ch-nps4.json",
+  "lsglang_glm5.3/results/temperature1-20261022-24ch-nps4.json",
+  "lsglang_glm5.3/results/ppl-20261022-24ch-nps4.json"
+ ]
+}

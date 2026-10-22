@@ -1,0 +1,315 @@
+{
+ "date": "2026-10-22",
+ "hardware": "RTX PRO 5000 72GB (SM120) + 2x EPYC 9334 + 24x16 GiB DDR5-4800 (NPS4, 8 NUMA nodes)",
+ "gate": "decode within 2% of the baseline, prefill not slower, PPL within noise, copy test 0 errors, recall correct",
+ "model": "lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4",
+ "pipeline": "lsglang_q3.8fn (launch/run-qwen38fn-nvfp4-24ch-nps4.sh)",
+ "settings": {
+  "context": 524288,
+  "max_running_requests": 2,
+  "resident_layers": 25,
+  "hot_expert_slots_per_layer": 155,
+  "pool_layers": 23,
+  "cpu_threads": 112,
+  "mtp": "NEXTN 3 steps / 4 drafts",
+  "hc_mix": "overlap kernel (SGLANG_HC_MIX_OVERLAP=1)"
+ },
+ "verify_step": {
+  "method": "20 prompts x temperature 0 / 0.7, 768 tokens, ms per verify step from /metrics",
+  "overlap_kernel": {
+   "decode_tps": 162.16128960642405,
+   "ms_per_step": 13.776863543716109,
+   "accept": 2.2371814791796147
+  },
+  "webui_start": {
+   "decode_tps": 163.28252518062163,
+   "ms_per_step": 13.746820131270292,
+   "accept": 2.2477256822953113
+  }
+ },
+ "speed_points": {
+  "method": "8+2 prompt lengths, temperature 0, 1024 output tokens, buried-fact recall",
+  "note": "measured before the hc_mix overlap kernel (per-step -1.7% since)",
+  "rows": [
+   {
+    "target": 4096,
+    "prompt_tokens": 4109,
+    "ttft_s": 1.07,
+    "prefill_tok_s": 3852,
+    "decode_tok_s": 220.3,
+    "accept_length": 3.14,
+    "recall": true,
+    "vram_peak_mib": 67766
+   },
+   {
+    "target": 8192,
+    "prompt_tokens": 8315,
+    "ttft_s": 1.49,
+    "prefill_tok_s": 5579,
+    "decode_tok_s": 234.6,
+    "accept_length": 3.23,
+    "recall": true,
+    "vram_peak_mib": 67768
+   },
+   {
+    "target": 16384,
+    "prompt_tokens": 17123,
+    "ttft_s": 2.72,
+    "prefill_tok_s": 6299,
+    "decode_tok_s": 192.1,
+    "accept_length": 3.06,
+    "recall": true,
+    "vram_peak_mib": 67770
+   },
+   {
+    "target": 32768,
+    "prompt_tokens": 33265,
+    "ttft_s": 5.66,
+    "prefill_tok_s": 5879,
+    "decode_tok_s": 192.4,
+    "accept_length": 2.98,
+    "recall": true,
+    "vram_peak_mib": 71174
+   },
+   {
+    "target": 65536,
+    "prompt_tokens": 68103,
+    "ttft_s": 12.58,
+    "prefill_tok_s": 5416,
+    "decode_tok_s": 191.5,
+    "accept_length": 2.92,
+    "recall": true,
+    "vram_peak_mib": 71820
+   },
+   {
+    "target": 131072,
+    "prompt_tokens": 134941,
+    "ttft_s": 31.87,
+    "prefill_tok_s": 4234,
+    "decode_tok_s": 177.3,
+    "accept_length": 2.86,
+    "recall": true,
+    "vram_peak_mib": 71864
+   },
+   {
+    "target": 196608,
+    "prompt_tokens": 210634,
+    "ttft_s": 35.33,
+    "prefill_tok_s": 5962,
+    "decode_tok_s": 180.5,
+    "accept_length": 2.83,
+    "recall": true,
+    "vram_peak_mib": 71964
+   },
+   {
+    "target": 240000,
+    "prompt_tokens": 252609,
+    "ttft_s": 43.57,
+    "prefill_tok_s": 5797,
+    "decode_tok_s": 210.0,
+    "accept_length": 2.86,
+    "recall": true,
+    "vram_peak_mib": 71966
+   },
+   {
+    "target": 393216,
+    "prompt_tokens": 414774,
+    "ttft_s": 81.49,
+    "prefill_tok_s": 5090,
+    "decode_tok_s": 169.8,
+    "accept_length": 2.84,
+    "recall": true,
+    "vram_peak_mib": 71966
+   },
+   {
+    "target": 500000,
+    "prompt_tokens": 499966,
+    "ttft_s": 106.24,
+    "prefill_tok_s": 4706,
+    "decode_tok_s": 165.1,
+    "accept_length": 2.55,
+    "recall": true,
+    "vram_peak_mib": 71822
+   }
+  ],
+  "mean_decode_4k_253k": 199.8
+ },
+ "concurrency": {
+  "1": {
+   "per_request": 145.6,
+   "aggregate": 145.9,
+   "accept": 2.07,
+   "ttft": 16.04,
+   "rows": [
+    {
+     "round": 0,
+     "aggregate": 132.6288427531203,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 63.254605770111084,
+       "first": 1792657723.0491595,
+       "last": 1792657726.9095566,
+       "decode": 132.3698020446181,
+       "accept": 1.848375451263538
+      }
+     ]
+    },
+    {
+     "round": 1,
+     "aggregate": 156.40505598214747,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.304027795791626,
+       "first": 1792657727.2149138,
+       "last": 1792657730.4884653,
+       "decode": 156.09957735718234,
+       "accept": 2.206896551724138
+      }
+     ]
+    },
+    {
+     "round": 2,
+     "aggregate": 148.17181824385355,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.2870767116546631,
+       "first": 1792657730.7767441,
+       "last": 1792657734.232192,
+       "decode": 147.88242016134603,
+       "accept": 2.1069958847736627
+      }
+     ]
+    },
+    {
+     "round": 3,
+     "aggregate": 146.4830964040735,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.32605814933776855,
+       "first": 1792657734.559341,
+       "last": 1792657738.0546248,
+       "decode": 146.1969966064093,
+       "accept": 2.098360655737705
+      }
+     ]
+    }
+   ]
+  },
+  "2": {
+   "per_request": 109.5,
+   "aggregate": 202.2,
+   "accept": 1.9,
+   "ttft": 0.4,
+   "rows": [
+    {
+     "round": 0,
+     "aggregate": 192.35476023434765,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.44495534896850586,
+       "first": 1792657738.5008957,
+       "last": 1792657742.8593895,
+       "decode": 117.24233711696525,
+       "accept": 2.0562248995983934
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.44428443908691406,
+       "first": 1792657738.5007312,
+       "last": 1792657743.8242283,
+       "decode": 95.98953367163247,
+       "accept": 1.615141955835962
+      }
+     ]
+    },
+    {
+     "round": 1,
+     "aggregate": 197.03017057208365,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.3747138977050781,
+       "first": 1792657744.200128,
+       "last": 1792657749.3973017,
+       "decode": 98.32267301009252,
+       "accept": 1.6897689768976898
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.3744652271270752,
+       "first": 1792657744.2002823,
+       "last": 1792657748.7060883,
+       "decode": 113.40923321791105,
+       "accept": 2.007843137254902
+      }
+     ]
+    },
+    {
+     "round": 2,
+     "aggregate": 200.6290549332608,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.37633347511291504,
+       "first": 1792657749.7748466,
+       "last": 1792657754.3056018,
+       "decode": 112.78472754693708,
+       "accept": 1.9692307692307693
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.3756895065307617,
+       "first": 1792657749.7746317,
+       "last": 1792657754.8785784,
+       "decode": 100.11860065517213,
+       "accept": 1.7066666666666668
+      }
+     ]
+    },
+    {
+     "round": 3,
+     "aggregate": 218.598485271465,
+     "requests": [
+      {
+       "tokens": 512,
+       "ttft": 0.3981137275695801,
+       "first": 1792657755.2778964,
+       "last": 1792657759.2408302,
+       "decode": 128.94487481431707,
+       "accept": 2.2857142857142856
+      },
+      {
+       "tokens": 512,
+       "ttft": 0.3979361057281494,
+       "first": 1792657755.2781086,
+       "last": 1792657759.9622838,
+       "decode": 109.09070912367399,
+       "accept": 1.8686131386861313
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "ppl": {
+  "method": "bench/ppl_eval.py, 13 segments x 4K",
+  "all": {
+   "segments": 13,
+   "nll": 1.24644,
+   "ppl": 3.4779
+  },
+  "overlap_kernel": 3.48
+ },
+ "copy_test": "0/8 and 0/8 (one / two at a time), ignoring the first-line indentation the Qwen reply always drops",
+ "sources": [
+  "lsglang_q3.8fn/results/speed-points-20261022-24ch-nps4.json",
+  "lsglang_q3.8fn/results/concurrency-20261022-24ch-nps4.json",
+  "lsglang_q3.8fn/results/ppl-20261022-24ch-nps4.json",
+  "lsglang_q3.8fn/results/hcmix-overlap-20261022.json"
+ ]
+}

@@ -1,0 +1,93 @@
+{
+ "date": "2026-10-22",
+ "hardware": "RTX PRO 5000 72GB (SM120) + 2x EPYC 9334 + 24x16 GiB DDR5-4800 (NPS4, 8 NUMA nodes)",
+ "gate": "decode within 2% of the baseline, prefill not slower, PPL within noise, copy test 0 errors, recall correct",
+ "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017 (MXFP4)",
+ "pipeline": "lsglang_ds4.1 (launch/run-ds41-1017-24ch-nps4.sh)",
+ "settings": {
+  "context": 524288,
+  "max_running_requests": 2,
+  "prefill_chunk": 22528,
+  "hot_expert_slots_per_layer": 50,
+  "prefill_prefetch_chunks": 6,
+  "engram_row_cache_gib": 4,
+  "cpu_threads": 112,
+  "dspark": "static, 6-token verify"
+ },
+ "agent_bench": {
+  "method": "bench/agent_bench.py, 5 coding-agent sessions 64K-490K",
+  "round1": {
+   "requests": 81,
+   "output_tokens": 12629,
+   "decode_tps": 157.5,
+   "median_request_tps": 200.3,
+   "accept": 4.841,
+   "ms_per_step": 30.53
+  },
+  "round2": {
+   "requests": 66,
+   "output_tokens": 17422,
+   "decode_tps": 144.0,
+   "median_request_tps": 182.8,
+   "accept": 4.562,
+   "ms_per_step": 31.55
+  },
+  "cold_prefill": [
+   {
+    "session": "64k",
+    "prompt_tokens": 66346,
+    "cached_tokens": 0,
+    "ttft_s": 19.644,
+    "prefill_tps": 3377.4
+   },
+   {
+    "session": "128k-write",
+    "prompt_tokens": 132215,
+    "cached_tokens": 0,
+    "ttft_s": 31.575,
+    "prefill_tps": 4187.3
+   },
+   {
+    "session": "256k",
+    "prompt_tokens": 264657,
+    "cached_tokens": 0,
+    "ttft_s": 64.208,
+    "prefill_tps": 4121.9
+   },
+   {
+    "session": "384k",
+    "prompt_tokens": 394274,
+    "cached_tokens": 0,
+    "ttft_s": 99.228,
+    "prefill_tps": 3973.4
+   },
+   {
+    "session": "500k",
+    "prompt_tokens": 489273,
+    "cached_tokens": 0,
+    "ttft_s": 126.89,
+    "prefill_tps": 3855.9
+   }
+  ],
+  "ttft_later_median_s": [
+   3.01,
+   2.36
+  ]
+ },
+ "capacity_522k": {
+  "prompt_tokens": 522300,
+  "completion_tokens": 1024,
+  "ttft_s": 142.66,
+  "prefill_tok_s": 3661,
+  "decode_tok_s": 91.9,
+  "accept_length": 3.16,
+  "recall": true
+ },
+ "ppl": "not published for this pipeline: measure on production with the same method (bench/ppl_eval.py, 13 x 4K) before switching",
+ "copy_test": "0 errors, one and two at a time (static verify; an extra trailing </src> is a known quirk)",
+ "sources": [
+  "lsglang_ds4.1/results/agent-bench-20261022-24ch-nps4-r1.json",
+  "lsglang_ds4.1/results/agent-bench-20261022-24ch-nps4-r2.json",
+  "lsglang_ds4.1/results/capacity-522k-20261022-24ch-nps4.json"
+ ]
+}
