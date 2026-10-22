@@ -1,6 +1,6 @@
 # 设计：DeepSeek V4.1 的 Engram 行放在 NVMe（`packs/deepseek_v4`）
 
-状态（2026-10-23）：行存储已移植（`csrc/engram/rows.cpp`、`xtier/packs/deepseek_v4/rows.py`），`tests/engram_rows_check.py` 在第 1、14 层（各约 3.84 亿行）整表和 TP 分片下与直接读文件逐字节一致；钩子（方案第 2 步）未做。DeepSeek V4.1 1017 在官方 main 上跑通的前置条件。
+状态（2026-10-23）：行存储已移植（`csrc/engram/rows.cpp`、`xtier/packs/deepseek_v4/rows.py`），`tests/engram_rows_check.py` 在第 1、14 层（各约 3.84 亿行）整表和 TP 分片下与直接读文件逐字节一致；图内可用的查表（`xtier/packs/deepseek_v4/engram.py`：ids 拷回主机、`cudaLaunchHostFunc` 回调读行、拷上 GPU、官方 `engram_gather` 反量化）在直接调用和 CUDA 图重放下与直接读文件逐位一致（`tests/engram_lookup_check.py`）。`EngramEmbedding` 的钩子（方案第 2 步）待 DS 端到端时做。DeepSeek V4.1 1017 在官方 main 上跑通的前置条件。
 
 ## 为什么
 
