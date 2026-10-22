@@ -101,3 +101,4 @@ SGLang 官方 main（固定到验收通过的提交号，每周同步）
 - 2026-10-23 清晨：Qwen3.8 加上 hc_mix 重叠内核（`packs/qwen4_exp`）与 XTier 草稿后，验证步 13.98 ms（生产 13.78）、解码 166.6 tok/s（生产 162.2）。GLM-5.3 在官方 main 上跑通（不开投机，42 层全由 XTier 接管），PPL 3.9869（生产 4.0598）；EAGLE 与 kpool 下的 sparse MLA 待做。
 - 2026-10-23 早上：Qwen3.8 长上下文 4K–500K 召回全部正确（FP8 KV；官方 QSA 不支持 NVFP4 KV）；GLM-5.3 的 EAGLE 跑通（NextN 草稿保持 NVFP4 并由 XTier 全常驻），速度约为生产的 80%；DeepSeek 1017 的 MXFP4 格式已适配，端到端受 Engram 表（189 GB）所限，下一步做 Engram NVMe 行存储包。DS 生产已恢复。
 - 2026-10-23 早上（续）：部分缓存层的混合 prefill（命中路由在 GPU 槽上算、其余同时在 CPU 上算）与常驻层 prefill 调参，Qwen 冷 prefill 1000 token 0.95→0.62 s、4K 1.09 s（生产 1.07）、8K 1.58 s（生产 1.49）；验证步 13.98 ms 在门槛 2% 以内。第 2 步 Qwen 剩余：8K 以上的长提示 prefill、QSA 的 NVFP4 KV。
+- 2026-10-23 早上（续）：`packs/deepseek_v4` 移入生产的 Engram NVMe 行存储（`csrc/engram`）与图内查表，两者都对照直接读文件逐位一致；下一步是 `EngramEmbedding` 的钩子和 DS 1017 端到端（见 [design-engram-nvme.md](design-engram-nvme.md)）。
