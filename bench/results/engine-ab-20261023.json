@@ -1,0 +1,191 @@
+{
+ "date": "2026-10-23",
+ "what": "XTier CPU engine (csrc/) against the lkqmoe 0.5.6 production libraries, one real layer per model, 112 threads, 8 NUMA nodes",
+ "method": "tests/engine_ab.py: sha256 of the float32 outputs of seeded cases; timings are means per call",
+ "isa": {
+  "avx512": {
+   "qwen38": {
+    "bitwise_equal": "9/9",
+    "switches": {
+     "XTIER_SPIN_COUNT": "1048576"
+    },
+    "us_lkqmoe": {
+     "m1-indep": 65.7,
+     "m2-indep": 128.1,
+     "m4-indep": 252.2,
+     "m4-verify": 157.7,
+     "m8-indep": 498.9,
+     "m8-verify2": 289.1,
+     "m64-indep": 2865.3,
+     "m512-indep": 11897.5,
+     "m2048-indep": 48623.0
+    },
+    "us_xtier": {
+     "m1-indep": 64.9,
+     "m2-indep": 123.9,
+     "m4-indep": 255.2,
+     "m4-verify": 154.9,
+     "m8-indep": 492.7,
+     "m8-verify2": 288.2,
+     "m64-indep": 2885.9,
+     "m512-indep": 11914.7,
+     "m2048-indep": 47858.8
+    }
+   },
+   "glm53": {
+    "bitwise_equal": "9/9",
+    "switches": {
+     "XTIER_DYNAMIC": "2",
+     "XTIER_DOWN_BF16": "1",
+     "XTIER_SPIN_COUNT": "1048576"
+    },
+    "us_lkqmoe": {
+     "m1-indep": 238.3,
+     "m2-indep": 447.7,
+     "m4-indep": 871.2,
+     "m4-verify": 538.5,
+     "m8-indep": 1622.0,
+     "m8-verify2": 983.4,
+     "m64-indep": 8268.2,
+     "m512-indep": 39382.8,
+     "m2048-indep": 204800.7
+    },
+    "us_xtier": {
+     "m1-indep": 238.2,
+     "m2-indep": 452.8,
+     "m4-indep": 885.3,
+     "m4-verify": 532.2,
+     "m8-indep": 1638.0,
+     "m8-verify2": 995.6,
+     "m64-indep": 8364.2,
+     "m512-indep": 40541.4,
+     "m2048-indep": 206311.1
+    }
+   },
+   "ds41_1017": {
+    "bitwise_equal": "9/9",
+    "switches": {
+     "XTIER_DYNAMIC": "2",
+     "XTIER_DOWN_BF16": "1",
+     "XTIER_DOWN_GRAIN": "24",
+     "XTIER_SPIN_COUNT": "1048576",
+     "XTIER_THP": "0"
+    },
+    "us_lkqmoe": {
+     "m1-indep": 227.0,
+     "m2-indep": 429.0,
+     "m4-indep": 834.5,
+     "m6-verify": 678.1,
+     "m8-indep": 1578.2,
+     "m8-verify2": 914.0,
+     "m64-indep": 9676.9,
+     "m512-indep": 39600.5,
+     "m2048-indep": 190516.2
+    },
+    "us_xtier": {
+     "m1-indep": 225.2,
+     "m2-indep": 425.8,
+     "m4-indep": 841.8,
+     "m6-verify": 691.9,
+     "m8-indep": 1578.8,
+     "m8-verify2": 911.5,
+     "m64-indep": 9757.1,
+     "m512-indep": 38654.1,
+     "m2048-indep": 182358.9
+    }
+   }
+  },
+  "avx2": {
+   "qwen38": {
+    "bitwise_equal": "9/9",
+    "switches": {
+     "XTIER_SPIN_COUNT": "1048576"
+    },
+    "us_lkqmoe": {
+     "m1-indep": 109.4,
+     "m2-indep": 212.6,
+     "m4-indep": 408.5,
+     "m4-verify": 246.7,
+     "m8-indep": 796.2,
+     "m8-verify2": 495.3,
+     "m64-indep": 4442.4,
+     "m512-indep": 21056.2,
+     "m2048-indep": 173069.4
+    },
+    "us_xtier": {
+     "m1-indep": 113.8,
+     "m2-indep": 217.3,
+     "m4-indep": 412.5,
+     "m4-verify": 248.4,
+     "m8-indep": 788.0,
+     "m8-verify2": 500.0,
+     "m64-indep": 4405.6,
+     "m512-indep": 20542.6,
+     "m2048-indep": 173461.9
+    }
+   },
+   "glm53": {
+    "bitwise_equal": "9/9",
+    "switches": {
+     "XTIER_DYNAMIC": "2",
+     "XTIER_DOWN_BF16": "1",
+     "XTIER_SPIN_COUNT": "1048576"
+    },
+    "us_lkqmoe": {
+     "m1-indep": 420.7,
+     "m2-indep": 906.9,
+     "m4-indep": 1579.7,
+     "m4-verify": 941.4,
+     "m8-indep": 2867.7,
+     "m8-verify2": 1862.4,
+     "m64-indep": 16353.1,
+     "m512-indep": 96517.4,
+     "m2048-indep": 430031.9
+    },
+    "us_xtier": {
+     "m1-indep": 409.0,
+     "m2-indep": 900.9,
+     "m4-indep": 1603.9,
+     "m4-verify": 974.4,
+     "m8-indep": 2902.5,
+     "m8-verify2": 2044.6,
+     "m64-indep": 15850.3,
+     "m512-indep": 97150.9,
+     "m2048-indep": 434403.5
+    }
+   },
+   "ds41_1017": {
+    "bitwise_equal": "9/9",
+    "switches": {
+     "XTIER_DYNAMIC": "2",
+     "XTIER_DOWN_BF16": "1",
+     "XTIER_DOWN_GRAIN": "24",
+     "XTIER_SPIN_COUNT": "1048576",
+     "XTIER_THP": "0"
+    },
+    "us_lkqmoe": {
+     "m1-indep": 462.3,
+     "m2-indep": 815.6,
+     "m4-indep": 1611.5,
+     "m6-verify": 1380.5,
+     "m8-indep": 3001.2,
+     "m8-verify2": 1917.1,
+     "m64-indep": 19043.2,
+     "m512-indep": 95550.6,
+     "m2048-indep": 367008.2
+    },
+    "us_xtier": {
+     "m1-indep": 411.2,
+     "m2-indep": 806.7,
+     "m4-indep": 1561.1,
+     "m6-verify": 1369.2,
+     "m8-indep": 3248.5,
+     "m8-verify2": 1871.1,
+     "m64-indep": 19960.3,
+     "m512-indep": 94078.0,
+     "m2048-indep": 371334.1
+    }
+   }
+  }
+ }
+}

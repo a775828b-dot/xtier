@@ -95,3 +95,4 @@ SGLang 官方 main（固定到验收通过的提交号，每周同步）
 
 - 2026-10-22：确定架构、名字（XTier）和本计划；仓库公开；开始第 0 步。
 - 2026-10-22 晚：0.1 盘点 v1（[docs/inventory.md](inventory.md)）、0.2 基线（`bench/baselines/`）完成；0.3 官方 main 环境安装中。
+- 2026-10-23：第 1 步 CPU 引擎迁入 `csrc/`（改名移植，删掉旧兼容入口）、Python 绑定 `xtier/engine`、构建脚本；三个模型的真实单层在 AVX512 和 AVX2 下都与 0.5.6 逐位一致（`bench/results/engine-ab-20261023.json`）。
