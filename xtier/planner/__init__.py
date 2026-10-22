@@ -16,7 +16,9 @@ def layer_config(layer_idx: int):
     from xtier.backend.method import LayerConfig
 
     if get_flags().moe.in_speculative_scope:   # a speculative draft's layers: every expert on the GPU
-        return LayerConfig(layer_id=int(layer_idx), threads=config.threads(), cache_slots=-1) if config.draft() else None
+        if not config.draft():
+            return None
+        return LayerConfig(layer_id=int(layer_idx), threads=config.threads(), cache_slots=-1, draft=True)
     selected = config.layers()
     if selected is not None and layer_idx not in selected:
         return None

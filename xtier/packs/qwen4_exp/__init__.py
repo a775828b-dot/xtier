@@ -3,12 +3,15 @@
 - PLE host table: the pinned backend allocates the n-gram embedding table (20M rows x 2560 FP8, 48 GiB) as an
   exact-size, NUMA-interleaved, CUDA-registered mapping (xtier.engine.memory) instead of the caching host
   allocator's power-of-two block on one node, which cannot be placed on an NPS4 host.
+- Hyper-connection mix of decode batches: the overlapped persistent kernel of hc_mix.py replaces SGLang's
+  ``fused_hc_mix`` (XTIER_HC_MIX_OVERLAP=0 keeps SGLang's).
 """
 
 import logging
 
 logger = logging.getLogger(__name__)
 PLE = 'sglang.srt.models.qwen4_exp_ple_table.allocate_ple_host_table'
+HC_MIX = 'sglang.kernels.ops.gemm.hc_mix.fused_hc_mix'
 
 
 def _allocate_ple_host_table(original, shape, dtype, backend='pinned', table_dir=None, tag=None, *args, **kwargs):
@@ -18,5 +21,11 @@ def _allocate_ple_host_table(original, shape, dtype, backend='pinned', table_dir
     return pinned_interleaved(shape, dtype)
 
 
+def _fused_hc_mix(original, *args, **kwargs):
+    from xtier.packs.qwen4_exp.hc_mix import fused_hc_mix
+    return fused_hc_mix(original, *args, **kwargs)
+
+
 def install(registry, hook_type):
     registry.register(PLE, _allocate_ple_host_table, hook_type.AROUND)
+    registry.register(HC_MIX, _fused_hc_mix, hook_type.AROUND)

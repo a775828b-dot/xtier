@@ -24,8 +24,15 @@ def install(registry, hook_type):
 
     class KTEPWrapperMethod(original):
         def __new__(cls, gpu_method, kt_config, *args, **kwargs):
-            if isinstance(kt_config, LayerConfig):
-                return XTierMoEMethod(gpu_method, kt_config)   # not an instance of cls: __init__ is skipped
+            if isinstance(kt_config, LayerConfig):   # not an instance of cls: __init__ is skipped
+                try:
+                    return XTierMoEMethod(gpu_method, kt_config)
+                except NotImplementedError as e:
+                    if not kt_config.draft:
+                        raise
+                    # a draft layer XTier cannot run (e.g. BF16 experts) stays with SGLang
+                    logger.info('xtier: draft MoE layer %d stays with SGLang: %s', kt_config.layer_id, e)
+                    return gpu_method
             return super().__new__(cls)
 
     # FusedMoE's loader recognizes the wrapper by class name.
@@ -56,7 +63,7 @@ def check(model_runner):
         if ours:
             raise RuntimeError(f'xtier: {len(ours)} draft MoE layers on XTier without XTIER_DRAFT=1')
         return
-    if moe and not ours:
+    if moe and not ours and not draft:   # a draft's layers may stay with SGLang (formats XTier cannot run)
         raise RuntimeError(f'xtier: XTIER=1 but none of the {len(moe)} MoE layers runs on XTier (hooks not applied)')
     unplanned = [m.quant_method.cfg.layer_id for m in ours if m.quant_method.plan is None]
     if unplanned:

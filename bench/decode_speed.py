@@ -43,7 +43,8 @@ def run(prompt):
             d = json.loads(line[6:])
             if d.get('usage'):
                 n = d['usage']['completion_tokens']
-            if d.get('choices') and d['choices'][0].get('delta', {}).get('content'):
+            delta = d['choices'][0].get('delta', {}) if d.get('choices') else {}
+            if delta.get('content') or delta.get('reasoning_content'):
                 now = time.time()
                 first = first or now
                 last = now

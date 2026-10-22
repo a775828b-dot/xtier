@@ -42,6 +42,7 @@ class LayerConfig:
     layer_id: int
     threads: int
     cache_slots: int = 0   # GPU expert cache slots (xtier.cache); -1: every expert of the layer
+    draft: bool = False    # a layer of a speculative draft model
 
 
 class XTierMoEMethod(FusedMoEMethodBase):
