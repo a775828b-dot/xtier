@@ -1,0 +1,9 @@
+XTier
+Copyright 2026 the XTier authors
+
+This product is a plugin for SGLang (https://github.com/sgl-project/sglang, Apache-2.0) and depends on it at runtime;
+it contains no SGLang source code unless a file says so.
+
+The CPU expert engine under csrc/ originates from the authors' lkqmoe project.
+The adaptive hot-expert placement follows ideas from Strata (https://github.com/Niko1221/Strata, MIT); it is an
+independent implementation and contains no Strata code.

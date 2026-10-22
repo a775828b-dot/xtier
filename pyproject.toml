@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xtier"
+version = "0.0.1"
+description = "Cross-tier CPU/GPU hybrid MoE inference for SGLang"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# SGLang itself is installed separately: XTier tracks a tested commit of its main branch.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/a775828b-dot/xtier"
+
+[project.entry-points."sglang.srt.plugins"]
+xtier = "xtier.plugin:load"
+
+[tool.setuptools.packages.find]
+include = ["xtier*"]
