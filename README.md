@@ -47,7 +47,7 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
-| Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致，解码总速度略高于生产，prefill 慢 5–17% |
+| Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；解码总速度略高于生产；短提示 prefill 更快，8K 以上慢 6–17% |
 | GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：PPL 优于生产，速度约为生产的 80% |
 | DeepSeek V4.1 Flash 1017 | `deepseek_v4` | MXFP4 格式已适配；Engram 表（189 GB）需要先做 NVMe 行存储包 |
 
