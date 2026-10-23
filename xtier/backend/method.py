@@ -32,7 +32,7 @@ import time
 import torch
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
-from xtier import config
+from xtier import config, platform
 from xtier.backend import formats, kernels
 from xtier.backend.prefill import Prefill
 from xtier.engine import CpuPlan, Mailbox, placement
@@ -109,7 +109,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
                 shard = kwargs.get('shard_id', args[1] if len(args) > 1 else None)
                 expert = kwargs.get('expert_id', args[2] if len(args) > 2 else None)
                 self._record(name, shard, expert)
+                platform.bulk_copy()   # this checkpoint file is mostly XTier experts: read the next ones ahead
             return result
+        weight_loader.xtier_inline = True   # runs on the loading thread (backend.hooks)
         return weight_loader
 
     def _record(self, name, shard, expert):
@@ -137,9 +139,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
 
     def _hand_off(self, layer):
         """All expert tensors are loaded: build the engine's copy and release the host parameters in place. One layer
-        at a time: a layer holds its loaded parameters and its new shards at once (DeepSeek V4.1: 2 x 7 GB), and
-        SGLang's loader threads complete several layers together; on the 377 GB host with DSpark that peak pushed
-        ~20 GB into swap, and pinning the shards then took 554 s instead of 72 s."""
+        at a time: a layer holds its loaded parameters and its new shards at once (DeepSeek V4.1: 2 x 7 GB). The
+        expert copies run on the loading thread, in checkpoint order (backend.hooks), so layers complete one after
+        the other."""
         with XTierMoEMethod._hand_off_lock:
             self._convert(layer)
 

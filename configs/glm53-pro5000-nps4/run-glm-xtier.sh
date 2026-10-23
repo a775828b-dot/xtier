@@ -33,4 +33,9 @@ exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-na
   --host 127.0.0.1 --port ${PORT:-18185} --tp-size 1 --trust-remote-code --skip-server-warmup --cuda-graph-backend-prefill disabled \
   --max-running-requests 2 --page-size 64 --reasoning-parser glm45 --enable-metrics --quantization modelopt_fp4 \
   --kv-cache-dtype fp8_e4m3 --dsa-decode-backend flashinfer_sparse_mla --dsa-prefill-backend flashinfer_sparse_mla \
-  --disable-shared-experts-fusion "$@"
+  --disable-shared-experts-fusion --weight-loader-drop-cache-after-load --max-total-tokens ${MAX_TOTAL_TOKENS:-524288} "$@"
+# --max-total-tokens: a KV pool of one 512K context. Sized by --mem-fraction-static alone it took 1.08M tokens (6 GB)
+# and left 4.9 GB, too little for XTier's prefill buffers of a 32K prompt (CUDA OOM).
+# --weight-loader-drop-cache-after-load: evicts each checkpoint file once loaded (XTier makes it work for mapped files,
+# xtier/platform.py): without it the page cache filled the NUMA nodes of the loading thread and 3.3 GB went to swap
+# although 160 GB were free elsewhere.

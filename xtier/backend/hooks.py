@@ -46,7 +46,18 @@ def install(registry, hook_type):
         check(model_runner)
         return result
 
+    def inline_experts(original_fn, *args, **kwargs):
+        # SGLang's DeepSeek loaders queue every copy of a host tensor on a thread pool. The checkpoint iterator then
+        # runs ahead of the copies: many layers fill at once (each holds its loaded experts until its hand-off), and
+        # their pages are read after the iterator dropped the file from the page cache. XTier's expert tensors are
+        # copied on the loading thread instead, in checkpoint order: one layer's file at a time, evicted after it
+        # (platform.py).
+        if getattr(kwargs.get('func'), 'xtier_inline', False):
+            kwargs['use_async'] = False
+        return original_fn(*args, **kwargs)
+
     registry.register(f'{KT}.create_kt_config_from_server_args', kt_config, hook_type.AROUND)
+    registry.register('sglang.srt.model_loader.utils.maybe_executor_submit', inline_experts, hook_type.AROUND)
     registry.register(f'{KT}.KTEPWrapperMethod', KTEPWrapperMethod, hook_type.REPLACE)
     registry.register('sglang.srt.model_executor.model_runner.ModelRunner.load_model', after_load, hook_type.AFTER)
 
