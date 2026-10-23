@@ -13,6 +13,10 @@
 - Tuned W8A8 block-FP8 GEMM configs (fp8_configs/, from the 1017 pipeline's bench/ds41_fp8_tune.py): SGLang has none
   for DeepSeek V4.1's 32 x 32 block projections on SM120 and runs one default tile for every shape, 1.5-4.6x slower
   at decode sizes (on the RTX PRO 5000 63 ms of a 68 ms decode step). Files of this directory win over SGLang's own.
+- Decoder replay tail without graphs: with --enable-decoder-swa-bounded-replay SGLang runs the late layers of a
+  prefill from row-bucket CUDA graphs captured while serving (up to SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = 2048
+  rows). Their MoE calls of hundreds to thousands of rows cannot go through XTier's capturable decode path (mailbox
+  slots of 8 tokens), so the tail runs eagerly on XTier's prefill paths; the replay itself is unchanged.
 """
 
 import functools
@@ -27,6 +31,7 @@ logger = logging.getLogger(__name__)
 ENGRAM = 'sglang.srt.layers.engram.EngramEmbedding'
 INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
+REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
 FP8_CONFIG_DIR = Path(__file__).with_name('fp8_configs')
 ENGRAM_LAYERS = 2   # DeepSeek V4.1 Flash has two Engram layers (1 and 14); the cache budget is split over them
 ROW_BYTES, SCALE_BYTES, BLOCK = 256, 8, 32   # an FP8 E4M3 row of 256 with one E8M0 scale per 32
@@ -151,9 +156,20 @@ def _fp8_configs(original, N, K, block_n, block_k):
     return original(N, K, block_n, block_k)
 
 
+def _replay_tail(original, cls, model, *args, **kwargs):
+    from xtier import config
+    if config.enabled():
+        logger.info('xtier: DeepSeek V4.1 decoder replay tail runs eagerly (no row-bucket graphs: their MoE calls of up '
+                    'to %s rows cannot be captured through XTier)',
+                    os.environ.get('SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS', '2048'))
+        return None
+    return original(cls, model, *args, **kwargs)
+
+
 def install(registry, hook_type):
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
+    registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
     if os.environ.get('XTIER_ENGRAM_ROWS', '') == 'nvme':
         registry.register(f'{ENGRAM}.__init__', _init, hook_type.AROUND)
         registry.register(f'{ENGRAM}._owned_rows', _owned_rows, hook_type.REPLACE)

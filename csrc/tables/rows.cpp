@@ -22,6 +22,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <thread>
 #include <time.h>
 #include <unistd.h>
@@ -84,6 +85,32 @@ static const Segment &segment_of(const Store *s, uint64_t id) {
     (s->segments[mid].first <= id ? lo : hi) = mid;
   }
   return s->segments[lo];
+}
+
+// Interleave a fresh anonymous mapping over the NUMA nodes with memory (best effort, like xtier/engine/memory.py for
+// the pinned tables): the cache and the scales (DeepSeek: ~10 GB) would otherwise land on the node of the thread
+// that touches them first, beside the engine's node-bound expert shards, which then may find no pages there.
+static void interleave(void *addr, size_t length) {
+  static const unsigned long mask = [] {
+    unsigned long m = 0;
+    if (FILE *f = std::fopen("/sys/devices/system/node/has_memory", "r")) {
+      char text[256] = {0};
+      const size_t n = std::fread(text, 1, sizeof(text) - 1, f);
+      std::fclose(f);
+      text[n] = 0;
+      for (char *p = text; *p && *p != '\n';) {   // "0-7" or "0,2-3"
+        char *end;
+        const long lo = std::strtol(p, &end, 10);
+        if (end == p) break;
+        long hi = lo;
+        if (*end == '-') hi = std::strtol(end + 1, &end, 10);
+        for (long k = lo; k <= hi && k < 64; ++k) m |= 1ul << k;
+        p = *end == ',' ? end + 1 : end;
+      }
+    }
+    return m;
+  }();
+  if (mask) syscall(SYS_mbind, addr, length, 3 /* MPOL_INTERLEAVE */, &mask, 65ul, 0u);
 }
 
 static uint64_t now_ns() {
@@ -346,6 +373,8 @@ XTIER_API Store *xtier_rows_open(uint64_t nseg, const char *const *paths, const 
     s->cache = cache == MAP_FAILED ? nullptr : static_cast<uint8_t *>(cache);
     s->keys = keys == MAP_FAILED ? nullptr : static_cast<uint64_t *>(keys);
     if (!s->cache || !s->keys) return give_up(s, ENOMEM);
+    interleave(s->cache, s->slots * s->entry);
+    interleave(s->keys, s->slots * sizeof(uint64_t));
   }
   return s;
 }
@@ -373,6 +402,7 @@ XTIER_API int xtier_rows_preload_scales(Store *s) {
   const size_t allocation = std::max(((hi - lo) * SB + kPage - 1) & ~(kPage - 1), kPage);
   void *memory = mmap(nullptr, allocation, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (memory == MAP_FAILED) return -1;
+  interleave(memory, allocation);
   auto *data = static_cast<uint8_t *>(memory);
   uint8_t *bounce = nullptr;
   if (posix_memalign(reinterpret_cast<void **>(&bounce), kPage, kBounce)) {

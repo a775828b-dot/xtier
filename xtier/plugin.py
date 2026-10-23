@@ -47,8 +47,18 @@ def load() -> None:
         logger.debug('xtier %s: XTIER is not 1, nothing registered', __version__)
         return
     if os.environ.get('XTIER_MAIN_CPUS'):
+        # XTier places the threads itself. SGLang binds every scheduler to its GPU's NUMA node when the main process
+        # starts it (numactl, SGLANG_NUMA_BIND_V2): XTier's main CPUs of that node only (2 on the RTX PRO 5000 host)
+        # and a preferred memory policy that puts the scheduler's own allocations there, where the engine's
+        # node-bound shards then find no pages (10-23: OOM kill, CONSTRAINT_MEMORY_POLICY nodemask=0). Off here, in
+        # the main process, before any scheduler starts (an explicit --numa-node still applies).
+        os.environ.setdefault('SGLANG_AUTO_NUMA_BIND', '0')
         from xtier.engine import placement
         if not placement.deferred():   # with TP the rank's placement waits for its first MoE layer
             placement.apply(config.threads())
     if _in_scheduler():
         install()
+        # SGLang configures logging only after loading the plugins: one line on stderr
+        print(f'[xtier] {__version__}: hooks installed in scheduler pid {os.getpid()}, CPUs '
+              f'{len(os.sched_getaffinity(0))}, SGLANG_AUTO_NUMA_BIND={os.environ.get("SGLANG_AUTO_NUMA_BIND", "")}',
+              file=sys.stderr, flush=True)
