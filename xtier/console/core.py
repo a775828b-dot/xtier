@@ -24,16 +24,16 @@ CONFIGS = REPO / 'configs'
 PUBLIC = ('name', 'code', 'port', 'served', 'spec', 'arch', 'hardware', 'bench', 'notes')
 
 
-def common_options(spec, threads=('112', '96', '64')):
+def common_options(spec, threads=('112', '96', '64'), contexts=('524288', '393216', '262144')):
     """The options every model has: the packs (off = the README "官方 main" configuration), speculative decoding, the
-    context (= the KV pool) and the CPU engine's threads (the first one measured)."""
+    context (= the KV pool) and the CPU engine's threads (the first context and thread count are the measured ones)."""
     return [
         {'key': 'packs', 'label': '加速包', 'default': 'on',
          'choices': [['on', '开 · 实测配置'], ['off', '关 · 官方 main 基线']],
          'hint': '关：只保留跑起来必需的修正，与 README「官方 main」那行同一配置'},
         {'key': 'spec', 'label': f'{spec} 投机解码', 'default': 'on', 'choices': [['on', '开'], ['off', '关']]},
-        {'key': 'context', 'label': '上下文 / KV 池', 'default': '524288',
-         'choices': [['524288', '512K'], ['393216', '384K'], ['262144', '256K']]},
+        {'key': 'context', 'label': '上下文 / KV 池', 'default': contexts[0],
+         'choices': [[c, f'{int(c) // 1024}K'] for c in contexts]},
         {'key': 'threads', 'label': 'CPU 专家线程', 'default': threads[0],
          'choices': [[threads[0], f'{threads[0]} · 实测']] + [[t, t] for t in threads[1:]]},
     ]
