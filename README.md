@@ -23,7 +23,9 @@ xtier/
 ├── cache/     热专家缓存：每层槽数可不同，全部常驻的层不经过 CPU；自适应换入换出；常驻层的 prefill 直接在槽上算
 ├── planner/   规划器：决定每层由谁算、缓存多少（目前按配置，目标是 CPU 和 GPU 同时算完）
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
-├── packs/     加速包：qwen4_exp（PLE 表、hc_mix 重叠内核）、glm5_next（量化排除、DSA、NextN）、deepseek_v4（计划中）
+├── packs/     加速包：qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核）、glm5_next（量化排除、DSA、NextN）、
+│              deepseek_v4（Engram 行放 NVMe、SM120 候选索引器、FP8 GEMM 调优配置）
+├── tables/    大嵌入表的行放在 NVMe：多段多文件、任意行宽、行缓存、CUDA 图内查表
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
 configs/       每个"模型 × 硬件"的启动配置
@@ -49,7 +51,7 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 |---|---|---|
 | Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；解码总速度略高于生产；短提示 prefill 更快，8K 以上慢 6–17% |
 | GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：PPL 优于生产，速度约为生产的 80% |
-| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | MXFP4 格式已适配；Engram 表（189 GB）的 NVMe 行存储与图内查表已移植并逐位验证，接入官方模型与端到端待做（[设计](docs/design-engram-nvme.md)） |
+| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；速度与 DSpark 在做 |
 
 ## 版本更新
 

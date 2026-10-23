@@ -6,7 +6,7 @@ A pack's hooks only act when its model's code runs, so every selected pack is in
 import importlib
 import os
 
-PACKS = ('qwen4_exp', 'glm5_next')
+PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4')
 
 
 def selected() -> list[str]:

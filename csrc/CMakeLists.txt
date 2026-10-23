@@ -40,8 +40,10 @@ target_link_libraries(xtier_engine PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 # command ring. Needs the CUDA runtime headers / library and the driver library.
 set(XTIER_CUDA_ROOT "" CACHE PATH "CUDA runtime directory containing include/ and lib/")
 if(XTIER_CUDA_ROOT)
-  find_library(XTIER_CUDART cudart PATHS "${XTIER_CUDA_ROOT}/lib" "${XTIER_CUDA_ROOT}/lib64" NO_DEFAULT_PATH REQUIRED)
-  find_library(XTIER_CUDA_DRIVER cuda REQUIRED)
+  # pip's nvidia/cu13 has only libcudart.so.13 (no libcudart.so link), the driver may lack the libcuda.so dev link
+  find_library(XTIER_CUDART NAMES cudart libcudart.so.13 libcudart.so.12 PATHS "${XTIER_CUDA_ROOT}/lib" "${XTIER_CUDA_ROOT}/lib64"
+               NO_DEFAULT_PATH REQUIRED)
+  find_library(XTIER_CUDA_DRIVER NAMES cuda libcuda.so.1 REQUIRED)
   add_library(xtier_mailbox SHARED mailbox/mailbox.cpp)
   target_include_directories(xtier_mailbox PRIVATE include "${XTIER_CUDA_ROOT}/include")
   target_compile_features(xtier_mailbox PRIVATE cxx_std_17)
@@ -50,9 +52,9 @@ if(XTIER_CUDA_ROOT)
   set_target_properties(xtier_mailbox PROPERTIES BUILD_RPATH "$ORIGIN;${XTIER_CUDA_ROOT}/lib")
 endif()
 
-# Engram rows on NVMe (DeepSeek V4.1, packs/deepseek_v4): exact FP8 row retrieval with O_DIRECT / AIO and a bounded row
-# cache; its lookup calls no CUDA API (a cudaLaunchHostFunc node).
-add_library(xtier_engram SHARED engram/rows.cpp)
-target_compile_features(xtier_engram PRIVATE cxx_std_17)
-target_compile_options(xtier_engram PRIVATE -O2)
-target_link_libraries(xtier_engram PRIVATE Threads::Threads)
+# Row tables on NVMe (xtier.tables: DeepSeek V4.1 Engram, Qwen3.8 PLE n-grams): exact rows read with O_DIRECT, a
+# bounded row cache; the lookup calls no CUDA API (a cudaLaunchHostFunc node).
+add_library(xtier_tables SHARED tables/rows.cpp)
+target_compile_features(xtier_tables PRIVATE cxx_std_17)
+target_compile_options(xtier_tables PRIVATE -O2 -fvisibility=hidden -Wall -Wextra)
+target_link_libraries(xtier_tables PRIVATE Threads::Threads)

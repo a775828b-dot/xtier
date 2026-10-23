@@ -79,6 +79,15 @@ def hybrid_prefill_max() -> int:
     return _int('XTIER_HYBRID_PREFILL_MAX', 2560)
 
 
+def split_prefill_max() -> int:
+    """XTIER_SPLIT_PREFILL_MAX=0: GPU prefill calls of up to this many tokens on a layer uploaded in expert chunks
+    split the experts: the GPU takes the first g (whole chunks) and the CPU engine the others at the same time, g
+    balancing the measured upload time per expert against the CPU time per expert and token (lkqmoe 0.5.6's hybrid
+    prefill; DeepSeek V4.1 production: 6144). XTIER_SPLIT_CPU_US=0.285: the first CPU estimate in microseconds per
+    expert and token at H 5120 x I 2304 (scaled by H x I)."""
+    return _int('XTIER_SPLIT_PREFILL_MAX', 0)
+
+
 def resident_prefill() -> bool:
     """XTIER_CACHE_PREFILL=packed (default): a fully cached layer's prefill runs on the packed slots in place;
     staged: through the GPU prefill's staging and BF16 unpack, like a host layer."""

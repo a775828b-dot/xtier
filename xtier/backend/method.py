@@ -15,7 +15,9 @@ Forward, per call of m tokens:
 - prefill of a partly cached layer below XTIER_HYBRID_PREFILL_MAX tokens: cached routes on the GPU, the others on the
   CPU at the same time (cache/prefill.py, hybrid_prefill);
 - other prefill of at least XTIER_GPU_PREFILL_MIN tokens: on the GPU (backend/prefill.py: expert chunks uploaded
-  from the engine's pinned shards, grouped BF16 GEMMs, FP32 route sums);
+  from the engine's pinned shards, grouped BF16 GEMMs, FP32 route sums); up to XTIER_SPLIT_PREFILL_MAX tokens on a
+  layer uploaded in expert chunks, the GPU takes the first g experts and the CPU the others at the same time
+  (_split_prefill);
 - the rest: synchronously on the CPU in batches of XTIER_CPU_PREFILL_BATCH tokens.
 Numerics are the engine's or the GPU prefill's (BF16 operands, FP32 accumulation); the output is rounded to the
 input dtype.
@@ -23,6 +25,8 @@ input dtype.
 
 import dataclasses
 import logging
+import os
+import threading
 import time
 
 import torch
@@ -61,7 +65,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self.plan = None
         self.prefill = None
         self.mailbox = None
-        self.calls = dict(decode=0, cpu_prefill=0, gpu_prefill=0, hybrid_prefill=0)
+        self.calls = dict(decode=0, cpu_prefill=0, gpu_prefill=0, hybrid_prefill=0, split_prefill=0)
 
     # -- construction ---------------------------------------------------------------------------------------------
     def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype,
@@ -218,10 +222,15 @@ class XTierMoEMethod(FusedMoEMethodBase):
             self.calls['hybrid_prefill'] += 1
         elif 0 < config.gpu_prefill_min() <= m or (self.pool is not None and self.pool.full):
             self._cache_start()
-            out = torch.empty_like(x)
-            self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k,
-                             torch.cuda.current_stream().cuda_stream)
-            self.calls['gpu_prefill'] += 1
+            split = config.split_prefill_max()
+            if (self.pool is None or not self.pool.full) and m <= split and self.prefill.chunk < self.experts:
+                out = self._split_prefill(x, ids, weights, m, k)
+                self.calls['split_prefill'] += 1
+            else:
+                out = torch.empty_like(x)
+                self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k,
+                                 torch.cuda.current_stream().cuda_stream)
+                self.calls['gpu_prefill'] += 1
         else:
             self._cache_start()
             out = self._cpu_prefill(x, ids, weights, m, k)
@@ -274,6 +283,76 @@ class XTierMoEMethod(FusedMoEMethodBase):
                               w_h.data_ptr() + start * k * 4, out_h.data_ptr() + start * H * 4)
         # pinned blocks are reused only after the copy completes (the caching host allocator records the stream)
         return out_h.to(x.device, non_blocking=True)
+
+    _split_cost = None   # {gpu_ms per expert, cpu_ms per expert and token}, shared by the layers of the process
+
+    def _split_experts(self, m):
+        """Experts [0, g) for the GPU: g balances the upload time per expert against the CPU time per expert and
+        token, in whole upload chunks; both costs are refined from measured calls."""
+        E, CH = self.experts, self.prefill.chunk
+        cost = XTierMoEMethod._split_cost
+        if cost is None:
+            scale = self.hidden * self.inter / (5120 * 2304)
+            per_expert = 3 * self.hidden * self.inter * 9 // 16   # FP4 weights and scales
+            cost = XTierMoEMethod._split_cost = dict(
+                gpu_ms=per_expert / 55e9 * 1e3,   # upload-bound GPU
+                cpu_ms=float(os.environ.get('XTIER_SPLIT_CPU_US', '0.285')) * scale / 1e3)
+        cpu = cost['cpu_ms'] * m
+        g = E * cpu / (cost['gpu_ms'] + cpu)
+        return max(CH, min(E, int(round(g / CH)) * CH))
+
+    def _split_prefill(self, x, ids, weights, m, k):
+        """Expert-split prefill (lkqmoe 0.5.6's hybrid prefill): the routes to experts [0, g) through the GPU
+        prefill (g whole upload chunks; the other routes get id -1), the others on the CPU engine in a thread at the
+        same time; the FP32 partial outputs add up."""
+        H, E = self.hidden, self.experts
+        g = self._split_experts(m)
+        stream = torch.cuda.current_stream().cuda_stream
+        if g >= E:
+            out = torch.empty_like(x)
+            self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream)
+            return out
+        gpu = ids < g
+        ids_g = torch.where(gpu, ids, -1).to(torch.int32).contiguous()
+        w_g = torch.where(gpu, weights, 0.0).contiguous()
+        x_h = torch.empty((m, H), dtype=torch.bfloat16, pin_memory=True)
+        ids_h = torch.empty((m, k), dtype=torch.int32, pin_memory=True)
+        w_h = torch.empty((m, k), dtype=torch.float32, pin_memory=True)
+        out_c = torch.empty((m, H), dtype=torch.float32, pin_memory=True)
+        x_h.copy_(x, non_blocking=True)
+        ids_h.copy_(torch.where(gpu, -1, ids), non_blocking=True)
+        w_h.copy_(torch.where(gpu, 0.0, weights), non_blocking=True)
+        staged = torch.cuda.Event()
+        staged.record()
+        timing, batch = {}, config.cpu_prefill_batch()
+
+        def cpu_part():
+            staged.synchronize()
+            t0 = time.perf_counter()
+            for start in range(0, m, batch):
+                n = min(batch, m - start)
+                self.plan.forward(n, k, x_h.data_ptr() + start * H * 2, ids_h.data_ptr() + start * k * 4,
+                                  w_h.data_ptr() + start * k * 4, out_c.data_ptr() + start * H * 4)
+            timing['cpu'] = time.perf_counter() - t0
+
+        worker = threading.Thread(target=cpu_part, name='xtier-split-cpu')
+        worker.start()
+        out_g = torch.empty((m, H), dtype=torch.float32, device=x.device)
+        t0 = time.perf_counter()
+        try:
+            self.prefill.run(x.data_ptr(), out_g.data_ptr(), ids_g.data_ptr(), w_g.data_ptr(), m, k, stream,
+                             output_dtype=torch.float32)
+            gpu_s = time.perf_counter() - t0   # the GPU part only; the join may wait for the CPU
+        finally:
+            worker.join()
+        out = out_g + out_c.to(x.device, non_blocking=True)
+        cost = XTierMoEMethod._split_cost
+        if 'cpu' in timing:
+            cost['cpu_ms'] = 0.8 * cost['cpu_ms'] + 0.2 * timing['cpu'] * 1e3 / ((E - g) * m)
+        cost['gpu_ms'] = 0.8 * cost['gpu_ms'] + 0.2 * gpu_s * 1e3 / g
+        self.last_split = dict(m=m, gpu_experts=g, cpu_ms=round(timing.get('cpu', 0) * 1e3, 1),
+                               gpu_ms=round(gpu_s * 1e3, 1))
+        return out
 
     @classmethod
     def _localize_all(cls):

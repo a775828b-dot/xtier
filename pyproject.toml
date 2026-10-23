@@ -20,3 +20,7 @@ xtier = "xtier.plugin:load"
 
 [tool.setuptools.packages.find]
 include = ["xtier*"]
+
+[tool.setuptools.package-data]
+# the libraries built by tools/build_engine.sh and the DeepSeek pack's tuned GEMM configs
+xtier = ["engine/lib/*.so", "packs/deepseek_v4/fp8_configs/*.json"]

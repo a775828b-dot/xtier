@@ -9,10 +9,11 @@ The CPU expert engine and the CPU-GPU mailbox, ported from lkqmoe 0.5.6 (commit 
 | `engine/dispatch.cpp` | `libxtier_engine.so`: exports the API and loads the AVX512 or AVX2 build next to it on first use (`XTIER_ISA=avx512\|avx2` forces one). |
 | `mailbox/mailbox.cpp` | `libxtier_mailbox.so`: mapped host mailboxes polled by one dispatcher thread, stream memory operations instead of host callbacks (CUDA-graph capturable), and the expert-pool command ring with its policy thread. |
 | `include/xtier_engine.h`, `include/xtier_mailbox.h` | C APIs. |
-| `engram/rows.cpp` | `libxtier_engram.so`: DeepSeek V4.1 Engram rows on NVMe (O_DIRECT / AIO reads, bounded row cache, preloaded scales, TP row range), ported from the 1017 pipeline by [tools/port_engram.py](../tools/port_engram.py); its lookup calls no CUDA API. |
+| `tables/rows.cpp` | `libxtier_tables.so`: rows of large embedding tables read from the checkpoint files on NVMe (DeepSeek V4.1 Engram, Qwen3.8 PLE n-grams): any row width with optional scale bytes, one table over many tensors and files, O_DIRECT reads on a reader pool, bounded row cache, preloaded scales, TP row range; grown from the 1017 pipeline's `row_store.cpp`; its lookup calls no CUDA API ([design](../docs/design-tables-nvme.md)). |
 
 Build: `tools/build_engine.sh [CUDA_ROOT]` (CMake; the AVX512 build uses the one-row Down microkernel, `XTIER_AVX512_DOWN_R4=1`,
-like the lkqmoe release). Check: `tests/engine_ab.py` (one real layer, output digests and timings).
+like the lkqmoe release). Check: `tests/engine_ab.py` (one real layer, output digests and timings); `tools/isa_check.sh` (no AVX512
+instruction in the libraries an AVX2-only host loads).
 
 Status (2026-10-23): on one real layer of Qwen3.8 Flash Next (NVFP4), GLM-5.3 Flash (NVFP4) and DeepSeek V4.1 Flash 1017 (MXFP4),
 9 shapes each (1 to 2048 tokens, decode and verify routing), the outputs equal lkqmoe 0.5.6 bit for bit with both the AVX512 and

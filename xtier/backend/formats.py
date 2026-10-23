@@ -80,4 +80,6 @@ def detect(gpu_method) -> Format:
         return ModelOptNvFp4()
     if name == 'Fp8MoEMethod' and getattr(gpu_method, 'is_fp4_expert', False):
         return Fp8Fp4Experts()
+    if name == 'Mxfp4FlashinferCutlassMoEMethod' and getattr(getattr(gpu_method, '_fp8', None), 'is_fp4_expert', False):
+        return Fp8Fp4Experts()   # SGLang's SM90 / SM120 choice for these experts: Fp8MoEMethod's parameters, E8M0 scales
     raise NotImplementedError(f'xtier: no CPU engine format for the MoE method {name}')
