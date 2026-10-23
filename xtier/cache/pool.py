@@ -143,7 +143,8 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
 
 @triton.jit
 def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
-             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False):
+             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
+             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -169,7 +170,10 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
     if LIMIT > 0:
         u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
         g = tl.minimum(g, LIMIT)
-    val = g / (1.0 + tl.exp(-g)) * u
+    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+        val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
+    else:
+        val = g / (1.0 + tl.exp(-g)) * u
     tl.store(MID + (p * BM + tok[:, None]) * I + n[None, :], val.to(tl.bfloat16), mask=tok[:, None] < M)
 
 
@@ -269,6 +273,7 @@ class LayerPool:
         self.layer_id = layer_id
         H, I, E = prefill.hidden, prefill.inter, prefill.experts
         self.H, self.I, self.E, self.limit = H, I, E, float(prefill.swiglu_limit)
+        self.alpha, self.beta = prefill.swiglu_alpha, prefill.swiglu_beta
         self.full = self.S >= E
         self.S = min(self.S, E)
         self.bk_h, self.bk_i = _tile_k(H), _tile_k(I)   # gate/up reduce over H, down over I
@@ -342,7 +347,8 @@ class LayerPool:
         xb = Pointer(x, torch.bfloat16)
         _gate_up[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], self.arena[0], self.arena[2], g13,
                                         sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
-                                        MX=self.prefill.mxfp4, num_warps=cfg['gw'], num_stages=cfg['gs'])
+                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
+                                        num_warps=cfg['gw'], num_stages=cfg['gs'])
         _down[(nk, H // cfg['dbn'])](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
                                      sc['part'], m, H, I, MAX_M, cfg['dbn'], self.bk_i,
                                      MX=self.prefill.mxfp4, num_warps=cfg['dw'], num_stages=cfg['ds'])

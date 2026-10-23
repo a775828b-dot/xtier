@@ -28,6 +28,9 @@ def engine() -> C.CDLL:
         lib = C.CDLL(str(lib_dir() / 'libxtier_engine.so'))
         lib.xtier_create3.argtypes = [_I, _I, _I, _I, C.c_float, _I] + [_P] * 6
         lib.xtier_create3.restype = _P
+        if hasattr(lib, 'xtier_set_swiglu'):   # builds before 2026-10-24 have the plain SiLU only
+            lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
+            lib.xtier_set_swiglu.restype = _I
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
         lib.xtier_forward.restype = _I
         lib.xtier_destroy.argtypes = [_P]
@@ -63,7 +66,8 @@ class CpuPlan:
     E4M3 for NVFP4, 32 UE8M0 for MXFP4) and g13 [E, 2], g2 [E] (float32; all ones for MXFP4). The engine keeps its own
     sharded copy: the inputs can be released after construction."""
 
-    def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4'):
+    def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
+                 swiglu_alpha=1.0, swiglu_beta=0.0):
         if scale_format not in SCALE_FORMATS:
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
@@ -73,6 +77,12 @@ class CpuPlan:
                                            SCALE_FORMATS[scale_format], *weight_pointers)
         if not self.plan:
             raise RuntimeError(self.lib.xtier_last_error().decode())
+        # GPT-OSS SwiGLU (MiniMax M3): gate * sigmoid(alpha * gate) * (up + beta); 1 / 0 keep the plain SiLU path
+        if (swiglu_alpha, swiglu_beta) != (1.0, 0.0):
+            if not hasattr(self.lib, 'xtier_set_swiglu'):
+                raise RuntimeError('xtier: this engine build has no GPT-OSS SwiGLU; rebuild it (tools/build_engine.sh)')
+            if self.lib.xtier_set_swiglu(self.plan, swiglu_alpha, swiglu_beta):
+                raise RuntimeError(self.lib.xtier_last_error().decode())
         self._localized = False
 
     def forward(self, m, k, x, ids, routing, out):

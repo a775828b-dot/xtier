@@ -20,6 +20,7 @@ struct Impl {
     const char *(*isa)();
     void *(*create3)(int,int,int,int,float,int,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
     void *(*create2)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
+    int (*set_swiglu)(void*,float,float);
     int (*shape)(void*,int*);
     int (*read_probe)(void*,int,int,const uint16_t*,const int32_t*,const float*,float*);
     int (*forward)(void*,int,int,const uint16_t*,const int32_t*,const float*,float*);
@@ -63,7 +64,7 @@ const Impl *load(const char *isa) {
     Impl &m=impl_storage;std::string p=std::string(isa)+"_";
     bool ok=bind(h,p,"xtier_last_error",m.last_error)&&bind(h,p,"xtier_isa",m.isa)&&
             bind(h,p,"xtier_create3",m.create3)&&bind(h,p,"xtier_create2",m.create2)&&
-            bind(h,p,"xtier_shape",m.shape)&&bind(h,p,"xtier_read_probe",m.read_probe)&&
+            bind(h,p,"xtier_set_swiglu",m.set_swiglu)&&bind(h,p,"xtier_shape",m.shape)&&bind(h,p,"xtier_read_probe",m.read_probe)&&
             bind(h,p,"xtier_forward",m.forward)&&bind(h,p,"xtier_retain",m.retain)&&
             bind(h,p,"xtier_destroy",m.destroy)&&bind(h,p,"xtier_last_timings",m.last_timings)&&
             bind(h,p,"xtier_localize",m.localize)&&bind(h,p,"xtier_shard",m.shard)&&
@@ -109,6 +110,7 @@ void *xtier_create2(int hidden,int inter,int experts,int threads,float swiglu_li
                      const float *g13,const float *g2) {
     auto p=impl();return p?p->create2(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2):nullptr;
 }
+int xtier_set_swiglu(void *plan,float alpha,float beta){auto p=impl();return p?p->set_swiglu(plan,alpha,beta):-1;}
 int xtier_shape(void *plan,int *out){auto p=impl();return p?p->shape(plan,out):-1;}
 int xtier_read_probe(void *plan,int m,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) {
     auto p=impl();return p?p->read_probe(plan,m,k,x,ids,rw,y):-1;

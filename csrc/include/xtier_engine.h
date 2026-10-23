@@ -35,6 +35,9 @@ void *xtier_create2(int hidden, int inter, int experts, int threads, float swigl
 void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int scale_format,
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                     const float *g13,const float *g2);
+// GPT-OSS SwiGLU (MiniMax M3): gate*sigmoid(alpha*gate)*(up+beta) after the clamp. The defaults 1 / 0 keep the
+// plain SiLU path; set before the first forward. 0 on success.
+int xtier_set_swiglu(void *plan, float alpha, float beta);
 // Four ints: hidden, inter, experts, largest decode batch per CUDA slot (8).
 int xtier_shape(void *plan, int *shape);
 

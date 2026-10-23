@@ -15,7 +15,12 @@ PRESETS = {
                'nvfp4', {'SPIN_COUNT': '1048576'}),
     'ds41_1017': ('/data/fast/nvme1/models/deepseek-ai/DeepSeek-V4.1-Flash-1017', 'layers.{layer}.ffn.experts.{e}.', ('w1', 'w3', 'w2'),
                   5120, 2304, 384, 6, 10.0, 20, 6, 'mxfp4', {'DYNAMIC': '2', 'DOWN_BF16': '1', 'DOWN_GRAIN': '24', 'SPIN_COUNT': '1048576', 'THP': '0'}),
+    # compressed-tensors NVFP4 W4A4 (weight_packed, weight_global_scale = 1 / scale_2)
+    'minimax_m31': ('/data/fast/nvme2/models/modelscope/MiniMax/MiniMax-M3.1-Flash', 'language_model.model.layers.{layer}.block_sparse_moe.experts.{e}.',
+                    ('w1', 'w3', 'w2'), 6144, 3072, 128, 4, 7.0, 20, 8, 'nvfp4', {'SPIN_COUNT': '1048576'}),
 }
+# GPT-OSS SwiGLU (alpha, beta) of a preset: gate * sigmoid(alpha * gate) * (up + beta); the others (1, 0) = SiLU
+SWIGLU = {'minimax_m31': (1.702, 1.0)}
 
 
 def load(preset, layer=None):
@@ -29,18 +34,22 @@ def load(preset, layer=None):
     s13 = torch.empty((E, 2 * I, H // G), dtype=torch.uint8); s2 = torch.empty((E, H, I // G), dtype=torch.uint8)
     g13 = torch.ones((E, 2), dtype=torch.float32); g2 = torch.ones((E,), dtype=torch.float32)
     scale_suffix = '.scale' if FMT == 'mxfp4' else '.weight_scale'
+    packed = KEY.format(layer=layer, e=0) + NAMES[0] + '.weight_packed' in index   # compressed-tensors naming
+    weight_suffix = '.weight_packed' if packed else '.weight'
     grouped = {}
     for e in range(E):
         p = KEY.format(layer=layer, e=e)
         for role, n in zip(('gate', 'up', 'down'), NAMES):
-            grouped.setdefault(index[p + n + '.weight'], []).append((e, p, n, role))
+            grouped.setdefault(index[p + n + weight_suffix], []).append((e, p, n, role))
     for file, items in grouped.items():
         with safe_open(root / file, framework='pt', device='cpu') as f:
             for e, p, n, role in items:
                 w, s, g, rows = {'gate': (w13[e], s13[e], g13[e, 0], slice(0, I)), 'up': (w13[e], s13[e], g13[e, 1], slice(I, 2 * I)),
                                  'down': (w2[e], s2[e], g2[e], slice(None))}[role]
-                w[rows].copy_(f.get_tensor(p + n + '.weight').view(torch.uint8))
+                w[rows].copy_(f.get_tensor(p + n + weight_suffix).view(torch.uint8))
                 s[rows].copy_(f.get_tensor(p + n + scale_suffix).view(torch.uint8))
-                if FMT == 'nvfp4':
+                if packed:
+                    g.copy_(f.get_tensor(p + n + '.weight_global_scale').float().reciprocal().reshape(()))
+                elif FMT == 'nvfp4':
                     g.copy_(f.get_tensor(p + n + '.weight_scale_2'))
     return w13, w2, s13, s2, g13, g2

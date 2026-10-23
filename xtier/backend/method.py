@@ -78,13 +78,15 @@ class XTierMoEMethod(FusedMoEMethodBase):
             ('expert bias', bool(extra_weight_attrs.get('with_bias'))),
             ('router weight on input', rc.apply_router_weight_on_input),
             ('fused shared experts', layer.num_fused_shared_experts > 0),
-            ('gemm1 alpha / beta', rc.gemm1_alpha is not None or rc.gemm1_beta is not None),
             ('expert parallel MoE', layer.moe_ep_size > 1),
             ('params dtype', params_dtype != torch.bfloat16)) if bad]
         if unsupported:
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
         self.hidden, self.inter, self.experts = hidden_size, intermediate_size_per_partition, num_experts
         self.swiglu_limit = float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
+        # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta)
+        self.swiglu_alpha = 1.0 if rc.gemm1_alpha is None else float(rc.gemm1_alpha)
+        self.swiglu_beta = 0.0 if rc.gemm1_beta is None else float(rc.gemm1_beta)
         extra_weight_attrs['weight_loader'] = self._tracking_loader(layer, extra_weight_attrs['weight_loader'])
         with torch.device('cpu'):
             self.gpu_method.create_weights(layer, num_experts, hidden_size, intermediate_size_per_partition,
@@ -95,6 +97,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # FusedMoE's loader follows this method's layout (row order, scale shapes, shard handling).
         layer.weight_load_method = self.gpu_method
         own = {id(p): n for n, p in layer.named_parameters(recurse=False)}
+        missing = sorted(set(self.format.required) - set(own.values()))
+        if missing:   # e.g. a compressed-tensors scheme other than NVFP4: its experts would never complete
+            scheme = type(getattr(layer, 'scheme', self.gpu_method)).__name__
+            raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: {scheme} creates no {", ".join(missing)} '
+                                      f'({self.format.name} format)')
         self._names = {i: n for i, n in own.items() if n in self.format.required}
         self._shards = {n: [set() for _ in range(num_experts)] for n in self.format.required}   # loaded shard ids
         self._missing = {n: num_experts for n in self.format.required}                        # incomplete experts
@@ -157,10 +164,12 @@ class XTierMoEMethod(FusedMoEMethodBase):
         t0 = time.perf_counter()
         pointers = [t.data_ptr() for t in inputs]
         self.plan = CpuPlan(self.experts, self.cfg.threads, pointers, hidden=self.hidden, inter=self.inter,
-                            swiglu_limit=self.swiglu_limit, scale_format=self.format.name)
+                            swiglu_limit=self.swiglu_limit, scale_format=self.format.name,
+                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta)
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
-                               swiglu_limit=self.swiglu_limit)
+                               swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
+                               swiglu_beta=self.swiglu_beta)
         self.prefill.order = self.cfg.layer_id   # the cross-layer prefetch links layers in this order
         del inputs, pointers
         self.mailbox = Mailbox(self.plan)

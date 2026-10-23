@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from layers import PRESETS, load  # noqa: E402
+from layers import PRESETS, SWIGLU, load  # noqa: E402
 
 P = argparse.ArgumentParser()
 P.add_argument('--preset', choices=sorted(PRESETS), required=True)
@@ -22,6 +22,7 @@ P.add_argument('--lengths', default='100,500,1000,2000')
 P.add_argument('--tolerance', type=float, default=0.02)
 A = P.parse_args()
 MODEL, KEY, NAMES, H, I, E, K, LIMIT, LAYER, VM, FMT, SWITCHES = PRESETS[A.preset]
+ALPHA, BETA = SWIGLU.get(A.preset, (1.0, 0.0))
 for name, value in SWITCHES.items():
     os.environ.setdefault('XTIER_' + name, value)
 os.environ['XTIER_CACHE_ADAPT'] = '0'
@@ -35,9 +36,10 @@ from xtier.engine import CpuPlan, Mailbox  # noqa: E402
 
 weights = load(A.preset)
 pointers = [t.data_ptr() for t in weights]
-plan = CpuPlan(E, A.threads, pointers, hidden=H, inter=I, swiglu_limit=LIMIT, scale_format=FMT)
+plan = CpuPlan(E, A.threads, pointers, hidden=H, inter=I, swiglu_limit=LIMIT, scale_format=FMT, swiglu_alpha=ALPHA,
+               swiglu_beta=BETA)
 plan.pool = None
-prefill = Prefill(E, pointers, native=plan, hidden=H, inter=I, swiglu_limit=LIMIT)
+prefill = Prefill(E, pointers, native=plan, hidden=H, inter=I, swiglu_limit=LIMIT, swiglu_alpha=ALPHA, swiglu_beta=BETA)
 del weights, pointers
 box = Mailbox(plan)
 pool = LayerPool(prefill, A.slots, plan, box, LAYER)

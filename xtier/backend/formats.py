@@ -45,6 +45,24 @@ class ModelOptNvFp4(Format):
                 layer.w2_weight_scale_2.data.float().contiguous())
 
 
+class CompressedTensorsNvFp4(Format):
+    """compressed-tensors NVFP4 W4A4 (MiniMax M3.1's routed experts): packed E2M1 weights, E4M3 scales per 16 and an
+    FP32 global scale per expert and projection that divides (ModelOpt's scale_2 is its reciprocal). The activations'
+    FP4 global scales are not needed: the engine and XTier's GPU kernels multiply BF16 activations."""
+    name = 'nvfp4'
+    required = {'w13_weight_packed': 'w13', 'w2_weight_packed': 'w2', 'w13_weight_scale': 'w13', 'w2_weight_scale': 'w2',
+                'w13_weight_global_scale': 'w13', 'w2_weight_global_scale': 'w2'}
+
+    def engine_inputs(self, layer, up_first):
+        g13 = layer.w13_weight_global_scale.data.float().reciprocal()   # per-tensor scales always stay [gate, up]
+        if g13.dim() == 1:
+            g13 = g13[:, None].expand(-1, 2)
+        return (_gate_up(layer.w13_weight_packed.data, up_first), layer.w2_weight_packed.data.contiguous(),
+                _gate_up(layer.w13_weight_scale.data.view(torch.uint8), up_first),
+                layer.w2_weight_scale.data.view(torch.uint8).contiguous(), g13.contiguous(),
+                layer.w2_weight_global_scale.data.float().reciprocal().contiguous())
+
+
 def _ue8m0_bytes(t: torch.Tensor) -> torch.Tensor:
     """UE8M0 block scales as bytes: SGLang keeps them as float32 powers of two (float8_e8m0fnu with aiter / XPU); the
     exponent field of a float32 2^(e-127) is e, including 2^-127 (exponent field 0)."""
@@ -82,4 +100,6 @@ def detect(gpu_method) -> Format:
         return Fp8Fp4Experts()
     if name == 'Mxfp4FlashinferCutlassMoEMethod' and getattr(getattr(gpu_method, '_fp8', None), 'is_fp4_expert', False):
         return Fp8Fp4Experts()   # SGLang's SM90 / SM120 choice for these experts: Fp8MoEMethod's parameters, E8M0 scales
+    if name == 'CompressedTensorsFusedMoEMethod':
+        return CompressedTensorsNvFp4()   # the scheme sits on the layer: checked once the parameters exist
     raise NotImplementedError(f'xtier: no CPU engine format for the MoE method {name}')

@@ -534,6 +534,7 @@ struct PlanBase {
     virtual int localize()=0;
     virtual int node_count() const=0;
     virtual void shard(int,void**,size_t*) const=0;
+    virtual void set_swiglu(float alpha,float beta)=0;
 };
 template<bool MX> class Plan: public PlanBase {
     static constexpr int scale_format=MX?1:0,scale_shift=MX?5:4;
@@ -551,6 +552,9 @@ template<bool MX> class Plan: public PlanBase {
     }
     int hidden,inter,experts;
     float swiglu_limit;
+    // GPT-OSS SwiGLU (MiniMax M3): gate*sigmoid(alpha*gate)*(up+beta) after the clamp; 1 / 0 = the plain SiLU path
+    float swiglu_alpha=1.f,swiglu_beta=0.f;
+    void set_swiglu(float alpha,float beta) override {swiglu_alpha=alpha;swiglu_beta=beta;}
     std::shared_ptr<Executor> pool;
     std::vector<Shard> shards;  // one per worker node
     int nodes=4;
@@ -618,6 +622,7 @@ template<bool MX> class Plan: public PlanBase {
         const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes;
         // Locals: stores into the intermediate must not force reloads of float members.
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;
+        const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
         const float scale_gate=globals13[2*group_expert(g)],scale_up=globals13[2*group_expert(g)+1];
         const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;
         const uint16_t *xs[M];for(int t=0;t<M;t++)xs[t]=input+size_t(group.token[t])*H;
@@ -646,7 +651,7 @@ template<bool MX> class Plan: public PlanBase {
                     up=std::min(std::max(up,-limit),limit);
                     gate=std::min(gate,limit);
                 }
-                float value=(gate/(1.f+std::exp(-gate)))*up;
+                float value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
                 size_t at=(size_t(group.row)+t)*I+node*IN+r+j;
                 if(down_bf16)reinterpret_cast<uint16_t*>(out_mid)[at]=tobf(value);
                 else out_mid[at]=value;
@@ -724,6 +729,7 @@ template<bool MX> class Plan: public PlanBase {
         static_assert(R==1||MT==1,"two rows per iteration only for one token");
         const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes;
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;const bool round=down_bf16;
+        const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
         const float scale_gate=globals13[2*group_expert(g)],scale_up=globals13[2*group_expert(g)+1];
         const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;
         const uint16_t *x1=input+size_t(group.token[t0])*H;
@@ -782,7 +788,7 @@ template<bool MX> class Plan: public PlanBase {
                     up=std::min(std::max(up,-limit),limit);
                     gate=std::min(gate,limit);
                 }
-                float value=(gate/(1.f+std::exp(-gate)))*up;
+                float value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
                 // The intermediate stays FP32 here; XTIER_DOWN_BF16 rounds its values only.
                 out_mid[(size_t(group.row)+t0+t)*I+node*IN+r+j]=round?round_bf16(value):value;
             }
@@ -1173,6 +1179,10 @@ void *XTIER_API(xtier_create2)(int hidden,int inter,int experts,int threads,floa
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                     const float *g13,const float *g2) {
     return XTIER_API(xtier_create3)(hidden,inter,experts,threads,limit,0,w13,w2,s13,s2,g13,g2);
+}
+int XTIER_API(xtier_set_swiglu)(void *plan,float alpha,float beta) {
+    if(!plan||!(alpha>0.f)){last_error="Invalid SwiGLU parameters";return -1;}
+    static_cast<Handle*>(plan)->plan->set_swiglu(alpha,beta);return 0;
 }
 int XTIER_API(xtier_shape)(void *plan,int *out) {
     if(!plan||!out){last_error="Invalid shape query";return -1;}

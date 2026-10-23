@@ -58,7 +58,8 @@ def _unpack_all(W, S, D, ROWS: tl.constexpr, COLS: tl.constexpr, B: tl.constexpr
 @tr.jit
 def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
           K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, UNPACKED: tl.constexpr,
-          HID: tl.constexpr, INT: tl.constexpr, LIMIT: tl.constexpr, MX: tl.constexpr = False):
+          HID: tl.constexpr, INT: tl.constexpr, LIMIT: tl.constexpr, MX: tl.constexpr = False,
+          ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)  # expert offsets exceed 2**31 for DeepSeek V4.1
     ew = e - E0  # index inside the staged expert chunk; global scales use e
@@ -86,7 +87,10 @@ def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
         # Clamped SwiGLU (DeepSeek V4): up to [-L,L], gate to (-inf,L].
         up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
         gate = tl.minimum(gate, LIMIT)
-    value = gate / (1. + tl.exp(-gate)) * up
+    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+        value = gate / (1. + tl.exp(-ALPHA * gate)) * (up + BETA)
+    else:
+        value = gate / (1. + tl.exp(-gate)) * up
     tl.store(MID + (r - R0)[:, None] * INT + n[None, :], value, (r < end)[:, None])
 
 
@@ -281,13 +285,16 @@ class Prefill:
     the FP32 route sum runs in chunk order instead, see __init__).
     """
 
-    def __init__(self, experts, pointers, native=None, hidden=2560, inter=640, swiglu_limit=0.0):
+    def __init__(self, experts, pointers, native=None, hidden=2560, inter=640, swiglu_limit=0.0, swiglu_alpha=1.0,
+                 swiglu_beta=0.0):
         self.mxfp4 = getattr(native, 'scale_format', 'nvfp4') == 'mxfp4'
         if self.mxfp4 and os.environ.get('XTIER_PREFILL_FROM_SHARDS', '1') != '1':
             raise ValueError('MXFP4 requires native scale shards')
         self.scale_group = 32 if self.mxfp4 else 16
         self.experts = experts
         self.hidden, self.inter, self.swiglu_limit = int(hidden), int(inter), float(swiglu_limit)
+        # GPT-OSS SwiGLU (MiniMax M3): gate * sigmoid(alpha * gate) * (up + beta); 1 / 0 = plain SiLU
+        self.swiglu_alpha, self.swiglu_beta = float(swiglu_alpha), float(swiglu_beta)
         H, I = self.hidden, self.inter
         self.layout = _shard_layout(H, I, group=self.scale_group)
         # Experts per uploaded chunk. Default: the whole layer while its unpacked BF16
@@ -588,7 +595,8 @@ class Prefill:
                     e0 = j * CH
                     _gate[(t1 - t0, I // gbn)](Pointer(x+start*H*2, torch.bfloat16), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, e0, r0,
-                                             k, tm, gbn, gbk, unpacked, H, I, self.swiglu_limit, MX=self.mxfp4, **gate_opts)
+                                             k, tm, gbn, gbk, unpacked, H, I, self.swiglu_limit, MX=self.mxfp4,
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, **gate_opts)
                     stamp('gate')
                     if self.down_tile128:
                         _down[(t1 - t0, H // 128)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
@@ -1046,7 +1054,8 @@ class Prefill:
                     s13, s2 = _slots[0][2], _slots[0][3]  # not read with unpacked weights
                     _gate[(t1 - t0, I // gbn)](Pointer(x, torch.bfloat16), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, j * CH, r0,
-                                             k, tm, gbn, gbk, True, H, I, self.swiglu_limit, MX=self.mxfp4, **gate_opts)
+                                             k, tm, gbn, gbk, True, H, I, self.swiglu_limit, MX=self.mxfp4,
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, **gate_opts)
                     _down[(t1 - t0, H // dbn)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                               meta[2, t0:t1], routes, j * CH, r0,
                                               tm, dbn, dbk, precision, True, H, I, True, MX=self.mxfp4, **down_opts)
