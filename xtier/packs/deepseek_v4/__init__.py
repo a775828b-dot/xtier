@@ -13,6 +13,10 @@
 - Tuned W8A8 block-FP8 GEMM configs (fp8_configs/, from the 1017 pipeline's bench/ds41_fp8_tune.py): SGLang has none
   for DeepSeek V4.1's 32 x 32 block projections on SM120 and runs one default tile for every shape, 1.5-4.6x slower
   at decode sizes (on the RTX PRO 5000 63 ms of a 68 ms decode step). Files of this directory win over SGLang's own.
+- MXFP8 dense GEMMs at decode sizes on b12x: with --fp8-gemm-backend flashinfer_cutlass SGLang serves the
+  32 x 32 block FP8 projections as MXFP8 on FlashInfer CUTLASS (on auto it keeps the Triton block kernel, which on
+  SM120 has no split-K); calls of XTIER_MXFP8_B12X_ROWS rows (default 1, 4, 6: decode and DSpark verify widths,
+  as the 1017 pipeline's verify6 fast path) take FlashInfer's b12x small-M kernels instead.
 - Decoder replay tail without graphs: with --enable-decoder-swa-bounded-replay SGLang runs the late layers of a
   prefill from row-bucket CUDA graphs captured while serving (up to SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = 2048
   rows). Their MoE calls of hundreds to thousands of rows cannot go through XTier's capturable decode path (mailbox
@@ -32,6 +36,7 @@ ENGRAM = 'sglang.srt.layers.engram.EngramEmbedding'
 INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
 REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
+MXFP8_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_blockscaled_linear'
 FP8_CONFIG_DIR = Path(__file__).with_name('fp8_configs')
 ENGRAM_LAYERS = 2   # DeepSeek V4.1 Flash has two Engram layers (1 and 14); the cache budget is split over them
 ROW_BYTES, SCALE_BYTES, BLOCK = 256, 8, 32   # an FP8 E4M3 row of 256 with one E8M0 scale per 32
@@ -166,10 +171,25 @@ def _replay_tail(original, cls, model, *args, **kwargs):
     return original(cls, model, *args, **kwargs)
 
 
+@functools.lru_cache
+def _b12x_rows():
+    if torch.cuda.get_device_capability()[0] != 12:
+        return frozenset()
+    return frozenset(int(r) for r in os.environ.get('XTIER_MXFP8_B12X_ROWS', '1,4,6').split(',') if r.strip())
+
+
+def _mxfp8_linear(original, input, *args, **kwargs):
+    if kwargs.get('backend', 'cutlass') == 'cutlass' and input.numel() // input.shape[-1] in _b12x_rows():
+        kwargs['backend'] = 'b12x'
+    return original(input, *args, **kwargs)
+
+
 def install(registry, hook_type):
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
-    registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
+    if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
+        registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
+    registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
     if os.environ.get('XTIER_ENGRAM_ROWS', '') == 'nvme':
         registry.register(f'{ENGRAM}.__init__', _init, hook_type.AROUND)
         registry.register(f'{ENGRAM}._owned_rows', _owned_rows, hook_type.REPLACE)
