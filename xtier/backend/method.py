@@ -77,7 +77,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
             ('router weight on input', rc.apply_router_weight_on_input),
             ('fused shared experts', layer.num_fused_shared_experts > 0),
             ('gemm1 alpha / beta', rc.gemm1_alpha is not None or rc.gemm1_beta is not None),
-            ('expert or tensor parallel MoE', layer.moe_ep_size > 1 or layer.moe_tp_size > 1),
+            ('expert parallel MoE', layer.moe_ep_size > 1),
             ('params dtype', params_dtype != torch.bfloat16)) if bad]
         if unsupported:
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
@@ -139,7 +139,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         inputs = self.format.engine_inputs(layer, up_first)
         if any(t.device.type != 'cpu' for t in inputs):
             inputs = [t.cpu() for t in inputs]
-        placement.apply(self.cfg.threads)
+        # TP: this rank holds the I / tp slice of every expert; SGLang all-reduces the partial outputs
+        placement.apply(self.cfg.threads, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
         t0 = time.perf_counter()
         pointers = [t.data_ptr() for t in inputs]
         self.plan = CpuPlan(self.experts, self.cfg.threads, pointers, hidden=self.hidden, inter=self.inter,

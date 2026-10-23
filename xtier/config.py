@@ -2,7 +2,9 @@
 
   XTIER=1                    master switch (off: the plugin registers nothing)
   XTIER_LAYERS=all|0-11,20   model layers whose routed experts XTier runs (default all MoE layers of the target model)
-  XTIER_DRAFT=0              1: also take the MoE layers of a speculative draft model (every expert on the GPU)
+  XTIER_DRAFT=0              1: also take the MoE layers of a speculative draft model
+  XTIER_DRAFT_SLOTS=-1       their GPU slots: -1 every expert on the GPU, 0 none (CPU engine only), N hot slots
+                             (16 GB cards: the GLM-5.3 NextN layer costs 1.9 GiB per GPU with every expert)
   XTIER_THREADS=64           CPU expert workers (a multiple of the NUMA node count)
   XTIER_MAIN_CPUS=auto|list  CPUs of every other thread of the process (auto: all but the expert workers and the
                              mailbox dispatcher); unset: unchanged
@@ -55,6 +57,10 @@ def layers() -> set[int] | None:
 
 def draft() -> bool:
     return _flag('XTIER_DRAFT')
+
+
+def draft_slots() -> int:
+    return _int('XTIER_DRAFT_SLOTS', -1)
 
 
 def threads() -> int:

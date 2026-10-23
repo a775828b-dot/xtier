@@ -48,6 +48,7 @@ def load() -> None:
         return
     if os.environ.get('XTIER_MAIN_CPUS'):
         from xtier.engine import placement
-        placement.apply(config.threads())
+        if not placement.deferred():   # with TP the rank's placement waits for its first MoE layer
+            placement.apply(config.threads())
     if _in_scheduler():
         install()
