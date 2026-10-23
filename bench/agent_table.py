@@ -48,7 +48,8 @@ while args:
             c = cold.get(name, {})
             first = srows[0]
             ttft = c.get('ttft_s', first['ttft_s'])
-            uncached = c.get('uncached_tokens') or c.get('prompt_tokens') or first['prompt_tokens']
+            # uncached prompt tokens / TTFT, as agent_bench and the production README (the session's system prompt hits)
+            uncached = c.get('uncached_tokens') or first['prompt_tokens'] - (first.get('cached_tokens') or 0)
             a = agg(srows)
             print(f"| {name} | {min(ctx) // 1000}K → {max(ctx) // 1000}K | {ttft:.1f} / {uncached / ttft:,.0f} | "
                   f"{len(srows)} | {a['n'] if a else 0} | {fmt(a)} |")

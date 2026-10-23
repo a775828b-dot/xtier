@@ -18,8 +18,10 @@ MODEL = {
     'spec': 'MTP', 'arch': '48 层 · 512 专家 top-10 · QSA + GDN 混合注意力 · NVFP4 W4A16',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 1800,
     # README "+ 加速包" row, text speed: decode / cold prefill tok/s at 64K / 512K
-    'bench': {'kind': 'text', 'dec': '161.4 / 147.5', 'pre': '5587 / 5040',
-              'title': '文本速度（README）：64K / 512K 提示，冷 prefill，输出 1K token'},
+    # README agent speed (production's agent_bench, two rounds): decode of the long responses (>= 300 tokens),
+    # cold prefill of the 64K / 500K sessions (mean of the rounds)
+    'bench': {'kind': 'agent', 'dec': '182.3', 'pre': '5427 / 5052',
+              'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('MTP') + [
         {'key': 'kv', 'label': 'KV 缓存', 'default': 'nvfp4', 'choices': [['nvfp4', 'NVFP4 · 与生产同参'], ['fp8', 'FP8']],
          'off_when': [{'packs': 'off'}]},

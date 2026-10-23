@@ -14,7 +14,7 @@ MODEL = {
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2400,
     # README agent speed (production's agent_bench, two rounds): decode of the long responses (>= 300 tokens),
     # cold prefill of the 64K / 500K sessions (mean of the rounds)
-    'bench': {'kind': 'agent', 'dec': '126.9', 'pre': '4249 / 4813',
+    'bench': {'kind': 'agent', 'dec': '132.4', 'pre': '3799 / 4818',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('DSpark') + [
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
