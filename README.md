@@ -4,8 +4,8 @@
 XTier is a plugin for upstream SGLang (tracking `main`): MoE experts live across GPU memory, host DRAM and NVMe, are placed by
 how often they are used and computed where they are. It wraps SGLang's standard `FusedMoE` quantization methods, so any MoE model
 that uses the standard layer can run in hybrid mode without model-specific code; optional per-model acceleration packs add
-model-specific optimizations. **Status: early development** — Qwen3.8 Flash Next and GLM-5.3 Flash run on SGLang main;
-see [docs/PLAN.md](docs/PLAN.md).
+model-specific optimizations. **Status: early development** — Qwen3.8 Flash Next, GLM-5.3 Flash and DeepSeek V4.1 Flash 1017
+run on SGLang main; see [docs/PLAN.md](docs/PLAN.md).
 
 ---
 
@@ -49,12 +49,14 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
-| Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；解码总速度略高于生产；短提示 prefill 更快，8K 以上慢 6–17% |
-| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：PPL 优于生产，速度约为生产的 80% |
-| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；速度与 DSpark 在做 |
+| Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；解码总速度略高于生产；短提示 prefill 更快，8K 以上慢 6–17%；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
+| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：BF16 注意力 / 稠密层存成 FP8 后解码与生产持平（单请求 90.9 对 82.3、双请求合计 113.1 对 112.4 tok/s），PPL 3.998（生产 4.060） |
+| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；DSpark 解码约为生产的 60%（70 对 120 tok/s），冷 prefill 慢 11–58%，在追 |
 
 ## 版本更新
 
+- 2026-10-23：第 3 步——DeepSeek V4.1 1017 上官方 main（Engram 行放 NVMe）、通用 NVMe 表（Qwen PLE 也可放）、GLM 的 FP8
+  权重、Zen2 / 双卡准备，详见 [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md)。
 - 2026-10-23：第 2 步——后端、热专家缓存、GPU prefill 在官方 main 上跑通 Qwen3.8 与 GLM-5.3，详见
   [reports/2026-10-23-step2-qwen.md](docs/reports/2026-10-23-step2-qwen.md)。
 - 2026-10-23：第 1 步——CPU 引擎迁入 `csrc/`，三个模型的真实层与 lkqmoe 0.5.6 逐位一致（`bench/results/engine-ab-20261023.json`）。

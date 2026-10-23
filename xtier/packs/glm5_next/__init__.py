@@ -11,7 +11,11 @@
 - NextN draft quantization: ``DeepseekModelNextN.__init__`` drops a ``modelopt_fp4`` quantization config (DeepSeek
   NVFP4 checkpoints keep their NextN layer in BF16), but GLM-5.3's NextN experts are NVFP4: built as BF16, loading
   fails on the packed tensors. For a GLM-5.3 draft the check does not fire (the config keeps its methods).
+- FP8 storage of the BF16 attention and dense weights (XTIER_FP8_WEIGHTS=1, fp8_weights.py): ~15 GB read every
+  decode step become ~7.5 GB; W8A16 decode kernel, W8A8 prefill for XTIER_FP8_W8A8_PREFILL.
 """
+
+import os
 
 EXCLUDED = 'sglang.srt.layers.quantization.modelopt_quant.ModelOptQuantConfig.is_layer_excluded'
 SPARSE_MLA = 'sglang.kernels.ops.attention.flash_mla_sm120._validate_flashinfer_sparse_mla_backend'
@@ -56,3 +60,11 @@ def install(registry, hook_type):
     registry.register(EXCLUDED, _is_layer_excluded, hook_type.AROUND)
     registry.register(SPARSE_MLA, _validate_sparse_mla, hook_type.AROUND)
     registry.register(NEXTN_MODEL, _nextn_model_init, hook_type.AROUND)
+    if os.environ.get('XTIER_FP8_WEIGHTS') == '1':
+        from xtier.packs.glm5_next import fp8_weights
+        method = 'sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod'
+        registry.register(f'{method}.apply', fp8_weights.apply, hook_type.AROUND)
+        registry.register(f'{method}.apply_into', fp8_weights.apply_into, hook_type.AROUND)
+        registry.register(f'{method}.apply_with_addend', fp8_weights.apply_with_addend, hook_type.AROUND)
+        registry.register('sglang.srt.model_loader.loader.DefaultModelLoader.load_weights_and_postprocess',
+                          fp8_weights.load_weights_and_postprocess, hook_type.AROUND)

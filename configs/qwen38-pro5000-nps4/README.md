@@ -12,4 +12,11 @@ Development launchers of step 2 (paths of the test host; the declarative configu
   draft's MoE runs either on SGLang (`--speculative-moe-runner-backend flashinfer_cutlass`) or on XTier
   (`XTIER_DRAFT=1`, every expert on the GPU).
 
-Results of 2026-10-23: [docs/reports/2026-10-23-step2-qwen.md](../../docs/reports/2026-10-23-step2-qwen.md).
+- PLE n-gram table on NVMe instead of 47.7 GiB of pinned host memory: `XTIER_PLE_ROWS=nvme` (rows read from the
+  checkpoint shards, 4 GiB row cache), `XTIER_PLE_MODEL=<dir>` for a copy of the shards elsewhere (a directory with
+  `model.safetensors.index.json` and the `model-plefp8-*` files). On the test host the copy on the Optane P5800X
+  (`/data/fast/p5800x1/qwen38-flash-next-ple`) matches the pinned table (verify step 14.14 vs 14.13 ms, cold prefill
+  within 3%); from the DRAM-less EX900 the verify step is 7% slower and long prefills 16-48% slower.
+
+Results of 2026-10-23: [docs/reports/2026-10-23-step2-qwen.md](../../docs/reports/2026-10-23-step2-qwen.md),
+[docs/reports/2026-10-23-step3-ds-tables.md](../../docs/reports/2026-10-23-step3-ds-tables.md).

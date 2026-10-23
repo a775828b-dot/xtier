@@ -44,11 +44,16 @@ DS 的 Engram 加专家（276 GB）超过整机 377 GB 内存，不放 NVMe 就�
 - `tests/table_lookup_check.py`（GPU）：包里的查表（DS `EngramLookup`、Qwen `ple_rows.gather`）对官方内核
   （`engram_gather`；`_gather_ple_embedding_from_pinned_kernel` 读同样字节的锁页表），直接调用和 CUDA 图重放换 id，
   整表和 TP 分片，逐位比较。
-- 端到端：DS 1017 在官方 main + XTier 上起服务（Engram 两层各 2 GiB 行缓存），生成正确；PPL 与照抄见
-  `docs/reports/`。Qwen 用 `XTIER_PLE_ROWS=nvme` 与锁页表对照 PPL、照抄、解码速度。
+- 端到端：DS 1017 在官方 main + XTier 上起服务（Engram 两层各 2 GiB 行缓存），生成正确、照抄 0 错；Qwen3.8 的 NVMe 表与
+  锁页表对照见 `docs/reports/2026-10-23-step3-ds-tables.md`。
+
+## 放在哪块盘
+
+随机读延迟决定开销。Qwen3.8 的 128 个分片：在傲腾 P5800X 上（`XTIER_PLE_MODEL` 指向分片副本）验证步 14.14 ms 对锁页表
+14.13 ms、冷 prefill 差 3% 以内；在无 DRAM 的 EX900 上验证步 +7%、8K prefill +48%（8K token × 16 头约 13 万次 160 字节
+随机读，16 路并发下 EX900 约 15–20 万 IOPS）。DS 的 Engram 文件一直在傲腾上（检查点第 47、48 个文件软链过去）。
 
 ## 以后
 
 - 预取：哈希结果出来后在旁路流上提前查后面层的表（生产 `DS41_ENGRAM_PREFETCH=1`，与前面的层重叠）。
 - 冷启动时的行缓存预热（按画像或上次运行的热行）。
-- 表放在哪块盘：DS 的 Engram 文件已在傲腾（P5800X）上；Qwen 的分片在 EX900（无 DRAM 缓存）上，要不要挪到傲腾先看测速。
