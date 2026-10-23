@@ -3,7 +3,8 @@
 SGLang calls ``load()`` early in every process and then applies the hooks registered through
 ``sglang.srt.plugins.hook_registry.HookRegistry``. XTier registers its model hooks only in scheduler processes (the
 ones that build models: importing the hook targets elsewhere would only cost startup time); ``install()`` does it
-unconditionally, for tools that build a ModelRunner in their own process. SGLang logs and swallows exceptions raised
+unconditionally, for tools that build a ModelRunner in their own process. The other processes, the one that serves
+the API among them, get the few hooks on how prompts are tokenized (``install_serving()``). SGLang logs and swallows exceptions raised
 here, so the backend checks after every model load that it took over (``xtier.backend.hooks.check``).
 """
 
@@ -15,6 +16,7 @@ from xtier import __version__, config
 
 logger = logging.getLogger(__name__)
 _installed = []
+_serving = []
 
 
 def _in_scheduler() -> bool:
@@ -42,6 +44,19 @@ def install() -> None:
                 fixes, os.getpid())
 
 
+def install_serving() -> None:
+    if _serving:
+        return
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+    from xtier import packs
+
+    names = packs.install_serving(HookRegistry, HookType)
+    _serving.append(True)
+    if names:
+        logger.info('xtier %s: serving hooks of packs %s registered (pid %d)', __version__, names, os.getpid())
+
+
 def load() -> None:
     if not config.enabled():
         logger.debug('xtier %s: XTIER is not 1, nothing registered', __version__)
@@ -62,3 +77,5 @@ def load() -> None:
         print(f'[xtier] {__version__}: hooks installed in scheduler pid {os.getpid()}, CPUs '
               f'{len(os.sched_getaffinity(0))}, SGLANG_AUTO_NUMA_BIND={os.environ.get("SGLANG_AUTO_NUMA_BIND", "")}',
               file=sys.stderr, flush=True)
+    else:
+        install_serving()

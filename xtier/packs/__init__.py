@@ -1,6 +1,7 @@
 """Acceleration packs: per-model-family fixes and kernels, registered as hooks on SGLang (XTIER_PACKS=all|none|list).
 
 A pack's hooks only act when its model's code runs, so every selected pack is installed in every scheduler process.
+Packs in SERVING also hook the process that serves the API (how prompts are tokenized): ``install_serving``.
 """
 
 import importlib
@@ -26,4 +27,16 @@ def install(registry, hook_type) -> list[str]:
     names = selected()
     for name in names:
         importlib.import_module(f'xtier.packs.{name}').install(registry, hook_type)
+    return names
+
+
+# packs with hooks in the process that serves the API (prompt tokenization), installed there and nowhere else
+SERVING = ('deepseek_v4',)
+
+
+def install_serving(registry, hook_type) -> list[str]:
+    names = []
+    for name in selected():
+        if name in SERVING and importlib.import_module(f'xtier.packs.{name}').install_serving(registry, hook_type):
+            names.append(name)
     return names

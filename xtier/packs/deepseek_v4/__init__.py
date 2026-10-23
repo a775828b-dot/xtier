@@ -30,6 +30,10 @@
   32 x 32 block FP8 projections as MXFP8 on FlashInfer CUTLASS (on auto it keeps the Triton block kernel, which on
   SM120 has no split-K); calls of XTIER_MXFP8_B12X_ROWS rows (default 1, 4, 6: decode and DSpark verify widths,
   as the 1017 pipeline's verify6 fast path) take FlashInfer's b12x small-M kernels instead.
+- Prompts tokenized as DeepSeek's deepseek-recipe does (``XTIER_DS_RECIPE_TOKENS``, default on; the 1017 pipeline's
+  DS41_PLAIN_CONTENT_TOKENS): added-token spellings in message content stay plain text, only the template's control
+  tokens are special, and the prompt is encoded in regions instead of one string (a 568K-token prompt 1.3 -> 0.18 s,
+  every turn). Hooks of the serving process, not the schedulers; see recipe_tokens.py.
 - Decoder replay tail without graphs: with --enable-decoder-swa-bounded-replay SGLang runs the late layers of a
   prefill from row-bucket CUDA graphs captured while serving (up to SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = 2048
   rows). Their MoE calls of hundreds to thousands of rows cannot go through XTier's capturable decode path (mailbox
@@ -297,3 +301,10 @@ def install(registry, hook_type):
     if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0':
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)
+
+
+def install_serving(registry, hook_type):
+    """Hooks of the process that serves the API: prompts tokenized as deepseek-recipe does (recipe_tokens)."""
+    from xtier.packs.deepseek_v4 import recipe_tokens
+
+    return recipe_tokens.install_serving(registry, hook_type)
