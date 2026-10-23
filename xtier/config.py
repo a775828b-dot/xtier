@@ -111,3 +111,20 @@ def cache_slots() -> int:
 
 def cache_full() -> set[int]:
     return set(cpulist(os.environ.get('XTIER_CACHE_FULL', '')))
+
+
+_plan = []
+
+
+def cache_plan() -> dict[int, int]:
+    """XTIER_CACHE_PLAN=file: {"slots": {layer: slots}} from tools/plan_cache.py --write (a layer's experts count as
+    full); layers it does not list keep XTIER_CACHE_FULL / XTIER_CACHE_SLOTS."""
+    if not _plan:
+        path = os.environ.get('XTIER_CACHE_PLAN', '')
+        if path:
+            import json
+            with open(path) as f:
+                _plan.append({int(k): int(v) for k, v in json.load(f)['slots'].items()})
+        else:
+            _plan.append({})
+    return _plan[0]
