@@ -1,5 +1,7 @@
 """Verbatim-copy test of a running SGLang server: the model must echo code chunks exactly (temperature 0, thinking off).
 Any changed span points at the decode path (the check that caught the 10-21 variable-length verify bug).
+--temperature T > 0 samples instead (T = 0.01: almost the greedy text through the sampling paths of the decode, e.g.
+rejection sampling and its verify truncation, which greedy requests skip).
 
   python bench/copy_test.py --port 18180 --model Qwen3.8-Flash-Next --chunks 8 --concurrency 1 --tag NAME
 
@@ -22,6 +24,7 @@ P.add_argument('--concurrency', type=int, default=1)
 P.add_argument('--tag', required=True)
 P.add_argument('--source', default='/data/fast/workspaces/ds41-1017/source/python/sglang/srt/managers/scheduler.py')
 P.add_argument('--ignore-first-indent', action='store_true')
+P.add_argument('--temperature', type=float, default=0.0)
 P.add_argument('--out', default='bench/results/copy')
 A = P.parse_args()
 lines = Path(A.source).read_text(encoding='utf-8').splitlines()
@@ -31,7 +34,7 @@ url = f'http://127.0.0.1:{A.port}/v1/chat/completions'
 
 
 def run(c):
-    body = dict(model=A.model, temperature=0, max_tokens=4000, stream=False,
+    body = dict(model=A.model, temperature=A.temperature, max_tokens=4000, stream=False,
                 chat_template_kwargs={'enable_thinking': False},
                 messages=[{'role': 'user', 'content': '把 <src> 和 </src> 之间的内容逐字原样输出，不要增删改任何字符，'
                            '不要加代码块标记，不要解释。\n<src>\n' + c + '\n</src>'}])

@@ -23,13 +23,14 @@ xtier/
 ├── cache/     热专家缓存：每层槽数可不同，全部常驻的层不经过 CPU；自适应换入换出；常驻层的 prefill 直接在槽上算
 ├── planner/   规划器：决定每层由谁算、缓存多少（目前按配置，目标是 CPU 和 GPU 同时算完）
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
-├── packs/     加速包：qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核）、glm5_next（量化排除、DSA、NextN）、
-│              deepseek_v4（Engram 行放 NVMe、SM120 候选索引器、FP8 GEMM 调优配置）
+├── packs/     加速包：qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核、QSA 读 NVFP4 KV）、glm5_next（量化排除、DSA、NextN）、
+│              deepseek_v4（Engram 行放 NVMe、SM120 候选索引器、FP8 GEMM 调优配置）、
+│              speculative（通用 EAGLE 投机解码：热词表配无损拒绝采样、草稿温度、按置信度截断验证）
 ├── tables/    大嵌入表的行放在 NVMe：多段多文件、任意行宽、行缓存、CUDA 图内查表
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
 configs/       每个"模型 × 硬件"的启动配置
-tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix）
+tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4）
 bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟）与结果
 ```
 
@@ -49,9 +50,9 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
-| Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；解码总速度略高于生产；短提示 prefill 更快，8K 以上慢 6–17%；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
-| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：BF16 注意力 / 稠密层存成 FP8 后解码与生产持平（单请求 90.9 对 82.3、双请求合计 113.1 对 112.4 tok/s），PPL 3.998（生产 4.060） |
-| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；DSpark 解码约为生产的 60%（70 对 120 tok/s），冷 prefill 慢 11–58%，在追 |
+| Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；加速包后 decode 每步、64K / 512K 冷 prefill 与生产持平或更快；QSA 能读 NVFP4 KV（生产的启动参数）；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
+| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包后生产的温度 1.0 测法 decode 95.6 对 84.8 tok/s（热词表拒绝采样，与生产相同），64K / 512K 冷 prefill 比生产快，PPL 3.994（生产 4.060） |
+| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；加速包后冷 prefill 比生产快，decode 的热专家命中率与 CPU 每层耗时与生产持平（每步时间两边测法不同，同口径待测） |
 
 ## 测速
 
@@ -62,11 +63,11 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 | 模型 | 配置 | 64K prefill | 64K decode | 512K prefill | 512K decode | 加速包精度 |
 |---|---|---:|---:|---:|---:|---|
 | Qwen3.8 Flash Next（MTP） | 官方 main | 5319 | 140.7（14.63 ms） | 4078 | 138.3（15.75 ms） | 基准 |
-|  | + 加速包 | 5511 | 144.2（14.37 ms） | 5011 | 151.7（15.57 ms） | 无损：hc_mix 换成重叠的持久内核，算法不变（原内核的原子加顺序本来就不固定）；PLE 层与 QSA 索引器分段与官方逐位一致，PPL 3.482 |
+|  | + 加速包 | 5513 | 151.1（14.34 ms） | 5015 | 145.5（15.49 ms） | 无损：hc_mix 换成重叠的持久内核，算法不变（原内核的原子加顺序本来就不固定）；PLE 层与 QSA 索引器分段与官方逐位一致，PPL 3.482 |
 | GLM-5.3 Flash（EAGLE） | 官方 main | 2663 | 78.6（34.93 ms） | 2518 | 75.0（33.83 ms） | 基准 |
-|  | + 加速包 | 2803 | 94.7（29.27 ms） | 2655 | 86.7（27.07 ms） | 轻微：BF16 注意力 / 稠密层存成 FP8（每行每 128 列一个 scale），PPL 3.987 → 3.998（+0.3%），照抄 0 错 |
+|  | + 加速包 | 2808 | 100.0（29.16 ms） | 2656 | 91.9（26.78 ms） | 轻微：BF16 注意力 / 稠密层存成 FP8（每行每 128 列一个 scale），PPL 3.987 → 3.998（+0.3%）；拒绝采样与截断验证无损（输出分布与不用投机解码相同），照抄 0 错 |
 | DeepSeek V4.1 Flash 1017（DSpark） | 官方 main | 3318 | 64.9（49.93 ms） | 3627 | 66.1（51.83 ms） | 基准 |
-|  | + 加速包 | 3977 | 95.8（33.73 ms） | 4435 | 86.6（34.98 ms） | 无损：块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型验证），PPL 3.319 → 3.317 |
+|  | + 加速包 | 4169 | 96.2（32.59 ms） | 4623 | 85.4（35.99 ms） | 无损：块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型验证），PPL 3.319 → 3.317 |
 
 - **decode**：5 次回答的中位数（1 次冷启动，加 4 次命中前缀缓存重发，上下文相同、各自采样）。括号里是每个验证步的耗时。
   投机解码每步出几个 token 取决于这段文字好不好猜，单次 tok/s 能差 30%。Qwen 和 DeepSeek 的草稿长度固定，每步耗时 5 次之间
@@ -74,18 +75,27 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
   tok/s 差 10%，大部分是这几次回答的接受长度不同（2.10 对 2.22、2.16 对 2.38），加速包本身每步只快 2%。
 - **官方 main**：XTier 后端加上跑起来必需的修正，不开任何提速项。必需的修正：Qwen 的 PLE 表锁页分配；GLM 的量化排除、DSA
   别名、NextN 草稿量化；DeepSeek 的 SM120 候选索引器、Engram 行放 NVMe、尾部重放不走 CUDA 图。
-- **热专家布局与启动参数与生产相同**：Qwen 25 层常驻、其余 23 层每层 155 槽；GLM 每层 60 槽、16K 分块、BF16 SSM 状态；DeepSeek
-  每层 50 槽。例外有两处：GLM 的官方 main 用 BF16 权重，60 槽时 prefill 显存不够，减到 55 槽（显存余量 10.3 GB，加速包那行 9.9 GB）；
-  Qwen 的分块是 24K（生产 32K：官方 main 的 QSA 读不了 NVFP4 KV，FP8 KV 多占约 3 GB），24K 要靠加速包把 PLE 层分段，官方 main 那行用 16K。
+- **热专家布局与启动参数与生产相同**：Qwen 25 层常驻、其余 23 层每层 155 槽；GLM 每层 60 槽、16K 分块、BF16 SSM 状态、拒绝采样；
+  DeepSeek 每层 50 槽。例外有三处：GLM 的官方 main 用 BF16 权重，60 槽时 prefill 显存不够，减到 55 槽（显存余量 10.3 GB，加速包那行
+  9.9 GB），也不开拒绝采样（官方 main 不允许热词表配拒绝采样）；Qwen 用 FP8 KV + 24K 分块（生产是 NVFP4 KV + 32K：官方 main 的 QSA
+  读不了 NVFP4，加速包能读，但 64K prefill 慢 3%，表里用 FP8，见[报告](docs/reports/2026-10-23-speculative-fp4kv.md)），24K 要靠加速包把
+  PLE 层分段，官方 main 那行用 16K。
 - **+ 加速包**：Qwen 是 hc_mix 重叠内核（`XTIER_HC_MIX_OVERLAP`）、PLE 层分段（`XTIER_PLE_BLOCK`）和 QSA 索引器 prefill 按键分段
-  （`XTIER_QSA_KEYS_PER_CTA`）；GLM 是 FP8 权重（`XTIER_FP8_WEIGHTS`，生产用的也是这一套）；
+  （`XTIER_QSA_KEYS_PER_CTA`）；GLM 是 FP8 权重（`XTIER_FP8_WEIGHTS`，生产用的也是这一套）和通用投机解码包（热词表拒绝采样、
+  草稿温度 ×0.8、按草稿置信度截断验证，截掉的 token 跳过 CPU 专家，`xtier/packs/speculative/`）；
   DeepSeek 是调好的块 FP8 GEMM 配置、MXFP8 走 FlashInfer CUTLASS（解码宽度走 b12x）、Engram 提前查表（`XTIER_ENGRAM_PREFETCH`）
   和草稿词表头 FP8（`XTIER_DRAFT_LMHEAD_FP8`）。
 - 512K 一列的提示是 510K token，加上 1K 输出不超过 524288 的上下文。每个配置的完整数据（首 token、5 次 decode 的范围、
-  接受长度）见 [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md#readme-测速)。
+  接受长度）：加速包三行（10-23 夜重测）见 [reports/2026-10-23-speculative-fp4kv.md](docs/reports/2026-10-23-speculative-fp4kv.md#readme-重测加速包三行10-23-夜)，
+  官方 main 三行见 [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md#readme-测速)。
 
 ## 版本更新
 
+- 2026-10-23（夜）：通用投机解码包 `xtier/packs/speculative/`：GLM 用上生产的热词表无损拒绝采样、草稿温度 ×0.8 和按草稿置信度
+  截断验证（截掉的验证 token 跳过 CPU 专家，核心加了逐 token 标志），生产的温度 1.0 测法 93.0 → 95.6 tok/s（生产 84.8），README 测法
+  64K / 512K decode 94.7 → 100.0、86.7 → 91.9 tok/s，照抄 0 错；三个加速包按当前代码重测；
+  Qwen 的 QSA 能读 NVFP4 KV（与官方反量化逐位一致，显存多 1.7 GB），测速表仍用 FP8；DeepSeek 剩余差距排查：热专家命中率、CPU
+  每层耗时与生产持平，差别来自测法不同。详见 [reports/2026-10-23-speculative-fp4kv.md](docs/reports/2026-10-23-speculative-fp4kv.md)。
 - 2026-10-23（晚）：512K prefill 追平生产。Qwen：QSA 索引器 prefill 的 logits 内核在长上下文时只开 11 个 CTA，加速包按键分段（逐位一致），
   PLE 层分段、分块 16K → 24K，512K 冷 prefill 125 → 102 s（生产 106 s）；GLM：启动参数对齐生产（16K 分块、BF16 SSM 状态），
   224 → 192 s（生产 201 s）。两者 PPL、照抄不变，详见 [reports/2026-10-23-prefill.md](docs/reports/2026-10-23-prefill.md)。

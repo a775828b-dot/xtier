@@ -11,6 +11,7 @@ Forward, per call of m tokens:
 - m <= XTIER_DECODE_MAX (and always inside CUDA-graph capture): through the mailbox, in slots of up to 8 tokens.
   A packing kernel stores the inputs into the slot's mapped pinned memory, stream memory operations hand the request
   to the CPU dispatcher and wait for it, an unpacking kernel reads the FP32 output. Capturable, no host sync.
+  With token flags (active_flags) a caller can drop tokens of these calls: their routes become -1 in the packing.
 - prefill of a fully cached layer: on its slots in place (cache/prefill.py);
 - prefill of a partly cached layer below XTIER_HYBRID_PREFILL_MAX tokens: cached routes on the GPU, the others on the
   CPU at the same time (cache/prefill.py, hybrid_prefill);
@@ -55,6 +56,7 @@ class LayerConfig:
 class XTierMoEMethod(FusedMoEMethodBase):
     layers = []          # every XTier layer of the process, in creation order
     _decode_out = {}     # hidden size -> FP32 decode output [DECODE_ROWS, H], shared (layers run one after another)
+    _active = None       # int32 [DECODE_ROWS] token flags of the decode path (active_flags)
     _localized = False
     _registered = 0      # layers whose shards are pinned and caches filled
 
@@ -268,14 +270,16 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if out is None:
             out = XTierMoEMethod._decode_out[H] = torch.empty((DECODE_ROWS, H), dtype=torch.float32, device=x.device)
         stream = torch.cuda.current_stream().cuda_stream
+        active = XTierMoEMethod._active
         for start in range(0, m, SLOT_TOKENS):
             n = min(SLOT_TOKENS, m - start)
             xs, ids_s, ws = x.data_ptr() + start * H * 2, ids.data_ptr() + start * k * 4, weights.data_ptr() + start * k * 4
+            act = active.data_ptr() + start * 4 if active is not None else 0
             if self.pool is not None:
-                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4)
+                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act)
                 continue
             slot = self.mailbox.slot(stream, n, k)
-            kernels.pack(slot, n, k, xs, ids_s, ws, H)
+            kernels.pack(slot, n, k, xs, ids_s, ws, H, act)
             self.mailbox.notify(stream, n, k)
             kernels.unpack(slot, n, out.data_ptr() + start * H * 4, H)
         return out[:m]
@@ -421,3 +425,14 @@ class XTierMoEMethod(FusedMoEMethodBase):
 
     def stats(self):
         return dict(layer=self.cfg.layer_id, **self.calls)
+
+
+def active_flags(device) -> torch.Tensor:
+    """Token flags of the decode path, int32 [DECODE_ROWS], all 1: a caller that sets row i to 0 on the stream before
+    a forward makes the i-th token of each decode-path MoE call skip its routed experts (GPU slots and CPU engine; a
+    zero output row), e.g. the tokens a truncated speculative verify will not use, and sets it back to 1 after. The
+    first call creates the buffer; only graphs captured after it read the flags (they keep its address)."""
+    if XTierMoEMethod._active is None:
+        XTierMoEMethod._active = torch.ones(DECODE_ROWS, dtype=torch.int32, device=device)
+        logger.info('xtier: decode-path token flags on (tokens can skip their routed experts)')
+    return XTierMoEMethod._active
