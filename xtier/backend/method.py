@@ -133,8 +133,17 @@ class XTierMoEMethod(FusedMoEMethodBase):
     def get_moe_runner_backend(self, layer):
         return None   # a direct kernel consuming standard TopK output with local expert ids
 
+    _hand_off_lock = threading.Lock()
+
     def _hand_off(self, layer):
-        """All expert tensors are loaded: build the engine's copy and release the host parameters in place."""
+        """All expert tensors are loaded: build the engine's copy and release the host parameters in place. One layer
+        at a time: a layer holds its loaded parameters and its new shards at once (DeepSeek V4.1: 2 x 7 GB), and
+        SGLang's loader threads complete several layers together; on the 377 GB host with DSpark that peak pushed
+        ~20 GB into swap, and pinning the shards then took 554 s instead of 72 s."""
+        with XTierMoEMethod._hand_off_lock:
+            self._convert(layer)
+
+    def _convert(self, layer):
         up_first = bool(getattr(self.gpu_method, 'load_up_proj_weight_first', False))
         inputs = self.format.engine_inputs(layer, up_first)
         if any(t.device.type != 'cpu' for t in inputs):
@@ -210,6 +219,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
             torch.cuda.current_stream().synchronize()
             t0 = time.perf_counter()
         if m <= config.decode_max() or capturing:
+            if not capturing:   # short prompts never reach a prefill branch: the policy must start here too
+                self._cache_start()
             out = self._decode(x, ids, weights, m, k)
             self.calls['decode'] += 1
         elif self.pool is not None and self.pool.full and config.resident_prefill():
@@ -388,7 +399,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
 
     @staticmethod
     def _cache_start():
-        """At a prefill: start the cache's adaptive policy once the decode graphs exist."""
+        """At any call outside graph capture: start the cache's adaptive policy once the decode graphs exist (with
+        speculative decoding and short prompts every call before the first graph replay is a decode-sized one)."""
         from xtier.cache import pool
         pool.maybe_start()
 

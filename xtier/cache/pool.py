@@ -392,7 +392,7 @@ class LayerPool:
 
 
 def maybe_start():
-    """At a prefill (outside capture): start the adaptive policy once the decode graphs have been captured, so its
+    """At any MoE call outside capture: start the adaptive policy once the decode graphs have been captured, so its
     copies never overlap a capture."""
     a = _glob.get('adapt')
     if not a or _glob.get('started') or not _glob.get('captured') or torch.cuda.is_current_stream_capturing():

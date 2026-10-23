@@ -49,4 +49,6 @@ exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-na
   --disable-shared-experts-fusion --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode full \
   --enable-decoder-swa-bounded-replay --enable-deepseek-v4-fp4-indexer \
   --reasoning-parser deepseek-v41 --tool-call-parser deepseekv41 --watchdog-timeout 1200 --enable-metrics \
-  "${SPEC[@]}" "$@"
+  --weight-loader-drop-cache-after-load "${SPEC[@]}" "$@"
+# --weight-loader-drop-cache-after-load (as in production): the page cache of the 300 GB checkpoint would otherwise
+# push the engine's freshly built shards into swap on this 377 GB host
