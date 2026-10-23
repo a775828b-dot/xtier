@@ -66,7 +66,7 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 | GLM-5.3 Flash（EAGLE） | 官方 main | 2320 | 79.5（35.73 ms） | 2203 | 69.6（32.39 ms） | 基准 |
 |  | + 加速包 | 2389 | 90.6（28.75 ms） | 2276 | 87.4（27.46 ms） | 轻微：BF16 注意力 / 稠密层存成 FP8（每行每 128 列一个 scale），PPL 3.987 → 3.998（+0.3%），照抄 0 错（驻留固定时） |
 | DeepSeek V4.1 Flash 1017（DSpark） | 官方 main | 3318 | 64.9（49.93 ms） | 3627 | 66.1（51.83 ms） | 基准 |
-|  | + 加速包 | 3962 | 89.5（36.78 ms） | 4363 | 80.2（38.20 ms） | 无损：只换块 FP8 GEMM 的分块配置和内核，权重与量化方式不变，PPL 3.319 → 3.315 |
+|  | + 加速包 | 3977 | 95.8（33.73 ms） | 4435 | 86.6（34.98 ms） | 无损：块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型验证），PPL 3.319 → 3.317 |
 
 - **decode**：5 次回答的中位数（1 次冷启动，加 4 次命中前缀缓存重发，上下文相同、各自采样）。括号里是每个验证步的耗时。
   投机解码每步出几个 token 取决于这段文字好不好猜，单次 tok/s 能差 30%。Qwen 和 DeepSeek 的草稿长度固定，每步耗时 5 次之间
@@ -77,12 +77,16 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 - **热专家布局与生产相同**：Qwen 25 层常驻、其余 23 层每层 155 槽；GLM 每层 60 槽；DeepSeek 每层 50 槽。只有 GLM 的官方 main
   例外：它用 BF16 权重，60 槽时 32K 的 prefill 显存不够（只剩 5.7 GB），所以减到 55 槽，显存余量 8.4 GB，与加速包那行（8.0 GB）相当。
 - **+ 加速包**：Qwen 是 hc_mix 重叠内核（`XTIER_HC_MIX_OVERLAP`）；GLM 是 FP8 权重（`XTIER_FP8_WEIGHTS`，生产用的也是这一套）；
-  DeepSeek 是调好的块 FP8 GEMM 配置，加上 MXFP8 走 FlashInfer CUTLASS（解码宽度走 b12x）。
+  DeepSeek 是调好的块 FP8 GEMM 配置、MXFP8 走 FlashInfer CUTLASS（解码宽度走 b12x）、Engram 提前查表（`XTIER_ENGRAM_PREFETCH`）
+  和草稿词表头 FP8（`XTIER_DRAFT_LMHEAD_FP8`）。
 - 512K 一列的提示是 510K token，加上 1K 输出不超过 524288 的上下文。每个配置的完整数据（首 token、5 次 decode 的范围、
   接受长度）见 [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md#readme-测速)。
 
 ## 版本更新
 
+- 2026-10-23（晚）：DeepSeek 加速包移植生产的 Engram 提前查表和草稿词表头 FP8：decode 每步 −8%（64K 33.7 ms、512K 35.0 ms，
+  生产约 31.5 ms）；冷提示的 prefill 持平，Engram 行缓存热时 64K prefill +16%；照抄 0 错、PPL 持平，详见
+  [reports/2026-10-23-ds-engram-prefetch.md](docs/reports/2026-10-23-ds-engram-prefetch.md)。
 - 2026-10-23：README 测速表（三个模型 64K / 512K 上下文的 prefill 与 decode，官方 main 对加速包）；加载不再换出（专家按检查点顺序
   拷贝、映射着的检查点页 page-out、提前读），DS 启动 811 → 409 s；全局预算的热专家规划器（只做了离线核对），详见
   [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md)。

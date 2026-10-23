@@ -7,6 +7,19 @@
   gating, the projections and the TP all-reduce stay SGLang's. The checkpoint directory is the served model's
   (``XTIER_ENGRAM_MODEL`` overrides); staging for ``XTIER_ENGRAM_GRAPH_IDS`` ids (default 16384, 24 per token) is
   allocated before any graph capture.
+- Engram rows prefetched (``XTIER_ENGRAM_PREFETCH``, default on; from the 1017 pipeline's DS41_ENGRAM_PREFETCH): every
+  forward hashes all tokens up front, so as soon as ``EngramHasher.forward`` returns, each Engram layer's lookup (ids
+  to the host, the row table's host function, rows back, dequantize) starts on a side stream of its own and overlaps
+  the layers before it (layer 0 for Engram layer 1, layers 2-13 for layer 14); the layer then only waits for its
+  event. The rows are the same; a graph captures the fork and the join. Otherwise the GPU waits for the host function
+  inside the layer. RTX PRO 5000, DSpark: decode step -2.4 ms (8K and 64K context, with the FP8 draft head below);
+  unlike the 1017 pipeline, prefill prefetches too (a 22528-token chunk looks up 540K rows per layer): 64K cold
+  prefill +16%.
+- DSpark draft LM head in FP8 (``XTIER_DRAFT_LMHEAD_FP8``, default on; DS41_DRAFT_LMHEAD_FP8): the draft projects
+  through the target's BF16 LM head (1.32 GB) every step. A copy in FP8 E4M3 with one scale per vocabulary row,
+  multiplied by ``torch._scaled_mm`` with per-token activation scales, takes 0.62 instead of 1.11 ms on the RTX PRO
+  5000 (+0.66 GB). It is made when the draft attaches the target's head, before any graph capture. Draft proposals
+  only: the target verifies every token with its BF16 head, so the output is the target's.
 - SM120 candidate indexer: SGLang sends every SM100-or-newer GPU to the sparse candidate table, whose DeepGEMM paged
   sparse MQA logits exist on SM100 only; on SM120 the dense-block candidates (SGLang's path below SM100, DeepGEMM's
   SM120 dense FP8 / FP4 MQA logits) serve prefill and decode.
@@ -33,6 +46,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 ENGRAM = 'sglang.srt.layers.engram.EngramEmbedding'
+ENGRAM_LAYER = 'sglang.srt.layers.engram.Engram'
+HASHER = 'sglang.srt.layers.engram.EngramHasher'
+DSPARK_DRAFT = 'sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark'
+DRAFT_PROJECT = 'sglang.srt.models.dspark.project_through_lm_head'
 INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
 REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
@@ -40,6 +57,8 @@ MXFP8_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_blocks
 FP8_CONFIG_DIR = Path(__file__).with_name('fp8_configs')
 ENGRAM_LAYERS = 2   # DeepSeek V4.1 Flash has two Engram layers (1 and 14); the cache budget is split over them
 ROW_BYTES, SCALE_BYTES, BLOCK = 256, 8, 32   # an FP8 E4M3 row of 256 with one E8M0 scale per 32
+FP8_MAX = 448.0
+_prefetching = {}   # Engram layer's hash index -> (its EngramEmbedding on the row table, side stream); one target model
 
 
 def model_dir():
@@ -74,14 +93,16 @@ class EngramLookup:
     def warm(self, count, device):
         self.lookup.warm(count, device)
 
-    def __call__(self, indices):
+    def fill(self, indices, out):
         from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 
-        out = torch.empty(*indices.shape, ROW_BYTES, dtype=torch.bfloat16, device=indices.device)
         if indices.numel():
             rows, scales, sequential = self.lookup.fetch(indices)
             engram_gather(rows.data_ptr(), scales.data_ptr(), sequential, out.view(-1, ROW_BYTES), ROW_BYTES, BLOCK)
         return out
+
+    def __call__(self, indices):
+        return self.fill(indices, torch.empty(*indices.shape, ROW_BYTES, dtype=torch.bfloat16, device=indices.device))
 
 
 def _check_rows(self, param, loaded_weight):
@@ -120,8 +141,85 @@ def _init(original, self, num_embeddings, dim, layer_id, column_bounds, *args, *
                 num_embeddings, self.row_start, row_end, store.describe(), cache / 2**30)
 
 
+def _view_key(t):
+    return t.data_ptr(), tuple(t.shape), tuple(t.stride())
+
+
+def _engram_layer_init(result, self, *args, **kwargs):
+    """After ``Engram.__init__``: a layer on the row table joins the prefetch, with a side stream of its own."""
+    if getattr(self.embed, '_xtier_lookup', None) is not None:
+        _prefetching[self.layer_hash_index] = (self.embed, torch.cuda.Stream())
+    return result
+
+
+def _prefetch(hash_ids, self, input_ids, *args, **kwargs):
+    """After ``EngramHasher.forward`` (hash ids [T, Engram layers, hash columns]): every Engram layer's lookup starts
+    on its side stream. The ids are made contiguous and the output allocated on the current stream, and both stay
+    referenced until the layer has waited for the lookup."""
+    if not _prefetching or hash_ids.dim() != 3 or hash_ids.shape[0] == 0 or not hash_ids.is_cuda:
+        return hash_ids
+    main = torch.cuda.current_stream()
+    for index, (embedding, side) in _prefetching.items():
+        if index >= hash_ids.shape[1]:
+            continue
+        view = hash_ids[:, index]
+        ids = view.contiguous()
+        out = torch.empty(*view.shape, ROW_BYTES, dtype=torch.bfloat16, device=view.device)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            embedding._xtier_lookup.fill(ids, out)
+            done = torch.cuda.Event()
+            done.record(side)
+        embedding._xtier_prefetched = (_view_key(view), out, done, ids)
+    return hash_ids
+
+
 def _owned_rows(self, indices):
+    prefetched = getattr(self, '_xtier_prefetched', None)
+    if prefetched is not None:
+        self._xtier_prefetched = None
+        key, out, done, _ = prefetched
+        torch.cuda.current_stream().wait_event(done)   # also orders an inline lookup after it (shared staging)
+        if key == _view_key(indices):
+            return out
     return self._xtier_lookup(indices)
+
+
+def _quantize_lm_head(lm_head):
+    """Row-scaled FP8 E4M3 copy of a BF16 LM head for the draft: (weight [vocab, hidden], scales [1, vocab])."""
+    weight = lm_head.weight.data
+    n, k = weight.shape
+    qweight = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=weight.device)
+    scale = torch.empty((n, 1), dtype=torch.float32, device=weight.device)
+    for start in range(0, n, 8192):   # bounded FP32 transients
+        rows = weight[start:start + 8192].float()
+        sc = rows.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / FP8_MAX
+        qweight[start:start + 8192] = (rows / sc).to(torch.float8_e4m3fn)
+        scale[start:start + 8192] = sc
+    lm_head._xtier_draft_fp8 = (qweight, scale.t().contiguous())
+    logger.info('xtier: DSpark draft LM head as a row-scaled FP8 copy %s (%.2f GiB)', tuple(qweight.shape),
+                qweight.numel() / 2**30)
+
+
+def _attach_shared(result, self, *args, **kwargs):
+    """After the DSpark draft attached the target's LM head (before its graphs are captured)."""
+    head = getattr(self, 'lm_head', None)
+    if (head is not None and getattr(head, 'weight', None) is not None and head.weight.dtype == torch.bfloat16
+            and head.weight.dim() == 2 and getattr(head, '_xtier_draft_fp8', None) is None):
+        _quantize_lm_head(head)
+    return result
+
+
+def _draft_project(original, hidden, lm_head):
+    packed = getattr(lm_head, '_xtier_draft_fp8', None)
+    if packed is None:
+        return original(hidden, lm_head)
+    qweight, scale = packed
+    x = hidden.reshape(-1, hidden.shape[-1]).float()
+    sx = x.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / FP8_MAX
+    out = torch._scaled_mm((x / sx).to(torch.float8_e4m3fn), qweight.t(), scale_a=sx, scale_b=scale,
+                           out_dtype=torch.bfloat16)
+    return out.view(*hidden.shape[:-1], qweight.shape[0])
 
 
 def _make_candidate_indexer(original, *args, **kwargs):
@@ -193,3 +291,9 @@ def install(registry, hook_type):
     if os.environ.get('XTIER_ENGRAM_ROWS', '') == 'nvme':
         registry.register(f'{ENGRAM}.__init__', _init, hook_type.AROUND)
         registry.register(f'{ENGRAM}._owned_rows', _owned_rows, hook_type.REPLACE)
+        if os.environ.get('XTIER_ENGRAM_PREFETCH', '1') != '0':
+            registry.register(f'{ENGRAM_LAYER}.__init__', _engram_layer_init, hook_type.AFTER)
+            registry.register(f'{HASHER}.forward', _prefetch, hook_type.AFTER)
+    if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0':
+        registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
+        registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)
