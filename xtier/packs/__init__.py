@@ -1,13 +1,14 @@
 """Acceleration packs: per-model-family fixes and kernels, registered as hooks on SGLang (XTIER_PACKS=all|none|list).
 
 A pack's hooks only act when its model's code runs, so every selected pack is installed in every scheduler process.
-Packs in SERVING also hook the process that serves the API (how prompts are tokenized): ``install_serving``.
+Packs in SERVING also hook the process that serves the API (how prompts are tokenized, how the server arguments are
+resolved): ``install_serving``.
 """
 
 import importlib
 import os
 
-PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4', 'speculative')
+PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4', 'minimax_m3', 'speculative')
 
 
 def selected() -> list[str]:
@@ -30,8 +31,9 @@ def install(registry, hook_type) -> list[str]:
     return names
 
 
-# packs with hooks in the process that serves the API (prompt tokenization), installed there and nowhere else
-SERVING = ('deepseek_v4',)
+# packs with hooks in the process that serves the API (prompt tokenization, argument resolution), installed there
+# and nowhere else
+SERVING = ('deepseek_v4', 'minimax_m3')
 
 
 def install_serving(registry, hook_type) -> list[str]:
