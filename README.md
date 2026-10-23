@@ -27,11 +27,11 @@ xtier/
 │              deepseek_v4（Engram 行放 NVMe、SM120 候选索引器、FP8 GEMM 调优配置）、
 │              speculative（通用 EAGLE 投机解码：热词表配无损拒绝采样、草稿温度、按置信度截断验证）
 ├── tables/    大嵌入表的行放在 NVMe：多段多文件、任意行宽、行缓存、CUDA 图内查表
-├── console/   控制台：一个网页选模型、调启动参数、启动 / 停止，跟踪加载阶段与 decode 遥测（只用标准库）
+├── console/   启动台：一个网页选模型、调启动参数、启动 / 停止，跟踪加载阶段与 decode 遥测（只用标准库）
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
-configs/       每个"模型 × 硬件"的启动配置，console.py 是它在控制台里的条目（选项、默认值、启动命令）
-tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4）与控制台检查
+configs/       每个"模型 × 硬件"的启动配置，console.py 是它在启动台里的条目（选项、默认值、启动命令）
+tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4）与启动台检查
 bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟）与结果
 ```
 
@@ -45,10 +45,23 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
   python -m sglang.launch_server --model-path <MoE 检查点> --cuda-graph-backend-prefill disabled ...
 ```
 
-开关见 [xtier/config.py](xtier/config.py)；按模型和硬件的完整启动参数见 [configs/](configs/)。
+开关见 [xtier/config.py](xtier/config.py)；按模型和硬件的完整启动参数见 [configs/](configs/)，也可以用下面的启动台。
 
-也可以用控制台：在仓库根目录运行 `python3 -m xtier.console`，打开 http://127.0.0.1:8100/ ，选模型、调参数（默认是实测配置）、
-启动 / 停止，看加载阶段和 decode 速度；模型服务在自己的端口上提供 OpenAI 兼容接口。见 [docs/console.md](docs/console.md)。
+## 启动台
+
+![XTier 启动台](docs/images/console.png)
+
+在仓库根目录运行 `python3 -m xtier.console`（只用 Python 标准库），打开 http://127.0.0.1:8100/ ：
+
+- **左边模型栏**：每个模型一张小卡片，写着端口和 README 实测速度，标签注明测法（AGENT = agent 速度，文本 = 文本速度），
+  模型多了在栏内滚动。
+- **中间启动参数**：默认就是实测配置，改过的项会标出。公共的有加速包开关（关 = 测速表里「官方 main」的配置）、投机解码、上下文、
+  CPU 专家线程；各模型自己的有 Qwen 的 KV 精度、分块、常驻层布局、PLE 表放内存还是 NVMe，GLM 的拒绝采样、热专家槽、分块，
+  DeepSeek 的 Engram 行缓存、热专家槽、分块。
+- **右边运行状态**：加载阶段（权重 → 草稿 → 专家池 → CUDA 图 → 预热 → 在线），在线后显示 decode 速度、接受长度、显存和日志。
+
+一次只跑一个模型；模型服务在自己的端口上提供 OpenAI 兼容接口，启动台退出不影响它。加模型只要在 `configs/<模型>-<硬件>/` 里
+加一个 `console.py`（卡片、选项、启动命令）。细节见 [docs/console.md](docs/console.md)。
 
 ## 支持的模型
 
@@ -60,9 +73,34 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 ## 测速
 
-单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）+ 384 GiB DDR5，官方 SGLang main 8cd3c494。agent 场景：编码 agent 的会话记录截成
-64K / 512K token 当提示，冷 prefill（先清前缀缓存），输出 1K token（含思考），单请求、默认采样；每个配置先用一个 32K 的提示
-预热（[bench/context_speed.py](bench/context_speed.py)）。prefill 和 decode 的单位都是 tok/s，表里只放最新一次的结果。
+单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）+ 384 GiB DDR5，官方 SGLang main 8cd3c494，单位 tok/s，表里只放最新一次的结果。
+两种测法，以后统一用 agent 速度：
+
+- **agent 速度**：与生产仓库同一个 `bench/agent_bench.py`，模拟编码代理（dsh / Claude Code 一类工具）：5 个会话从 64K 到约 500K，
+  铺满 512K KV 池，多步调用工具，后续请求命中前缀缓存，服务端默认采样，同一次启动连跑两轮。目前 DeepSeek 用这个。
+- **文本速度**：编码代理的会话记录截成 64K / 512K token 当提示，冷 prefill（先清前缀缓存），输出 1K token（含思考），单请求、
+  默认采样，每个配置先用一个 32K 的提示预热（[bench/context_speed.py](bench/context_speed.py)）。Qwen、GLM 目前是这个，之后换成
+  agent 速度。
+
+### agent 速度
+
+| DeepSeek V4.1 Flash 1017（DSpark） | 轮 | 冷 prefill 64K 会话 | 冷 prefill 500K 会话 | decode（长回复） | 接受长度 | 每步 |
+|---|:-:|---:|---:|---:|---:|---:|
+| XTier + 加速包 | 1 | 3,503 | 4,801 | 121.7 | 4.13 | 33.9 ms |
+|  | 2 | 4,994 | 4,825 | 131.5 | 4.45 | 33.8 ms |
+| 生产（lsglang_ds4.1，10-22） | 1 | 3,377 | 3,856 | 142.7 | 4.56 | 31.9 ms |
+|  | 2 | 4,431 | 3,856 | 136.1 | 4.36 | 32.0 ms |
+
+- **decode 只比长回复**（≥ 300 token，写代码、写总结）：官方 main 的 DeepSeek 工具调用解析不逐 token 流式返回参数，XTier 上工具调用
+  请求量不出 decode（两轮 149 个请求里能计时 18 个）；生产所有请求都能计时，算上工具调用（输出短、接受长度高）是 158.6 / 144.6 tok/s。
+- 接受长度随回复内容变，比较两边看每步耗时：XTier 慢约 6%（CPU 专家侧与生产持平，差在 GPU 侧，在查）。冷 prefill XTier 快 10–25%
+  （两边第 1 轮的 64K 会话都是启动后的第一个请求，偏慢）。
+- 加速包精度：无损——块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型
+  验证），PPL 3.319 → 3.317，照抄 0 错。官方 main（不开加速包）还没按 agent 测。
+- 每会话的明细（上下文起止、首字、请求数）见[报告](docs/reports/2026-10-24-qwen-kv-ds-agent.md)，原始数据
+  `bench/results/agent-bench-ds41-xtier-r{1,2}-20261023.json`。
+
+### 文本速度（Qwen、GLM）
 
 | 模型 | 配置 | 64K prefill | 64K decode | 512K prefill | 512K decode | 加速包精度 |
 |---|---|---:|---:|---:|---:|---|
@@ -70,13 +108,17 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 |  | + 加速包 | 5587 | 161.4（14.47 ms） | 5040 | 147.5（15.62 ms） | 轻微：KV 存 NVFP4（与生产相同，每 16 个值一个 E4M3 缩放；读出与官方反量化逐位一致），照抄 0 错、PPL 3.481；hc_mix 换成重叠的持久内核、PLE 层与 QSA 索引器分段与官方逐位一致 |
 | GLM-5.3 Flash（EAGLE） | 官方 main | 2663 | 78.6（34.93 ms） | 2518 | 75.0（33.83 ms） | 基准 |
 |  | + 加速包 | 2808 | 100.0（29.16 ms） | 2656 | 91.9（26.78 ms） | 轻微：BF16 注意力 / 稠密层存成 FP8（每行每 128 列一个 scale），PPL 3.987 → 3.998（+0.3%）；拒绝采样与截断验证无损（输出分布与不用投机解码相同），照抄 0 错 |
-| DeepSeek V4.1 Flash 1017（DSpark） | 官方 main | 3318 | 64.9（49.93 ms） | 3627 | 66.1（51.83 ms） | 基准 |
-|  | + 加速包 | 4169 | 96.2（32.59 ms） | 4623 | 85.4（35.99 ms） | 无损：块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型验证），PPL 3.319 → 3.317 |
 
 - **decode**：5 次回答的中位数（1 次冷启动，加 4 次命中前缀缓存重发，上下文相同、各自采样）。括号里是每个验证步的耗时。
-  投机解码每步出几个 token 取决于这段文字好不好猜，单次 tok/s 能差 30%。Qwen 和 DeepSeek 的草稿长度固定，每步耗时 5 次之间
+  投机解码每步出几个 token 取决于这段文字好不好猜，单次 tok/s 能差 30%。Qwen 的草稿长度固定，每步耗时 5 次之间
   只差 1–3%，比较两种配置看括号里的数；GLM 开了自适应草稿步数，每步耗时也随接受长度变（±5%）。例如 Qwen 两行的 decode
   tok/s 差 10%，大部分是这几次回答的接受长度不同（2.10 对 2.22、2.16 对 2.38），加速包本身每步只快 2%。
+- 512K 一列的提示是 510K token，加上 1K 输出不超过 524288 的上下文。每个配置的完整数据（首 token、5 次 decode 的范围、
+  接受长度）：加速包（10-23 夜重测）见 [reports/2026-10-23-speculative-fp4kv.md](docs/reports/2026-10-23-speculative-fp4kv.md#readme-重测加速包三行10-23-夜)，
+  官方 main 见 [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md#readme-测速)。
+
+### 配置（两种测法通用）
+
 - **官方 main**：XTier 后端加上跑起来必需的修正，不开任何提速项。必需的修正：Qwen 的 PLE 表锁页分配；GLM 的量化排除、DSA
   别名、NextN 草稿量化；DeepSeek 的 SM120 候选索引器、Engram 行放 NVMe、尾部重放不走 CUDA 图。
 - **热专家布局与启动参数与生产相同**：Qwen NVFP4 KV、其余层每层 155 槽；GLM 每层 60 槽、16K 分块、BF16 SSM 状态、拒绝采样；
@@ -89,15 +131,15 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
   草稿温度 ×0.8、按草稿置信度截断验证，截掉的 token 跳过 CPU 专家，`xtier/packs/speculative/`）；
   DeepSeek 是调好的块 FP8 GEMM 配置、MXFP8 走 FlashInfer CUTLASS（解码宽度走 b12x）、Engram 提前查表（`XTIER_ENGRAM_PREFETCH`）
   和草稿词表头 FP8（`XTIER_DRAFT_LMHEAD_FP8`）。
-- **DeepSeek 按生产的测法**（生产仓库 lsglang_ds4.1 的 `bench/agent_bench.py`：五个编码代理会话从 64K 到约 500K，两轮）：两边都能逐 token 计时的长回复
-  （≥ 300 token）每步 33.9 ms（生产 32.0 ms，+6%），接受长度 4.1–4.5（生产 4.4–4.6）；冷 prefill 4832–4994 tok/s（生产
-  3856–4431）。官方 main 的 DeepSeek 工具调用不逐 token 流式返回参数，这类请求测不了 decode，见报告。
-- 512K 一列的提示是 510K token，加上 1K 输出不超过 524288 的上下文。每个配置的完整数据（首 token、5 次 decode 的范围、
-  接受长度）：加速包三行（10-23 夜重测）见 [reports/2026-10-23-speculative-fp4kv.md](docs/reports/2026-10-23-speculative-fp4kv.md#readme-重测加速包三行10-23-夜)，
-  官方 main 三行见 [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md#readme-测速)。
+- **接口参数与生产相同**：推理解析、工具调用解析（DeepSeek `deepseekv41`、GLM `glm47`、Qwen `qwen3_coder`）和缓存命中上报
+  （`--enable-cache-report`：usage 里的 `prompt_tokens_details.cached_tokens`，dsh 一类客户端据此显示缓存命中）。
 
 ## 版本更新
 
+- 2026-10-24（夜）：README 加启动台介绍；测速分成 agent 速度和文本速度，以后统一用 agent 速度：DeepSeek 改列 agent 速度（与生产
+  同一套 agent_bench，每会话明细见 [reports/2026-10-24-qwen-kv-ds-agent.md](docs/reports/2026-10-24-qwen-kv-ds-agent.md)），Qwen、GLM
+  暂为文本速度。启动参数补上生产的接口参数：三个模型 `--enable-cache-report`，GLM、Qwen 的工具调用解析器（`glm47`、`qwen3_coder`）；
+  按 dsh 的请求（流式 chat completions）实测三个模型：缓存命中正常上报，工具调用正常解析。
 - 2026-10-24：控制台 `xtier/console/`（`python3 -m xtier.console`）：一个网页管所有模型——选模型、调启动参数（默认是实测配置）、
   启动 / 停止，跟踪加载阶段与 decode 遥测；每个模型在 `configs/*/console.py` 里描述，加模型只要加一个配置目录。
   见 [docs/console.md](docs/console.md)。

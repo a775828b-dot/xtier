@@ -62,9 +62,11 @@ clip-path:polygon(9px 0,100% 0,100% calc(100% - 9px),calc(100% - 9px) 100%,0 100
 .xt-model .top{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0}
 .xt-model .code{min-width:0;font-size:9.5px;letter-spacing:.18em;color:var(--c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .xt-model .name{margin-top:1px;font-weight:700;font-size:13.5px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.xt-model .perf{display:grid;grid-template-columns:32px minmax(0,1fr);margin-top:3px;font-size:11px;line-height:1.45}
+.xt-model .perf{display:grid;grid-template-columns:32px minmax(0,1fr) auto;margin-top:3px;font-size:11px;line-height:1.45}
 .xt-model .perf span{font-size:9.5px;letter-spacing:.12em;color:var(--d);align-self:center}
 .xt-model .perf b{font-weight:600;color:#e3f3ff;white-space:nowrap}
+.xt-model .perf .kind{grid-column:3;grid-row:1/span 2;align-self:center;font-style:normal;font-size:8.5px;line-height:1.5;letter-spacing:.12em;padding:0 5px;border-radius:5px;border:1px solid rgba(127,144,173,.4);color:var(--d)}
+.xt-model .perf .kind[data-kind=agent]{color:var(--g);border-color:rgba(156,240,107,.5)}
 .xt-model .run{flex:none;display:none;font-size:8.5px;line-height:1.5;letter-spacing:.16em;padding:0 6px;border-radius:999px;color:#04110a;background:var(--g);box-shadow:0 0 10px rgba(156,240,107,.7)}
 .xt-model[data-running=loading] .run{display:block;background:var(--a);box-shadow:0 0 10px rgba(251,191,36,.6)}
 .xt-model[data-running=online] .run{display:block}
@@ -169,7 +171,7 @@ def card_html(data):
 <div class=xt-body>
   <div class="xt-panel xt-rail" role=group aria-label="XTier 模型">
     <h4>MODELS · 模型</h4>
-    <div class=xt-legend>README 实测 tok/s · 64K / 512K</div>
+    <div class=xt-legend>README 实测 tok/s · 文本：64K / 512K 提示 · AGENT：编码代理会话（悬停看测法）</div>
     <div class=xt-models role=tablist></div>
   </div>
   <form class=xt-panel id=xt-form autocomplete=off>
@@ -233,12 +235,14 @@ JS = r"""
   let busy = false;
 
   const tabs = root.querySelector('.xt-models');
+  // bench: the README speeds as text (dec, pre), how they were measured (kind: agent / text) and a tooltip (title)
   tabs.innerHTML = models.map(m => {
     const d = data.models[m], b = d.bench || {};
-    const pair = (x, y) => `${x ?? '--'} / ${y ?? '--'}`;
-    const perf = b.d64 || b.p64 ? `<div class="perf xt-mono"><span>DEC</span><b>${esc(pair(b.d64, b.d512))}</b>` +
-      `<span>PRE</span><b>${esc(pair(b.p64, b.p512))}</b></div>` : '';
-    return `<button type=button class=xt-model role=tab data-model="${esc(m)}" aria-selected=false title="${esc(d.arch || '')}"><div>
+    const kind = {agent: 'AGENT', text: '文本'}[b.kind] || '';
+    const perf = b.dec || b.pre ? `<div class="perf xt-mono"><span>DEC</span><b>${esc(b.dec || '--')}</b>` +
+      (kind ? `<i class=kind data-kind="${esc(b.kind)}">${kind}</i>` : '') + `<span>PRE</span><b>${esc(b.pre || '--')}</b></div>` : '';
+    const tip = [d.arch, b.title].filter(Boolean).join('\n');
+    return `<button type=button class=xt-model role=tab data-model="${esc(m)}" aria-selected=false title="${esc(tip)}"><div>
       <div class=top><span class="code xt-mono">${esc(d.code || m)} · :${esc(d.port)}</span><span class="run xt-mono"></span></div>
       <div class=name>${esc(d.name)}</div>${perf}</div></button>`;
   }).join('');

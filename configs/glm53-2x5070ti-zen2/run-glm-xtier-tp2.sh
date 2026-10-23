@@ -42,6 +42,8 @@ exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-na
   --mem-fraction-static ${MEMFRAC:-0.90} --page-size 64 --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 \
   --dsa-decode-backend tilelang --dsa-prefill-backend tilelang --cuda-graph-backend-prefill disabled \
   --cuda-graph-max-bs-decode ${MAXREQ:-1} --disable-shared-experts-fusion \
-  --reasoning-parser glm45 --tool-call-parser glm47 --watchdog-timeout 3600 --enable-metrics \
+  --reasoning-parser glm45 --tool-call-parser glm47 --watchdog-timeout 3600 --enable-metrics --enable-cache-report \
   --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   "$@"
+# --tool-call-parser, --enable-cache-report: the API as production (tool calls parsed; usage reports the cached prompt
+# tokens, prompt_tokens_details.cached_tokens, which clients such as dsh show as cache hits).

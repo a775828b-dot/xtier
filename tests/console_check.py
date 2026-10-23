@@ -27,6 +27,8 @@ combos = 0
 for mid, m in models.items():
     keys = [o['key'] for o in m['options']]
     assert len(keys) == len(set(keys)), mid
+    b = m.get('bench') or {}   # the card's README speeds: how they were measured and the text shown
+    assert b.get('kind') in ('agent', 'text') and isinstance(b.get('dec'), str) and isinstance(b.get('pre'), str), mid
     d = console.defaults(mid)
     assert console.validate(mid, {}) == d
     for o in m['options']:

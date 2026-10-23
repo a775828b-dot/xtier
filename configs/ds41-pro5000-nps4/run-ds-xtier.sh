@@ -49,9 +49,11 @@ exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-na
   --disable-shared-experts-fusion --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode full \
   --fp8-gemm-backend ${FP8_GEMM:-flashinfer_cutlass} \
   --enable-decoder-swa-bounded-replay --enable-deepseek-v4-fp4-indexer \
-  --reasoning-parser deepseek-v41 --tool-call-parser deepseekv41 --watchdog-timeout 1200 --enable-metrics \
+  --reasoning-parser deepseek-v41 --tool-call-parser deepseekv41 --watchdog-timeout 1200 --enable-metrics --enable-cache-report \
   --weight-loader-drop-cache-after-load "${SPEC[@]}" "$@"
 # --weight-loader-drop-cache-after-load (as in production): the page cache of the 300 GB checkpoint would otherwise
 # push the engine's freshly built shards into swap on this 377 GB host. --fp8-gemm-backend flashinfer_cutlass:
 # the 32 x 32 block FP8 projections as MXFP8 on FlashInfer (production's SM120 default; SGLang main keeps Triton on
 # auto), small M on b12x (packs/deepseek_v4); FP8_GEMM=auto for the Triton block kernel with the tuned configs.
+# --tool-call-parser, --enable-cache-report: the API as production (tool calls parsed; usage reports the cached prompt
+# tokens, prompt_tokens_details.cached_tokens, which clients such as dsh show as cache hits).

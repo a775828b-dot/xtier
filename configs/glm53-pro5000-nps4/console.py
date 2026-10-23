@@ -14,7 +14,8 @@ MODEL = {
     'name': 'GLM-5.3 Flash', 'code': 'GLM-5.3-F', 'port': 18185, 'served': 'GLM-5.3-Flash-NVFP4',
     'spec': 'EAGLE', 'arch': '42 层 · 288 专家 · DSA 稀疏注意力 · NVFP4 专家 + FP8 稠密层',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2700,
-    'bench': {'p64': 2808, 'd64': 100.0, 'p512': 2656, 'd512': 91.9},
+    'bench': {'kind': 'text', 'dec': '100.0 / 91.9', 'pre': '2808 / 2656',
+              'title': '文本速度（README）：64K / 512K 提示，冷 prefill，输出 1K token'},
     'options': common_options('EAGLE') + [
         {'key': 'rs', 'label': '无损拒绝采样', 'default': 'on',
          'choices': [['on', '开 · 热词表 + 置信度截断'], ['off', '关']],

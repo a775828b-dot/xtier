@@ -31,7 +31,8 @@ export XTIER_FP8_EXCLUDE=${XTIER_FP8_EXCLUDE:-'(fused_qkv_a_proj|kv_b_proj|[.]ga
 export XTIER_FP8_W8A8_PREFILL=${XTIER_FP8_W8A8_PREFILL:-'[.](self_attn|mlp)[.]'}
 exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-name GLM-5.3-Flash-NVFP4 \
   --host 127.0.0.1 --port ${PORT:-18185} --tp-size 1 --trust-remote-code --skip-server-warmup --cuda-graph-backend-prefill disabled \
-  --max-running-requests 2 --page-size 64 --reasoning-parser glm45 --enable-metrics --quantization modelopt_fp4 \
+  --max-running-requests 2 --page-size 64 --reasoning-parser glm45 --tool-call-parser glm47 --enable-metrics \
+  --enable-cache-report --quantization modelopt_fp4 \
   --kv-cache-dtype fp8_e4m3 --dsa-decode-backend flashinfer_sparse_mla --dsa-prefill-backend flashinfer_sparse_mla \
   --disable-shared-experts-fusion --weight-loader-drop-cache-after-load --max-total-tokens ${MAX_TOTAL_TOKENS:-524288} \
   --chunked-prefill-size 16384 --mamba-ssm-dtype bfloat16 "$@"
@@ -42,3 +43,5 @@ exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-na
 # --weight-loader-drop-cache-after-load: evicts each checkpoint file once loaded (XTier makes it work for mapped files,
 # xtier/platform.py): without it the page cache filled the NUMA nodes of the loading thread and 3.3 GB went to swap
 # although 160 GB were free elsewhere.
+# --tool-call-parser, --enable-cache-report: the API as production (tool calls parsed; usage reports the cached prompt
+# tokens, prompt_tokens_details.cached_tokens, which clients such as dsh show as cache hits).

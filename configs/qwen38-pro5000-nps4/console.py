@@ -17,8 +17,9 @@ MODEL = {
     'name': 'Qwen3.8 Flash Next', 'code': 'QWEN-3.8-FN', 'port': 18180, 'served': 'Qwen3.8-Flash-Next',
     'spec': 'MTP', 'arch': '48 层 · 512 专家 top-10 · QSA + GDN 混合注意力 · NVFP4 W4A16',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 1800,
-    # README "+ 加速包" row: prefill / decode tok/s at 64K and 512K
-    'bench': {'p64': 5587, 'd64': 161.4, 'p512': 5040, 'd512': 147.5},
+    # README "+ 加速包" row, text speed: decode / cold prefill tok/s at 64K / 512K
+    'bench': {'kind': 'text', 'dec': '161.4 / 147.5', 'pre': '5587 / 5040',
+              'title': '文本速度（README）：64K / 512K 提示，冷 prefill，输出 1K token'},
     'options': common_options('MTP') + [
         {'key': 'kv', 'label': 'KV 缓存', 'default': 'nvfp4', 'choices': [['nvfp4', 'NVFP4 · 与生产同参'], ['fp8', 'FP8']],
          'off_when': [{'packs': 'off'}]},

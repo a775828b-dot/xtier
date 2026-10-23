@@ -1,9 +1,9 @@
-# XTier 控制台
+# XTier 启动台
 
 一个网页管所有模型：选模型、调启动参数（默认是实测配置，改过的项会标出）、启动 / 停止，实时看加载阶段（权重 → 草稿 →
 专家池 → CUDA 图 → 在线）和 decode 遥测（tok/s、接受长度、显存）。只用 Python 标准库，不需要 SGLang 或 torch。
 
-![XTier 控制台](images/console.png)
+![XTier 启动台](images/console.png)
 
 ## 运行
 
@@ -25,7 +25,8 @@ python3 -m xtier.console       # http://127.0.0.1:8100/
 - 一次只跑一个模型：启动新模型前先停掉当前的，等显存释放；GPU 上别的进程占着超过 2 GiB 就报错、不启动。
 - 模型服务在自己的端口上提供 SGLang 的 OpenAI 兼容接口（`http://127.0.0.1:端口/v1`），控制台不转发请求。控制台退出或重启
   不影响正在跑的模型服务，重新打开后接着显示它的状态。
-- 页面上的速度数字是 README 测速表里的实测值（64K / 512K 上下文）。
+- 模型卡片上的速度是 README 测速表里的实测值，标签注明测法：AGENT = agent 速度（编码代理会话，以后统一用这个），
+  文本 = 文本速度（64K / 512K 提示）；鼠标悬停看具体口径。
 
 ## 加一个模型
 
@@ -42,7 +43,8 @@ MODEL = {
     'id': 'mymodel', 'order': 40,                 # 唯一的 id；order 决定在列表里的位置
     'name': 'My Model', 'code': 'MY-MODEL', 'port': 18200, 'served': 'My-Model',
     'spec': 'EAGLE', 'arch': '一行结构说明', 'hardware': '一行硬件说明', 'ready_timeout': 1800,
-    'bench': {'p64': 0, 'd64': 0.0, 'p512': 0, 'd512': 0.0},   # README 实测 tok/s：prefill / decode × 64K / 512K
+    # README 实测速度：卡片上显示的 decode / prefill 文字、测法（agent / text）、悬停说明
+    'bench': {'kind': 'agent', 'dec': '120.0', 'pre': '4000 / 3800', 'title': 'agent 速度：……'},
     # 公共的四项（加速包、投机解码、上下文、CPU 线程）+ 模型自己的；第一个取值写实测配置
     'options': common_options('EAGLE') + [
         {'key': 'slots', 'label': '热专家槽 / 层', 'default': '60',
