@@ -23,4 +23,6 @@ if [ "${LAYOUT:-}" = prod ]; then
 fi
 exec $D/env/bin/python -m sglang.launch_server --model-path $M --tokenizer-path $T --served-model-name Qwen3.8-Flash-Next \
   --host 127.0.0.1 --port ${PORT:-18180} --tp-size 1 --trust-remote-code --skip-server-warmup --cuda-graph-backend-prefill disabled \
-  --max-running-requests 2 --page-size 64 --reasoning-parser qwen3 --enable-metrics "$@"
+  --max-running-requests 2 --page-size 64 --reasoning-parser qwen3 --enable-metrics --weight-loader-drop-cache-after-load "$@"
+# --weight-loader-drop-cache-after-load: evicts each checkpoint file once loaded (XTier makes it work for mapped files,
+# xtier/platform.py); without it the page cache piles up on a few NUMA nodes, which then swap (4.3 GB once).
