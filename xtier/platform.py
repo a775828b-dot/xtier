@@ -16,6 +16,12 @@
   DeepSeek's 100 GB Engram files; POSIX_FADV_WILLNEED would read only one read-ahead window), so the loading thread
   copies from the page cache instead of faulting the files in page by page. A pass that takes a few tensors per file
   (a speculative draft loading from the target's checkpoint) reads no file ahead.
+- Token-id sync at TP 1: SGLang's sampler all-reduces the sampled ids over the TP group whenever a request has a
+  grammar (tool calls with a constrained parser, e.g. GLM-5.3's glm47) and skips that only by flag, not by group size.
+  At TP 1 the all-reduce over one rank is the identity, but its first call makes NCCL set up a communicator and
+  cudaMalloc its buffers (512 MB); after a large prefill the device is full and the server dies (GLM-5.3 on the RTX
+  PRO 5000, 10-24: "Failed to CUDA calloc 536870912 bytes" on the first tool request after a 64K prefill). XTier skips
+  the call when the group has one rank.
 """
 
 import ctypes
@@ -27,6 +33,7 @@ import threading
 logger = logging.getLogger(__name__)
 TILELANG_TARGET = 'tilelang.backend.target.auto_detect_target'
 DROP_FILE_CACHE = 'sglang.srt.model_loader.weight_utils._drop_file_cache_after_load'
+TOKEN_SYNC = 'sglang.srt.layers.sampler.Sampler._sync_token_ids_across_tp'
 _MADV_PAGEOUT = 21
 READ_AHEAD_FILES, READ_AHEAD_MAX = 2, 16 << 30
 
@@ -125,6 +132,14 @@ def _drop_file_cache(original, path, *args, **kwargs):
     return original(path, *args, **kwargs)
 
 
+def _sync_token_ids(original, self, *args, **kwargs):
+    import torch.distributed as dist
+    group = getattr(self, 'tp_sync_group', None)
+    if group is not None and dist.get_world_size(group) == 1:
+        return None   # an all-reduce over one rank: nothing to agree on, and no NCCL communicator to create
+    return original(self, *args, **kwargs)
+
+
 def install(registry, hook_type) -> list[str]:
     import importlib.util
     fixes = []
@@ -134,4 +149,6 @@ def install(registry, hook_type) -> list[str]:
     if os.path.exists('/proc/self/maps'):
         registry.register(DROP_FILE_CACHE, _drop_file_cache, hook_type.AROUND)
         fixes.append('checkpoint-page-out')
+    registry.register(TOKEN_SYNC, _sync_token_ids, hook_type.AROUND)
+    fixes.append('tp1-token-sync')
     return fixes
