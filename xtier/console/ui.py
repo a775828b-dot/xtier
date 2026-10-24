@@ -369,7 +369,7 @@ JS = r"""
       const i = order.indexOf(li.dataset.phase);
       li.className = at < 0 ? '' : (i < at ? 'done' : (i === at ? 'now' : ''));
     }
-    $('xt-tps').innerHTML = s.tps ? `${s.tps.toFixed(1)}<small>tok/s</small>` : '--';
+    $('xt-tps').innerHTML = typeof s.tps === 'number' ? `${s.tps.toFixed(1)}<small>tok/s</small>` : '--';
     $('xt-accept').textContent = s.accept ? s.accept.toFixed(2) : '--';
     $('xt-running').textContent = s.state === 'online' ? String(s.running ?? 0) : '--';
     spark(s.spark);

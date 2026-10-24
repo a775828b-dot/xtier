@@ -172,6 +172,18 @@ _POLL = re.compile(r'"GET /(?:v1/models|health|metrics|get_model_info|get_server
 _QUEUE = re.compile(r'#queue-req: (\d+)')
 _PREFILL_TPS = re.compile(r'input throughput \(token/s\): ([\d.]+)')
 _CACHE = re.compile(r'XTier cache: \d+ windows, hit ([\d.]+), ([\d.]+) distinct experts and (\d+) us CPU per layer call')
+# the same lines with their time, to tell a running server from an idle one (SGLang logs a batch line only while busy)
+_AT = r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)[^\]]*\] '
+_DECODE_AT = re.compile(_AT + _DECODE.pattern, re.M)
+_PREFILL_AT = re.compile(_AT + r'Prefill batch, #new-seq: (\d+).*?#running-req: (\d+)', re.M)
+
+
+def _fresh(stamps, now, floor, cap=60.0):
+    """Whether the newest of these log times is recent: within 2.5 of their usual gaps (at least floor seconds)."""
+    times = [time.mktime(time.strptime(s, '%Y-%m-%d %H:%M:%S')) for s in stamps[-6:]]
+    gaps = sorted(b - a for a, b in zip(times, times[1:]) if b > a)
+    interval = gaps[len(gaps) // 2] if gaps else floor
+    return now - times[-1] <= min(cap, max(floor, 2.5 * interval))
 
 
 def _count(n):
@@ -455,15 +467,26 @@ class Console:
                         version=version[-1] if version else '', layers=len(set(_LAYER.findall(text))))
             # online once wait_ready saw /health pass; /v1/models when nothing here waits (the console restarted)
             if state.get('ready_at') or (state.get('port') not in self._waiting and models_ok(state.get('port'))):
-                decodes = _DECODE.findall(text)[-40:]
-                prefills = _PREFILL.findall(text)
+                decodes = _DECODE_AT.findall(text)[-40:]
+                prefills = _PREFILL_AT.findall(text)
                 body.update(state='online', progress=100, phase='online', phase_label='在线')
+                now = time.time()
                 if decodes:
-                    running, tokens, accept, tps = decodes[-1]
-                    body.update(running=int(running), tokens=int(tokens), accept=float(accept) if accept else None,
-                                tps=float(tps), spark=[float(d[3]) for d in decodes])
-                if prefills:
-                    body['last_prefill'] = int(prefills[-1][1])
+                    stamp, running, tokens, accept, tps = decodes[-1]
+                    spark = [float(d[4]) for d in decodes]
+                    if _fresh([d[0] for d in decodes], now, 6.0):
+                        body.update(running=int(running), tokens=int(tokens), accept=float(accept) if accept else None,
+                                    tps=float(tps), spark=spark)
+                    else:   # no decode line for a while: nothing decodes (a prefill may run, below)
+                        body.update(running=0, tokens=int(tokens), accept=None, tps=0.0, spark=spark + [0.0])
+                if prefills and _fresh([p[0] for p in prefills], now, 20.0) and (
+                        not decodes or prefills[-1][0] >= decodes[-1][0]):
+                    # a prefill after the newest decode line: its requests and those it joins run
+                    body['running'] = int(prefills[-1][1]) + int(prefills[-1][2])
+                    body.setdefault('tps', 0.0)
+                last = _PREFILL.findall(text)
+                if last:
+                    body['last_prefill'] = int(last[-1][1])
                 if state.get('ready_at'):
                     body['load_s'] = round(state['ready_at'] - state['started_at'])
             else:
