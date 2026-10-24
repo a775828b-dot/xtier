@@ -63,7 +63,8 @@ python tools/plan_auto.py --profile profile.json --probe probe.json --layout "0,
 - `--add-gib`：在手工布局的预算上再加（例如测得的 prefill 峰值之外的空余显存）。
 - `--adapt`：自适应换入让 S 个槽命中得像档案前 adapt×S 名。用 `plan_calibrate.py` 从一次运行求（DS 1.69、GLM 1.47、MiniMax 2.19、
   Qwen 约 1.4–1.6）。
-- `--call-us`：真实服务里每次信箱调用比单层探测多的微秒数。本机 Qwen 用五组实测布局标定为 28（配 v3 探测、adapt 1.4），来源未定位。
+- `--call-us`：真实服务里每次信箱调用比单层探测多的微秒数。本机 Qwen 用五组实测布局标定为 28（配 v3 探测、adapt 1.4），来源未定位
+  （排除了：槽位扫描、token 数、统计锁、多层切换 +5 µs、主线程 CPU 忙等）。
 
 ### 4. 启动
 
