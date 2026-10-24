@@ -160,10 +160,23 @@ def _write_json(path, value):
 
 _SHARDS = re.compile(r'loading shards:\s+(\d+)% Completed \| (\d+)/(\d+)')
 _LAYER = re.compile(r'xtier: layer (\d+): \d+ experts')
-_DECODE = re.compile(r'Decode batch, #running-req: (\d+), #full token: (\d+)(?:.*?accept len: ([\d.]+))?.*?'
+# "#full token" on hybrid pools (DeepSeek, GLM, Qwen), "#token" on one pool (MiniMax)
+_DECODE = re.compile(r'Decode batch, #running-req: (\d+), #(?:full )?token: (\d+)(?:.*?accept len: ([\d.]+))?.*?'
                      r'gen throughput \(token/s\): ([\d.]+)')
 _PREFILL = re.compile(r'Prefill batch, #new-seq: (\d+), #new-token: (\d+), #cached-token: (\d+)')
 _VERSION = re.compile(r'\[xtier\] ([\w.+-]+): hooks installed')
+# the log tail: the time of day only, the polling requests dropped, the batch lines in short
+_STAMP = re.compile(r'^\[\d{4}-\d\d-\d\d (\d\d:\d\d:\d\d)\]\s*')
+_ACCESS = re.compile(r'INFO:\s+\S+ - "(\w+) (\S+) HTTP/[\d.]+" (\d+)')
+_POLL = re.compile(r'"GET /(?:v1/models|health|metrics|get_model_info|get_server_info)\b')
+_QUEUE = re.compile(r'#queue-req: (\d+)')
+_PREFILL_TPS = re.compile(r'input throughput \(token/s\): ([\d.]+)')
+_CACHE = re.compile(r'XTier cache: \d+ windows, hit ([\d.]+), ([\d.]+) distinct experts and (\d+) us CPU per layer call')
+
+
+def _count(n):
+    n = int(n)
+    return str(n) if n < 1000 else f'{n / 1000:.1f}K' if n < 10000 else f'{n / 1000:.0f}K'
 
 
 def _read_tail(path, size=262144):
@@ -176,9 +189,36 @@ def _read_tail(path, size=262144):
         return ''
 
 
-def log_tail(path, n=4):
-    lines = [ln.strip() for ln in _read_tail(path, 16384).splitlines() if ln.strip() and 'Multi-thread loading' not in ln]
-    return [re.sub(r'\x1b\[[0-9;]*m', '', ln)[:240] for ln in lines[-n:]]
+def _short(line):
+    """A log line for the page: HH:MM:SS, SGLang's batch lines in short, an access line as method, path, status."""
+    line = re.sub(r'\x1b\[[0-9;]*m', '', line)
+    stamp = _STAMP.match(line)
+    head, line = (stamp.group(1) + ' ', line[stamp.end():]) if stamp else ('', line)
+    decode, prefill, access, cache = _DECODE.search(line), _PREFILL.search(line), _ACCESS.search(line), _CACHE.search(line)
+    if decode:
+        running, tokens, accept, tps = decode.groups()
+        line = (f'decode {running} 请求 · {_count(tokens)} token' + (f' · 接受 {accept}' if accept else '')
+                + f' · {float(tps):.1f} tok/s')
+        queue = _QUEUE.search(decode.string)
+        if queue and queue.group(1) != '0':
+            line += f' · 排队 {queue.group(1)}'
+    elif prefill:
+        seqs, new, cached = prefill.groups()
+        tps = _PREFILL_TPS.search(line)
+        line = (f'prefill {seqs} 请求 · 新 {int(new):,} · 命中 {int(cached):,}'
+                + (f' · {float(tps.group(1)):,.0f} tok/s' if tps else ''))
+    elif access:
+        line = ' '.join(access.groups())
+    elif cache:
+        hit, experts, us = cache.groups()
+        line = f'热专家命中 {hit} · 每层 {experts} 个 CPU 专家 · CPU {us} µs / 层'
+    return (head + line)[:240]
+
+
+def log_tail(path, n=5):
+    lines = [ln.strip() for ln in _read_tail(path, 16384).splitlines()
+             if ln.strip() and 'Multi-thread loading' not in ln and not _POLL.search(ln)]
+    return [_short(ln) for ln in lines[-n:]]
 
 
 def _progress(text):

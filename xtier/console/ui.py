@@ -128,7 +128,7 @@ box-shadow:0 0 24px rgba(62,230,255,.45);text-shadow:0 1px 0 rgba(255,255,255,.3
 .xt-gpu .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--c),var(--v),var(--p));box-shadow:0 0 10px rgba(167,139,250,.7);transition:width .6s}
 .xt-end{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px;font-size:12px;color:var(--d)}
 .xt-end code{padding:3px 8px;border-radius:7px;border:1px solid var(--line);background:rgba(3,8,20,.8);color:var(--c);font-size:12px;overflow-wrap:anywhere}
-.xt-log{margin-top:10px;padding:8px 10px;max-height:94px;overflow:hidden;border-radius:9px;border:1px solid rgba(127,144,173,.18);background:rgba(2,5,12,.85);font-size:11px;line-height:1.55;color:#8ea2c2}
+.xt-log{margin-top:10px;padding:8px 10px;max-height:104px;overflow:hidden;border-radius:9px;border:1px solid rgba(127,144,173,.18);background:rgba(2,5,12,.85);font-size:11px;line-height:1.55;color:#8ea2c2}
 .xt-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .xt-log div:last-child::after{content:"▋";margin-left:3px;color:var(--c);animation:xt-blink 1s steps(2) infinite}
 .xt-msg{margin-top:10px;font-size:12.5px;color:var(--d)}
