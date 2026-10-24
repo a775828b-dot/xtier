@@ -1,4 +1,4 @@
-# 2026-10-24：DeepSeek decode 追平生产（FP8 wo_a）、deepseek-recipe 分词、Qwen / GLM 换 agent 速度、dsh 真机调用
+# 2026-10-24：DeepSeek decode 追平生产（FP8 wo_a、分页索引器）、deepseek-recipe 分词、Qwen / GLM 换 agent 速度、dsh 真机调用、MiniMax-M3.1-Flash 跑通与加速包
 
 ## DeepSeek：decode 每步慢 6% 的原因
 
@@ -83,6 +83,7 @@
 | DeepSeek V4.1 Flash 1017 | 6.9 min | `ledger` 记账包（SQLite、整数分、add / list / summary / remove / export、中文 README），14 个测试全过 |
 | Qwen3.8 Flash Next | 0.7 min | 按任务做完：`gen_log.py`（300 行日志）、`logstat.py`（状态码 / 最慢路径 / 每小时、`--top N`）、`test_logstat.py` 11 个测试全过、`report.md` |
 | GLM-5.3 Flash | 1.1 min | 按任务做完，同样五个文件，8 个测试全过（中途自己发现一条断言的预期写错并改正） |
+| MiniMax-M3.1-Flash（10-24 上午，加速包默认配置） | 2.9 min | 按任务做完，同样五个文件，7 个测试全过（中途自己发现沙箱不让在工作区外建临时目录、report.md 的编码不对，都改正了） |
 
 - 无头模式的两个坑（客户端侧）：headless profile 不读桌面版凭据服务里的 `HOME_API_KEY`（运行脚本从 `~/.dsh/.credentials.yaml`
   取值只传给子进程）；`dsh.cmd` 是批处理，多行任务参数在 cmd.exe 里被截到第一行（改成任务写文件、从 stdin 读 `-`）。
@@ -243,10 +244,174 @@ cached_tokens 上报：74 / 74 个请求
   第 2 轮长回复：4 个，84.1 tok/s，接受长度 2.62，每步 31.20 ms
 cached_tokens 上报：63 / 72 个请求
 
+## MiniMax-M3.1-Flash：SM120 上跑起来需要的修正
+
+SGLang 对 MiniMax M3.1 的支持还在 PR #45925（未合入 main），装在单独的 venv（env-m31），其余三个模型仍用 main 8cd3c494。
+在 RTX PRO 5000（SM120）上，PR 的代码有四处把 SM120 当成 SM100 处理，逐个以 hook 修正（`xtier/packs/minimax_m3/`，不改 SGLang）：
+
+1. 参数解析：NVFP4 检查点在"Blackwell"上选原生栈（MSA-v1 Q8KV4 注意力 + 打包 NVFP4 KV、MegaMoE、FP8 KV + TRT-LLM MHA），这些内核
+   只有 SM100 / SM103（tcgen05），而 TRT-LLM 的 FMHAv2 prefill 在 SM120 上拒绝 FP8 KV，服务在解析参数时就退出。SM120 改用 SGLang 给
+   Hopper 的通用栈：MiniMax 稀疏注意力的 Triton 路径，外面套 TRT-LLM MHA 稠密后端（Hopper 的 FA3 只有 SM90），页大小 128，专家
+   scheme 照 Hopper（Marlin；专家反正由 XTier 跑）。KV 仍是检查点声明的 FP8 E4M3（Triton 稀疏路径读时反量化），只是不写进参数。
+2. 原生栈判定 `uses_minimax_m3_nvfp4_native_stack` 在 SM120 返回 False（KV 池、注意力后端、显存预算三处要一致）。
+3. 专家 scheme `MiniMaxM3Nvfp4MoE` 在 SM120 按 Hopper 初始化（否则要求 MegaMoE 或 TRT-LLM routed）。
+4. DSpark 的 target verify：通用稀疏后端只在 NPU 和 ROCm 上实现了 verify（CUDA 上 DSpark 只配原生栈），verify batch 走进 prefill
+   路径、第一次 forward 就因为没有 extend 长度而失败。照 ROCm 的做法：每个草稿行作为一个因果 decode 查询走 Triton 稀疏 decode，
+   长度 = 已接受前缀 + 行号（元数据在 graph 里捕获），捕获时 KV 长度上界取上下文长度。
+
+另外两处是 XTier 配置：prefill 不捕获 CUDA graph（`--cuda-graph-backend-prefill disabled`，与其他三个模型相同），GPU prefill 开关照
+GLM-5.3 的生产设置（BF16 Down、预解包、上传预取、路由累加）。CPU 引擎新增 GPT-OSS SwiGLU（`gate·σ(1.702·gate)·(up+1)`，钳位 7），
+GPU 侧三处 Triton 内核同步支持；与 FP32 参考相对误差 1e-6（CPU）、与 CPU 引擎 1.3e-3（GPU，W4A16）。
+
+### 第一组 A/B（`xtier-dev/m31_quick.py`：新文本的 1K / 3.2K / 11.5K 冷 prefill 首字，默认采样的长解释与温度 0 的照抄各一次）
+
+128K KV 池（FP8 主 KV 7.5 GB + BF16 索引 K 1.9 GB + 草稿 KV 1.3 GB），DSpark 草稿 7 个（检查点的块长）：
+
+| 配置 | 1K / 3.2K / 11.5K 首字 | 解释：tok/s · 接受 · 每步 | 照抄：tok/s · 接受 · 每步 | 热专家命中 · CPU / 层 | 图后余量 |
+|---|---|---|---|---|---:|
+| 8 槽（13.5 GiB） | 14.2* / 8.9 / 7.4 s | 54.1 · 4.02 · 74.4 ms | 78.7 · 6.21 · 79.4 ms | 0.23 · 962 µs | 25.0 GB |
+| 16 槽 | 3.6 / 5.0 / 5.9 s | 58.2 · 3.99 · 68.6 ms | 85.1 · 5.93 · 70.1 ms | 0.34 · 856 µs | 11.4 GB |
+| 16 槽、草稿 3 个 | 3.6 / 5.1 / 5.9 s | 59.0 · 2.57 · 43.6 ms | 80.7 · 3.79 · 47.1 ms | 0.41 · 430–465 µs | 11.4 GB |
+
+\* 启动后第一个长提示：稀疏 prefill 的 `_topk_index_kernel` 这时才编译并 autotune 8 个配置（约 25 s，之后有缓存）。
+
+- 每步 ≈ 18–20 ms 的 GPU 与调度 + 57 层 × 每层 CPU 专家时间。CPU 专家受内存带宽限制（16 槽时每层约 13 个专家留在 CPU，
+  413 MB / 856 µs ≈ 480 GB/s），所以 decode 靠"少读"：多放热专家槽（16 槽每步 −8%~−12%），或每步少验证几个 token。
+- 草稿 3 个：每步省 36%，接受长度也少 36%，tok/s 持平、照抄更慢。固定缩短草稿没有净收益；要的是按草稿置信度截断（容易的
+  文本多验证、难的少验证）。DSpark 自带的验证规划器只在变长验证模式下裁剪，而 M3.1 NVFP4 要求 static 模式。
+- 16 槽和 256K KV 池放不下（图后余量 11.4 GB，256K 还要 +10.6 GB）：卡片默认 16 槽 + 128K，可选 8 槽 + 256K。
+
+### decode 剖析（16 槽、草稿 7，GPU-only，43 步，每步 72.2 ms）
+
+| 每步 | ms | 说明 |
+|---|---:|---|
+| 整卡空闲 | 32.8 | 主流在每个 MoE 层等 CPU 专家（57 层 × 约 0.76 ms；其间旁路流上热专家的 GPU 部分在算） |
+| 主流 GPU 计算 | 23.6 | MXFP8 投影 14.3（FlashInfer CUTLASS 128×32 块，M = 8，260 次 × 55 µs，约 56% 显存带宽）、目标 LM head（BF16）2.4、稀疏注意力 2.3 |
+| 旁路流：热专家 W4A16 | 15.1 | `_gate_up` 9.4 + `_down` 4.1，与 CPU 专家并行 |
+| 拷贝流：热专家换入 | 12.2 | 自适应池每步约 19 个专家（788 次拷贝），不占主流 |
+
+CPU 专家占每步约 60%，是第一瓶颈；其次是 decode 宽度的 MXFP8 GEMM 效率。
+
+### 第二组 A/B（同一测法，16 槽、128K KV 池）
+
+| 配置 | 1K / 3.2K / 11.5K 首字 | 解释：tok/s · 接受 · 每步 | 照抄：tok/s · 接受 · 每步 | 热专家命中 · CPU / 层 |
+|---|---|---|---|---|
+| 16 槽、草稿 7（第一组） | 3.6 / 5.0 / 5.9 s | 58.2 · 3.99 · 68.6 ms | 85.1 · 5.93 · 70.1 ms | 0.34 · 856 µs |
+| + MXFP8 b12x 行、草稿词表头 FP8 | — | 55.8 · 3.82 · 68.5 ms | 104.4 · 7.57 · 73.2 ms | 0.34 · 876 µs |
+| 草稿 5 | 3.6 / 6.9 / 6.5 s | 59.7 · 3.28 · 55.0 ms | 92.9 · 5.59 · 60.6 ms | 0.38 · 647 µs |
+| 草稿 5 + 换入节奏照 DeepSeek（每 2 窗、每次最多 32 个） | 3.5 / 5.2 / 5.9 s | **63.6 · 3.28 · 51.6 ms** | 91.2 · 5.34 · 58.9 ms | **0.43 · 571 µs** |
+| 草稿 5 + CPU 引擎 Down 粒度 24 | — | 65.3 · 3.83 · 58.7 ms | 87.7 · 5.20 · 59.7 ms | 0.35 · 711 µs |
+
+- b12x 和草稿词表头 FP8：每步不变（68.5 对 68.6 ms），接受长度的差别是采样波动；草稿 7 时验证宽度 8 不在 b12x 的行数里（1、4、6），
+  草稿 5 的 6 行验证才走 b12x。草稿词表头的 FP8 副本多占 1.23 GB 显存（16 槽 + 128K 仍放得下），只影响草稿提案。
+- 草稿 5：验证 6 个 token，每层不同的专家 15 个（草稿 7 时 19–20 个），每步少 20%，接受长度少 18%（解释 3.99 → 3.28），解释 tok/s
+  +3%，照抄 +9%。
+- 换入节奏：MiniMax 一开始用 XTier 的默认节奏（每 4 窗、每次最多换 16 个，GLM 也是这个），改成 DeepSeek / 生产的（每 2 窗、32 个）
+  后命中 0.38 → 0.43，CPU 每层 647 → 571 µs，解释每步 −6%。
+- Down 粒度 24：每个未命中专家仍是约 67 µs（约 32 MB，约 470 GB/s），没有变化；这一行的命中和接受长度不同是内容和换入的波动。
+- 加速包默认：草稿 5、DeepSeek 的换入节奏、草稿词表头 FP8、6 行验证走 b12x。卡片的「关加速包」用检查点的草稿 7、不开词表头 FP8。
+
+### agent 速度（生产的 agent_bench，64k 会话，同一次启动连跑四轮）
+
+agent_bench 的五个会话里只有 64k 放得进 128K KV 池（128k-write 预填的历史就有 13.3 万 token，服务端回 400：输入超过上下文长度）。
+MiniMax 多数轮次在第一步就把 4096 个输出 token 全用在思考上（约 1.7 万字符，没有正文、没有工具调用），会话随即结束；有三轮先调了
+工具，第二步再长回复。所以每轮是一个 67K 的冷 prefill 加一到两个长回复（每轮第一个请求只命中 128 token 前缀缓存，都是冷 prefill）。
+
+| 配置 | 轮 | 冷 prefill（67K，首字） | 输出 token（每步） | decode | 接受长度 | 每步 |
+|---|:-:|---:|---|---:|---:|---:|
+| XTier + 加速包（草稿 5） | 1 | 1,586（42.2 s） | 293 + 工具 → 4096 | 53.4 | 3.20 | 59.9 ms |
+|  | 2 | 1,609（41.6 s） | 2080 + 工具 → 4096 | 55.7 | 3.34 | 59.9 ms |
+|  | 3 | 1,605（41.7 s） | 4096 | 55.3 | 3.27 | 59.1 ms |
+|  | 4 | 1,607（41.7 s） | 4096 | 52.5 | 3.09 | 58.8 ms |
+| 官方代码 + 必要修正（草稿 7） | 1 | 1,618（41.4 s） | 4096 | 53.2 | 3.77 | 70.8 ms |
+|  | 2 | 1,607（41.7 s） | 4096 | 52.1 | 3.67 | 70.4 ms |
+|  | 3 | 1,606（41.7 s） | 4096 | 55.1 | 3.93 | 71.2 ms |
+|  | 4 | 1,604（41.8 s） | 4096 | 51.8 | 3.58 | 69.2 ms |
+| 加速包、草稿改回 7 | 1 | 1,598（41.9 s） | 4096 | 52.0 | 3.56 | 68.4 ms |
+|  | 2 | 1,604（41.8 s） | 4096 | 54.5 | 3.74 | 68.6 ms |
+|  | 3 | 1,607（41.7 s） | 2506 + 工具 → 4096 | 52.3 | 3.49 | 66.7 ms |
+|  | 4 | 1,600（41.9 s） | 4096 | 54.2 | 3.81 | 70.4 ms |
+
+- 中位数：加速包 54.3 tok/s、接受长度 3.23、每步 59.5 ms；官方代码 + 必要修正 52.7、3.72、70.6 ms；加速包配草稿 7 是 53.2、3.65、
+  68.5 ms。冷 prefill 三组都是约 1,600 tok/s（67K 首字 41.4–42.2 s）。
+- 每步的差别几乎都在 CPU 专家：草稿 5 时每层不同的专家约 16 个、CPU 每层 605–630 µs（命中 0.40–0.42）；草稿 7 时约 19.5 个、
+  760–800 µs（命中 0.39–0.42）；其余（GPU 与调度）两边都约 24 ms。换入节奏和词表头 FP8 在草稿 7 下单独看是每步 −3%（70.6 → 68.5 ms）。
+- 有三轮模型在第一步先调了工具（list_dir、grep），第二步命中 67,072 token 前缀缓存（首字 1.3–1.9 s）后再长回复；其余各轮第一步就把
+  4096 个 token 用在思考上。第二组 A/B 里草稿 5 加换入节奏在短上下文的解释文本上快 9%，这里接受长度的损失吃掉了大半。
+- 跑法：`xtier-dev/m31_agent2.sh TAG 轮数 变量=值`（起服务 → 两个预热请求 → 若干轮 64k 会话 → 停）、`m31_pack_run2.sh`（起服务 → 照抄
+  单 / 双并发各 8 段 → 若干轮）、`m31_rounds2.sh`（在已起的服务上跑）、`m31_table2.py TAG`（按 README 的口径出表）。第一次的
+  `m31_agent.sh` 用的是生产原版 agent_bench，128k-write 的 400 让整轮异常退出，改用仓库里那份（只结束该会话）。
+- 原始数据 `bench/results/agent-bench-minimax31-{xtier,base,xtier-gamma7}-r{1,2,3,4}-20261024.json`。
+
+### 加速包的 decode 剖析（WebUI 启动的默认配置，草稿 5，GPU-only，约 16K 上下文，50 步，每步 61.2 ms）
+
+| 每步 | 草稿 5（加速包） | 草稿 7（上面那次） | 说明 |
+|---|---:|---:|---|
+| 主流等 CPU 专家 | 34.6 ms | — | 57 个 MoE 层各等约 0.61 ms（其中一半时间旁路流和拷贝流在忙，一半整卡空闲） |
+| 主流 GPU 计算 | 21.7 ms | 23.6 ms | |
+| 其中 MXFP8 投影 | 11.4 + 1.5 ms | 14.3 ms | 草稿 5：目标的 6 行验证走 b12x（241 次 × 47.5 µs），草稿 5 层仍走 CUTLASS（M = 5，20 次 × 77 µs）；草稿 7 全走 CUTLASS（260 次 × 55 µs） |
+| 其中目标 LM head（BF16） | 2.4 ms | 2.4 ms | cuBLAS 在 SM120 上选了 SM80 的 WMMA（`cutlass_80_wmma_tensorop_bf16`），2 次 / 步 |
+| 其中稀疏注意力 | 1.8 ms | 2.3 ms | MSA 的打分 `_decode_score_kernel` 1.2 ms + 稀疏 decode 0.64 ms |
+| 旁路流：热专家 W4A16 | 11.7 ms | 15.1 ms | `_gate_up` 8.3 + `_down` 3.4 ms，与 CPU 专家并行 |
+| 拷贝流：热专家换入 | 24.7 ms | 12.2 ms | DeepSeek 的换入节奏换得更勤（每步约 32 个专家、1538 次拷贝），不占主流 |
+
+- 关键路径 = 每层的注意力（qkv、o 投影和稀疏注意力）+ 等 CPU 专家；共享专家和热专家都在等待期间算完。所以 GPU 侧能省的主要是注意力的
+  两次 MXFP8 投影（约占 11.4 ms 的一半）：b12x 已经比 CUTLASS 快 14%，再做到接近显存带宽（像 DeepSeek 的 wo_a 那样在寄存器里反量化、BF16
+  激活、省掉激活量化）估计每步还能省约 1.5 ms（2–3%）；草稿的 5 行投影也走 b12x 约省 0.6 ms（下面第三组 A/B 想一起测，那次 OOM 没测到）。
+- 大头仍是 CPU 专家：要明显更快得每步少读专家（更多热专家槽受显存限制；按草稿置信度截断验证，见下一步）。
+
+### 第三组：32K prefill 分块、256K KV 池
+
+- **32K 分块**（`BATCH=32768`，同时让草稿的 5 行 MXFP8 投影也走 b12x）：每个分块要把 57 层 × 128 个专家传上 GPU，分块翻倍每 token 的上传
+  减半，本想以此提冷 prefill。但 SGLang 按分块大小预留的缓冲随之变大，128K 池加每层 16 槽之后没有余量，启动后第一个 3.5K 的预热 prefill
+  就 OOM（要 536 MiB，只剩 136 MiB）。要用 32K 分块得减热专家槽，等于拿 decode 换 prefill，这次没做；草稿走 b12x 那项也因此没测到
+  （估计每步约 0.6 ms）。
+- **8 槽 + 256K KV 池**（启动台的另一档，`CONTEXT=262144 XTIER_CACHE_SLOTS=8`）：agent_bench 的 128k-write 会话放得下，一轮（每会话
+  最多 8 步）：64k 会话冷 prefill 1,606 tok/s（41.7 s），128k-write 会话 133,399 token 冷 prefill 1,588 tok/s（83.5 s），先调工具
+  （list_dir、grep），第二步命中 133,376 token 缓存后长回复。长回复合计 47.6 tok/s、接受长度 3.24、每步 68.1 ms：槽少一半，热专家命中
+  0.24（16 槽时 0.40–0.42），CPU 每层约 800 µs，比 16 槽 + 128K 慢 12%。原始数据 `bench/results/agent-bench-minimax31-xtier-256k-r1-20261024.json`。
+
+## DeepSeek：索引器 decode 走官方的分页路径（`deepseek_v4/paged_indexer.py`）
+
+清晨的剖析里 SM120 上索引器的 FP4 logits 和 top-k 每步 0.56 ms（生产 0.12 ms），连 gather、排序、写回一起约 1 ms。
+官方的 `v41_indexer.scoring.decode_scores` 只看 `get_platform().is_sm90`：SM90 直接按请求表打分（`fp4_index_logits_paged`，持久 Triton 内核，跳过每行长度之后的块），用融合的 top-k v2 选（JIT CUDA），
+候选块由 `amax_topk_blocks` 选出、以掩码传给后面的层；其他 GPU 先把每行的槽按图容量 gather 出来，再用稠密 Triton 内核打分、
+`torch.topk` 选、再排序。两条路径打分用的是同一个 `_fp4_index_logits_tile`（logits 逐位相同），分页路径上没有 SM90 专用的东西
+（top-k v2 的 cluster 路径在编译时按占用率探测，SM120 上也能编），decode 元数据在所有 GPU 上都建。加速包在调用 `decode_scores`
+期间让这个模块看到 `is_sm90`，模块外的 `get_platform` 不受影响（`XTIER_DS_PAGED_INDEXER=0` 关掉）。
+
+| 16K 剖析（同一个提示，GPU-only） | FP8 wo_a 之后 | + 分页索引器 |
+|---|---:|---:|
+| 名字含 index / top-k / sort / gather 的内核（不含稀疏 MLA） | 1.08 ms | 0.33 ms |
+| 主流 GPU 工作 | 15.39 ms | 13.75 ms |
+| 整步 | 30.47 ms | 31.09 ms |
+| 热专家命中 · CPU / 层（剖析时） | 0.59–0.61 · 335–364 µs | 0.565 · 381–391 µs |
+
+- 非分页路径每步多出来的是 `gatherTopK` 0.24 ms、稠密 logits 0.22 ms、gather 0.14 ms、两次 radix 排序 0.11 ms、masked_fill / scatter /
+  多块 top-k 约 0.3 ms；分页路径是分页 logits 0.17 ms + top-k v2 0.06 ms + 写回 0.01 ms。剖析的整步反而慢 0.6 ms：这次剖析时热专家
+  命中偏低，CPU 专家每层多约 35 µs（整卡空闲 2.33 → 3.29 ms）；下面 agent 两轮的命中与之前相当。
+- 照抄单 / 双并发各 8 段 0 错。按生产的 agent_bench 两轮（WebUI 控制台启动，与 wo_a 那两轮同一套参数，热专家命中、CPU 每层耗时两次
+  相当：0.56–0.62 · 361–403 µs 对 0.54–0.60 · 344–427 µs）：
+
+| DeepSeek V4.1 1017，长回复（≥ 300 token） | 请求 | decode | 接受长度 | 每步 |
+|---|---:|---:|---:|---:|
+| + 分页索引器第 1 / 2 轮 | 3 / 7 | 112.7 / 137.6 tok/s | 3.76 / 4.46 | 33.39 / 32.37 ms |
+| 两轮合计 | 10 | 133.2 tok/s | 4.34 | 32.5 ms |
+| FP8 wo_a 之后（上面那两轮）合计 | 11 | 132.4 tok/s | 4.37 | 33.0 ms |
+| 生产（10-22）合计 | 147 | — | — | 32.0 ms |
+
+- 每步 33.0 → 32.5 ms，离生产 2%。剖析里 GPU 省了 1.6 ms，整步只少 0.5 ms：decode 每层大部分时间在等 CPU 专家，GPU 侧的节省只有一部分
+  落在关键路径上。冷 prefill 不变（第 2 轮 64K 5,022、500K 4,793 tok/s）。
+- 原始数据 `bench/results/agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`。
+
 ## 下一步
 
-- DeepSeek 索引器在 SM120 走官方的分页路径（`fp4_index_logits_paged` + top-k v2，现在只给 SM90）：长上下文时剩下那 3% 的大头。
-- DSpark 按草稿置信度截断验证：截掉的 token 用核心的逐 token 标志跳过路由专家（GLM 的 EAGLE 截断已经这样做）。DSpark 自带的验证规划器
-  只在变长验证下裁剪，DeepSeek 生产用 static；static 下要做到无损，需要在截断位置重采奖励 token（采样路径走 `cap_correct_len`，
-  贪心路径在 CUDA 图里），还要配一个按采样分布的无损检查（照抄测试只覆盖贪心）。
+- DSpark 按草稿置信度截断验证（MiniMax、DeepSeek 都受益，MiniMax 更明显）：MiniMax 每步约 60% 在等 CPU 专家，草稿 5 时每层约 16 个
+  不同专家，难的文本平均只接受 3.2 个 token。截断后的 token 用核心的逐 token 标志跳过路由专家（GLM 的 EAGLE 截断已经这样做）。DSpark
+  自带的验证规划器只在变长验证下裁剪，M3.1 NVFP4 与 DeepSeek 生产都用 static；static 下要做到无损，需要在截断位置重采奖励 token（采样
+  路径走 `cap_correct_len`，贪心路径在 CUDA 图里），还要配一个按采样分布的无损检查（照抄测试只覆盖贪心）。
+- MiniMax：注意力 qkv / o 的 MXFP8 投影做成小 M 专用内核（在寄存器里反量化、BF16 激活，估计每步省约 1.5 ms）；热专家种子档案（现在冷启动
+  后自适应）；CPU 引擎的 NVFP4 解码在 MiniMax 形状上约 470 GB/s；冷 prefill 64K 只有约 1,600 tok/s，先剖析分块里上传专家和计算的重叠；
+  SGLang 的 M3.1 支持合入 main 后，env-m31 并回主 venv。
+- DeepSeek：离生产还差约 2%，GPU 侧已与生产持平（16K 剖析），剩下的在 CPU 专家等待里，先比两边的热专家命中和换入节奏随上下文的变化。
 - Qwen：64K 会话的冷 prefill 这次生产快 15–18%（文本测法下 XTier 快 3%），先对两边的分块（24K 对 32K）和第一个请求的预热查起。
