@@ -136,6 +136,7 @@ def from_env(full_layers, slots):
                           partly cached: predicted 1.4 % faster, measured 3.3 % slower), hence the default.
     XTIER_PLANNER_LAM     a fixed prefill weight instead (0: the fastest decode)
     XTIER_PLANNER_ADAPT   adaptive residency gain of cost.Model (default 1.0: the static profile ranking)
+    XTIER_PLANNER_CALL_US extra microseconds per mailbox call in a serving model over the probe (cost.Model call_us)
     XTIER_PLANNER_MIN_GAIN  below this predicted decode gain (default 0.01) a plan that does not upload less keeps the
                           hand layout (its extra budget spread evenly), see guard()
     """
@@ -145,7 +146,8 @@ def from_env(full_layers, slots):
     with open(prof) as f:
         d = json.load(f)
     with open(probe) as f:
-        model = Model.from_probe(json.load(f), float(os.environ.get('XTIER_PLANNER_ADAPT', '1.0')))
+        model = Model.from_probe(json.load(f), float(os.environ.get('XTIER_PLANNER_ADAPT', '1.0')),
+                                 float(os.environ.get('XTIER_PLANNER_CALL_US', '0') or 0))
     if 'counts' not in d or int(d['experts']) != model.E:
         raise RuntimeError(f'xtier: XTIER_CACHE_PLAN=auto: {prof} needs "counts" for {model.E} experts per layer')
     usages = profile_usages(d, model.tokens)

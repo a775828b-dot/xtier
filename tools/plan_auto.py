@@ -32,6 +32,8 @@ P.add_argument('--keep-decode', action='store_true',
 P.add_argument('--lam', type=float, help='solve for this prefill weight only (0: the fastest decode)')
 P.add_argument('--min-gain', type=float, default=0.01,
                help='with --layout: below this predicted decode gain a plan that does not upload less keeps the layout')
+P.add_argument('--call-us', type=float, default=0.0,
+               help='extra microseconds per mailbox call in a serving model over the probe (cost.Model call_us)')
 P.add_argument('--adapt', type=float, default=1.0,
                help='adaptive residency gain: S slots hit like the profile\'s top adapt x S (cost.Model)')
 P.add_argument('--q', type=int, help='slot granularity of the plan (default E / 64)')
@@ -41,7 +43,7 @@ A = P.parse_args()
 
 d = json.load(open(A.profile))
 probe = json.load(open(A.probe))
-model = cost.Model.from_probe(probe, A.adapt)
+model = cost.Model.from_probe(probe, A.adapt, A.call_us)
 E, windows = int(d['experts']), int(d['windows'])
 if E != model.E:
     sys.exit(f'profile has {E} experts per layer, the probe {model.E}')
@@ -50,7 +52,8 @@ gib = model.slot_bytes() / 2**30
 print(f'{d.get("model")}: {len(usages)} profiled layers x {E} experts, {windows} windows'
       f'{" (route counts)" if d.get("routes") else ""}; probe {probe.get("name")} ({probe["threads"]} threads, m '
       f'{probe["m"]}): gpu {model.g0:.1f} + {model.g1:.2f} n, cpu {model.c0:.1f} + {model.c1:.2f} n + {model.c2:.2f} r, '
-      f'partial +{model.p0:g} / {model.p1:+g} us; upload {model.upload_us() / 1e3:.1f} ms per layer; adapt {A.adapt:g}')
+      f'partial +{model.p0:g} / {model.p1:+g} us, +{A.call_us:g} us per mailbox call; upload {model.upload_us() / 1e3:.1f} '
+      f'ms per layer; adapt {A.adapt:g}')
 
 
 def describe(name, plan):
@@ -108,6 +111,6 @@ if A.layers:
 if A.write:
     with open(A.write, 'w') as f:
         json.dump(dict(model=d.get('model'), profile=A.profile, probe=A.probe, budget=budget, tol=A.tol, lam=lam,
-                       adapt=A.adapt, decode_us=round(dec, 1), prefill_upload_us=round(pre, 1),
+                       adapt=A.adapt, call_us=A.call_us, decode_us=round(dec, 1), prefill_upload_us=round(pre, 1),
                        slots={str(l): s for l, s in sorted(plan.items())}), f, indent=1)
     print('written', A.write)

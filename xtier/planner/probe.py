@@ -6,14 +6,15 @@ CUDA graph of R decode calls of m tokens, every call with other routes, so the w
 from the caches, as in a real decode step where the other layers' weights pass in between. Measured, per call:
 
 - gpu(n):  a fully cached layer (S = E, the GPU alone) whose m tokens use n distinct experts;
-- cpu(n, r): a layer without cache (plain mailbox path: pack, CPU engine, unpack) with n distinct experts and r
+- cpu(n, r, t): a layer without cache (plain mailbox path: pack, CPU engine, unpack) with n distinct experts, r
   routes (token-expert pairs; the engine reads an expert once and computes each of its tokens, which costs about as
-  much as the read on large experts);
+  much as the read on large experts) and t tokens with routes (each costs the engine a fixed share, ~8 us on Qwen3.8:
+  version 2 probes filled the routes token after token, which folded it into the route term);
 - part(g, c): a partly cached layer, g distinct experts in its slots and c on the CPU (both sides run at once);
 - h2d: host-to-device bandwidth of the GPU prefill's upload (pinned engine shards to device memory).
 
-The fit (xtier/planner/cost.py) turns them into per-call costs: gpu(n) = g0 + g1 n, cpu(n, r) = c0 + c1 n + c2 r
-and part(g, c) = max(gpu(g) + p0, cpu(c, r_c) + p1).
+The fit (xtier/planner/cost.py) turns them into per-call costs: gpu(n) = g0 + g1 n, cpu(n, r, t) = c0 + c1 n + c2 r
++ c3 t and part(g, c) = max(gpu(g) + p0, cpu(c, r_c, t_c) + p1).
 """
 import json
 import os
@@ -43,21 +44,27 @@ def synthetic(E, H, I, fmt, seed=20261024):
     return w13, w2, s13, s2, torch.ones((E, 2), dtype=torch.float32), torch.ones((E,), dtype=torch.float32)
 
 
-def routes(experts, m, k, r=None):
-    """[m, k] int32 routes over exactly the given n distinct experts: token after token, min(k, n) routes each, the
-    experts taken in turn (so a token's routes are distinct and all n are used once r >= n); after r routes (default:
-    all m min(k, n)) the rest are -1, routes the engine and the cache skip."""
+def routes(experts, m, k, r=None, spread=False):
+    """[m, k] int32 routes over exactly the given n distinct experts, in consecutive blocks (so a token's routes are
+    distinct and all n are used once r >= n), at most min(k, n) per token; r routes in all (default: m min(k, n)), the
+    rest -1 (routes the engine and the cache skip; a token without routes is not computed at all). spread: the r routes
+    spread evenly over the m tokens instead of filling token after token."""
     n = len(experts)
     per = min(k, n)
     r = m * per if r is None else min(r, m * per)
+    counts = [r // m + (t < r % m) for t in range(m)] if spread else [min(per, max(0, r - t * per)) for t in range(m)]
     out = [[-1] * k for _ in range(m)]
     i = 0
     for t in range(m):
-        for j in range(per):
-            if i < r:
-                out[t][j] = experts[i % n]
-                i += 1
+        for j in range(counts[t]):
+            out[t][j] = experts[i % n]
+            i += 1
     return torch.tensor(out, dtype=torch.int32)
+
+
+def active(ids, lo=0):
+    """Tokens of an [m, k] route tensor with at least one route to an expert >= lo."""
+    return int(((ids >= lo).sum(1) > 0).sum())
 
 
 class Layer:
@@ -148,7 +155,7 @@ def measure(E, H, I, k, fmt, threads, m=4, calls=32, reps=10, slots=None, limit=
     def pick(lo, hi, n):
         return [lo + int(i) for i in torch.randperm(hi - lo, generator=rng)[:n]]
 
-    out = dict(version=2, host=socket.gethostname(), gpu=torch.cuda.get_device_name(), threads=threads, m=m,
+    out = dict(version=3, host=socket.gethostname(), gpu=torch.cuda.get_device_name(), threads=threads, m=m,
                calls=calls, model=dict(E=E, H=H, I=I, k=k, format=fmt, expert_bytes=expert_bytes(H, I, fmt)),
                engine_isa=None, gpu_full=[], cpu_only=[], partial=[])
     from xtier.engine import isa
@@ -172,9 +179,14 @@ def measure(E, H, I, k, fmt, threads, m=4, calls=32, reps=10, slots=None, limit=
     for n in grid:
         top = m * min(k, n)
         for r in sorted({n, (n + top) // 2, top}):
-            us = _graph_time(plain, [routes(pick(0, E, n), m, k, r) for _ in range(calls)], m, H, reps)
-            out['cpu_only'].append([n, r, us])
-            log(f'probe: cpu   n {n:3d} r {r:3d}: {us:7.1f} us')
+            for spread in (False, True):
+                sets = [routes(pick(0, E, n), m, k, r, spread) for _ in range(calls)]
+                t = active(sets[0])
+                if spread and t == active(routes(list(range(n)), m, k, r)):
+                    continue   # same active tokens as filled token after token
+                us = _graph_time(plain, sets, m, H, reps)
+                out['cpu_only'].append([n, r, t, us])
+                log(f'probe: cpu   n {n:3d} r {r:3d} tokens {t}: {us:7.1f} us')
 
     # partly cached: S slots hold experts [0, S); g of the call's experts from them, c from the others (the GPU and
     # the CPU work at once); the CPU part's routes are counted
@@ -188,10 +200,11 @@ def measure(E, H, I, k, fmt, threads, m=4, calls=32, reps=10, slots=None, limit=
                 mixed = [e for pair in zip(gpu_e, cpu_e) for e in pair] + gpu_e[len(cpu_e):] + cpu_e[len(gpu_e):]
                 sets.append(routes(mixed, m, k))
             rc = sum(int((t >= S).sum()) for t in sets) / len(sets)
+            tc = sum(active(t, S) for t in sets) / len(sets)
             us = _graph_time(lambda st, x, t, rw, o: part.decode(st, m, k, x.data_ptr(), t.data_ptr(), rw.data_ptr(),
                                                                  o.data_ptr()), sets, m, H, reps)
-            out['partial'].append([g, c, rc, us])
-            log(f'probe: part  g {g:3d} c {c:3d} (CPU routes {rc:4.1f}): {us:7.1f} us')
+            out['partial'].append([g, c, rc, tc, us])
+            log(f'probe: part  g {g:3d} c {c:3d} (CPU routes {rc:4.1f}, tokens {tc:3.1f}): {us:7.1f} us')
 
     # prefill upload: all experts, in the GPU prefill's chunks
     chunk = max(1, min(E, 64))

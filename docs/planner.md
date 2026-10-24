@@ -27,7 +27,7 @@ python tools/plan_probe.py --shape 512,2560,640,10,nvfp4 --m 4 ...          # �
 | 项 | 路径 | 拟合 |
 |---|---|---|
 | gpu(n) | 全常驻层，n 个不同专家 | g0 + g1·n（每个用到的专家读一次，与 token 数无关） |
-| cpu(n, r) | 不缓存的层，n 个专家、r 个路由（token-专家对） | c0 + c1·n + c2·r（专家大时每个 token 的计算约是读一次权重的 1/5） |
+| cpu(n, r, t) | 不缓存的层，n 个专家、r 个路由（token-专家对）、t 个有路由的 token | c0 + c1·n + c2·r + c3·t（专家大时每个路由的计算约是读一次权重的 1/6；c3 在 Qwen 上约 0.8 µs，可忽略） |
 | part(g, c) | 部分缓存层，g 个命中、c 个没命中，两边同时算 | max(gpu(g) + p0, cpu(c, r_c) + p1) |
 | h2d | prefill 从锁页内存上传专家 | GB/s |
 
@@ -61,7 +61,9 @@ python tools/plan_auto.py --profile profile.json --probe probe.json --layout "0,
 - 保护（`--min-gain`，默认 0.01）：方案的上传不比手工布局少、decode 预测收益又不到 1% 时，保留手工布局（预算多出的槽平均
   加到部分缓存层）。GLM 实测：模型预测不均匀分槽快 0.8%，实际没有，逐层模型没这么准，小的挪动不值得。
 - `--add-gib`：在手工布局的预算上再加（例如测得的 prefill 峰值之外的空余显存）。
-- `--adapt`：自适应换入让 S 个槽命中得像档案前 adapt×S 名。用 `plan_calibrate.py` 从一次运行求（DS 1.69、GLM 1.47，Qwen 约 1.6）。
+- `--adapt`：自适应换入让 S 个槽命中得像档案前 adapt×S 名。用 `plan_calibrate.py` 从一次运行求（DS 1.69、GLM 1.47、MiniMax 2.19、
+  Qwen 约 1.4–1.6）。
+- `--call-us`：真实服务里每次信箱调用比单层探测多的微秒数。本机 Qwen 用五组实测布局标定为 28（配 v3 探测、adapt 1.4），来源未定位。
 
 ### 4. 启动
 
@@ -70,7 +72,7 @@ python tools/plan_auto.py --profile profile.json --probe probe.json --layout "0,
 - `XTIER_CACHE_PLAN=auto`：启动时现算（`xtier/planner/auto.py from_env`），需要 `XTIER_CACHE_PROFILE`（带 counts）和
   `XTIER_PLANNER_PROBE`；预算默认 = 启动脚本里的手工布局（同显存，`XTIER_CACHE_BUDGET` / `XTIER_CACHE_BUDGET_GIB` 可改，
   `XTIER_CACHE_BUDGET_ADD_GIB` 在其上加）；默认 `XTIER_PLANNER_KEEP=1`：decode 不差于手工布局、上传不多于手工布局（`0` 按最快方案），`XTIER_PLANNER_TOL`、
-  `XTIER_PLANNER_LAM`、`XTIER_PLANNER_ADAPT`、`XTIER_PLANNER_MIN_GAIN` 同命令行。日志里有一行 `xtier planner:`（全常驻层、
+  `XTIER_PLANNER_LAM`、`XTIER_PLANNER_ADAPT`、`XTIER_PLANNER_CALL_US`、`XTIER_PLANNER_MIN_GAIN` 同命令行。日志里有一行 `xtier planner:`（全常驻层、
   槽数、预测的 decode 和上传，保留手工布局时注明）。
 
 ### 5. 校准
@@ -88,8 +90,8 @@ python tools/plan_calibrate.py --profile profile.json --log 服务日志 --layou
 
 ```
 全常驻          gpu(n_g)
-部分缓存        E[max(gpu(n_g) + p0, cpu(n_c, r_c) + p1)]
-不缓存          cpu(n_c, r_c)
+部分缓存        E[max(gpu(n_g) + p0, cpu(n_c, r_c, t_c) + p1)]
+不缓存          cpu(n_c, r_c, t_c)
 ```
 
 n_g / n_c 是命中 / 没命中的不同专家数：档案里使用率为 p 的专家贡献均值 p、方差 p(1−p)，槽里放使用最多的 adapt×S 个；
@@ -103,8 +105,8 @@ max 的期望用 Clark 公式（两边接近时窗口间的波动要多付一点
 
 - 显存预算现在取手工布局（同显存）或给定值；还不会自己算"权重、KV 池、CUDA 图、prefill 分块之后还剩多少"。空余显存的测法：
   跑最长的 prefill（512K）时每 0.5 s 采 `nvidia-smi --query-gpu=memory.used`，峰值之外留 1.5 GiB（GLM、MiniMax 在本机已没有余量）。
-- 探测只用一层反复调用：部分缓存层很多时低估每次调用的固定开销（Qwen 47 层全部部分缓存：预测快 1.4%，实测慢 3.3%）。所以默认只在
-  手工布局附近挪动（KEEP），在那里预测与实测一致。
+- 探测只用一层反复调用，比真实服务每次信箱调用少约 28 µs（`--call-us` 补）；即使补上，离手工布局远的方案仍有约 2% 的误差
+  （Qwen 29 层方案 decode 预测 +2.75%，agent 实测 +0.5%）。所以默认只在手工布局附近挪动（KEEP）。
 - 只决定槽数；CPU 线程、prefill 分块、并发仍是启动脚本里的值。
 - 自适应系数依赖负载和换入节奏（`XTIER_CACHE_EVERY` / `SWAPS`），换了要重新校准。
 - 检查：`python tests/planner_check.py`（不需要 GPU）。

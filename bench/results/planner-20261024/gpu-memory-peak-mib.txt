@@ -4,4 +4,6 @@ minimax-hand 72650
 qwen-auto2 71354
 qwen-auto 71338
 qwen-r26 71402
+qwen-r26static 71384
 qwen-v2fast 42702
+qwen-v2faststatic 42702
