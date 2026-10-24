@@ -17,11 +17,11 @@ MODEL = {
     'options': common_options('DSpark', contexts=('131072', '262144')) + [
         {'key': 'slots', 'label': '热专家槽 / 层', 'default': '16',
          'choices': [['16', '16 · 128K'], ['8', '8 · 256K'], ['12', '12']]},
-        {'key': 'gamma', 'label': 'DSpark 草稿长度', 'default': '7',
-         'choices': [['7', '7 · 检查点'], ['5', '5'], ['3', '3']]},
+        {'key': 'gamma', 'label': 'DSpark 草稿长度', 'default': '5',
+         'choices': [['5', '5 · 实测'], ['7', '7 · 检查点'], ['3', '3']]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '16384', 'choices': [['16384', '16K'], ['8192', '8K']]},
     ],
-    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：只保留在 SM120 上跑起来必需的修正'}],
+    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：只保留在 SM120 上跑起来必需的修正，草稿长度用检查点的 7'}],
 }
 
 
@@ -29,6 +29,6 @@ def build(o, port):
     """(environment additions, argv) for validated options o."""
     env = {'XTIER_THREADS': o['threads'], 'PORT': str(port), 'CONTEXT': o['context'], 'BATCH': o['chunk'],
            'XTIER_CACHE_SLOTS': o['slots'], 'DSPARK': '1' if o['spec'] == 'on' else '0', 'GAMMA': o['gamma']}
-    if o['packs'] == 'off':   # README "官方 main": the SM120 fixes only (packs/minimax_m3), no speed items
-        env.update(XTIER_DRAFT_LMHEAD_FP8='0', XTIER_MXFP8_B12X_ROWS='')
+    if o['packs'] == 'off':   # README "官方 main": the SM120 fixes only (packs/minimax_m3), the checkpoint's draft length
+        env.update(XTIER_DRAFT_LMHEAD_FP8='0', XTIER_MXFP8_B12X_ROWS='', GAMMA='7')
     return env, [str(HERE / 'run-minimax-xtier.sh')]

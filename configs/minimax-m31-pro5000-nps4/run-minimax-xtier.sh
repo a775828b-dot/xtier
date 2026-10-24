@@ -5,7 +5,7 @@
 # sparse attention throughout; a DSpark draft of 5 dense layers (served by the vision-language wrapper only).
 # Extra server arguments are appended ("$@"); XTIER_* settings come from the environment. Defaults: every routed
 # expert on the CPU engine, 16 hot experts per layer on the GPU (XTIER_CACHE_SLOTS), a 128K KV pool (FP8: 16 slots
-# and a 256K pool do not fit together; CONTEXT=262144 with about 8 slots), DSpark.
+# and a 256K pool do not fit together; CONTEXT=262144 with about 8 slots), DSpark with 5 draft tokens (GAMMA).
 set -eo pipefail
 D=/data/fast/workspaces/xtier-dev
 M=/data/fast/nvme2/models/modelscope/MiniMax/MiniMax-M3.1-Flash
@@ -28,11 +28,13 @@ export XTIER_DOWN_PRECISION=${XTIER_DOWN_PRECISION:-bf16}
 export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFILL_MIN=${XTIER_GPU_PREFILL_MIN:-512}
 export XTIER_HYBRID_PREFILL_MAX=${XTIER_HYBRID_PREFILL_MAX:-512} XTIER_SPLIT_PREFILL_MAX=${XTIER_SPLIT_PREFILL_MAX:-4096}
 export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-16} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
+# hot-cache adaptation at DeepSeek's (production's) pace: hit 0.38 -> 0.43, decode step -6% with 5 draft tokens
+export XTIER_CACHE_EVERY=${XTIER_CACHE_EVERY:-2} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-32}
 SPEC=()
 if [ "${DSPARK:-1}" = 1 ]; then
   export SGLANG_RAGGED_VERIFY_MODE=static   # M3.1 NVFP4 DSpark requires it (SGLang's MiniMax M3 argument checks)
-  SPEC=(--speculative-algorithm DSPARK)
-  [ -n "${GAMMA:-}" ] && SPEC+=(--speculative-dspark-block-size $GAMMA)   # draft tokens per step (checkpoint: 7)
+  # draft tokens per step: 5 measured best here (the checkpoint's 7 verifies more tokens, i.e. more CPU experts, per step)
+  SPEC=(--speculative-algorithm DSPARK --speculative-dspark-block-size ${GAMMA:-5})
 fi
 exec $D/env-m31/bin/python -m sglang.launch_server --model-path $M --served-model-name MiniMax-M3.1-Flash \
   --host 127.0.0.1 --port ${PORT:-18195} --tp-size 1 --trust-remote-code --skip-server-warmup \
