@@ -6,7 +6,9 @@ Segments are cut deterministically from fixed corpora, so every configuration sc
 default corpora are the ones of the production baselines (bench/baselines: Markdown docs, agent sessions, a Chinese
 document; local files, not in the repository). Uses /generate with return_logprob and logprob_start_len=0 (prefill
 logprobs of the given ids), flushing the prefix cache before every segment (each is a cold prefill). Reports mean
-NLL / PPL overall and per corpus, and per-segment NLL so two runs can be compared pairwise.
+NLL / PPL overall and per corpus, and per-segment NLL so two runs can be compared pairwise. ``--prefix`` puts text
+before every segment, unscored: the document-start token of a model that needs one (MiniMax M3's ``]~!b[``, which
+its chat template writes; a segment without it scores as noise).
 """
 import argparse
 import json
@@ -28,9 +30,11 @@ P.add_argument('--tag', required=True)
 P.add_argument('--segments', type=int, default=6, help='segments per corpus')
 P.add_argument('--tokens', type=int, default=4096)
 P.add_argument('--corpus', action='append', help='NAME=PATH, repeatable (default: the baseline corpora)')
+P.add_argument('--prefix', default='', help='text before every segment, not scored (e.g. a document-start token)')
 P.add_argument('--out', default='bench/results/ppl')
 A = P.parse_args()
 tok = AutoTokenizer.from_pretrained(A.tokenizer, trust_remote_code=True)
+prefix = tok.encode(A.prefix, add_special_tokens=False) if A.prefix else []
 corpora = dict(c.split('=', 1) for c in A.corpus) if A.corpus else DEFAULT_CORPORA
 segs = []
 for name, path in corpora.items():
@@ -45,8 +49,9 @@ for name, path in corpora.items():
 rows = []
 for name, i, s in segs:
     urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{A.port}/flush_cache', b''), timeout=60)
-    body = json.dumps(dict(input_ids=s, sampling_params=dict(max_new_tokens=1, temperature=0),
-                           return_logprob=True, logprob_start_len=0)).encode()
+    # the segment's first token stays unscored, as without a prefix
+    body = json.dumps(dict(input_ids=prefix + s, sampling_params=dict(max_new_tokens=1, temperature=0),
+                           return_logprob=True, logprob_start_len=len(prefix) + 1 if prefix else 0)).encode()
     req = urllib.request.Request(f'http://127.0.0.1:{A.port}/generate', body, {'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=1800) as r:
         meta = json.loads(r.read())['meta_info']

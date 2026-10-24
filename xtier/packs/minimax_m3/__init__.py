@@ -13,6 +13,11 @@ attention), on SGLang's MiniMax M3.1 branch (PR #45925).
   layer is sparse, so the dense backend never runs a prefill. The MXFP8 projections stay MXFP8 (FlashInfer CUTLASS
   on SM120) and DSpark keeps its settings (BF16 draft KV, TRT-LLM MHA draft attention). Argument resolution happens
   in the process that serves the API, so that hook is a serving hook.
+- NVFP4 KV cache on SM120 (``XTIER_MINIMAX_KV_FP4``, default on; memory: 648 instead of 1280 bytes per token and
+  layer, a 512K context next to the hot experts): the KV pool and its cell size are the native stack's (SGLang's
+  MSA-v1 NVFP4 pool, its stores through SGLang's fused quantize+store kernel), while the attention stays the generic
+  Triton path, reading that cache through ``kv_fp4`` (decode: kernels decoding the cache in registers; prefill:
+  SGLang's kernels on BF16 copies of the batch's contexts). The DSpark draft KV stays BF16.
 - DSpark's target verify on SM120 as SGLang runs it on ROCm: the generic sparse backend verifies only on NPU and ROCm
   (on CUDA, DSpark comes with the native stack), so a verify batch reached its prefill path and failed on the first
   forward (no extend lengths). Each draft row becomes one causal decode query on the Triton sparse decode, with the
@@ -36,7 +41,10 @@ MOE_SCHEME = 'sglang.srt.layers.quantization.minimax_m3_nvfp4.MiniMaxM3Nvfp4MoE'
 SPARSE = 'sglang.srt.layers.attention.minimax_sparse_backend.MiniMaxSparseAttnBackend'
 DSPARK_DRAFT = 'sglang.srt.models.dspark.DSparkDraftMixin'
 DRAFT_PROJECT = 'sglang.srt.models.dspark.project_through_lm_head'
+KV_POOL = 'sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_minimax_sparse_kv_pool'
+KV_CELL = 'sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator._compute_cell_size'
 OVERRIDES = '_minimax_m3_overrides'
+_kv_pool_scope = [False]
 
 
 @functools.lru_cache
@@ -45,8 +53,33 @@ def sm120():
     return bool(get_platform().is_sm120)
 
 
+def kv_fp4_enabled():
+    return os.environ.get('XTIER_MINIMAX_KV_FP4', '1') != '0'
+
+
 def _native_stack(original, quantization, *args, **kwargs):
-    return False if sm120() else original(quantization, *args, **kwargs)
+    if sm120() and not _kv_pool_scope[0]:
+        return False
+    return original(quantization, *args, **kwargs)
+
+
+def _in_kv_pool_scope(original, *args, **kwargs):
+    """The KV pool's cell size and class as on the native stack (SGLang's MSA-v1 NVFP4 pool)."""
+    _kv_pool_scope[0] = True
+    try:
+        return original(*args, **kwargs)
+    finally:
+        _kv_pool_scope[0] = False
+
+
+def _kv_pool(original, *args, **kwargs):
+    pool = _in_kv_pool_scope(original, *args, **kwargs)
+    if sm120() and getattr(getattr(pool, 'main_pool', None), 'is_minimax_m3_nvfp4_main', False):
+        from xtier.packs.minimax_m3 import kv_fp4 as fp4
+
+        fp4.attach_scales(pool)
+        fp4.enable_fused_store(pool)
+    return pool
 
 
 def _invoke_override(original, fn, server_args, hf_config, *args, **kwargs):
@@ -120,6 +153,12 @@ def install(registry, hook_type):
     registry.register(f'{SPARSE}.init_forward_metadata_in_graph', _metadata_in_graph, hook_type.AROUND)
     registry.register(f'{SPARSE}.init_forward_metadata_out_graph', _metadata_out_graph, hook_type.AFTER)
     registry.register(f'{SPARSE}.forward_extend', _forward_extend, hook_type.AROUND)
+    if kv_fp4_enabled():
+        from xtier.packs.minimax_m3 import kv_fp4 as fp4
+
+        registry.register(KV_CELL, _in_kv_pool_scope, hook_type.AROUND)
+        registry.register(KV_POOL, _kv_pool, hook_type.AROUND)
+        fp4.install(registry, hook_type)
     if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0':
         from xtier import packs
         from xtier.packs import deepseek_v4

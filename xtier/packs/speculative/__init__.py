@@ -139,6 +139,9 @@ def _renorm(original, next_token_logits, sampling_info, use_rejection_sampling, 
 
 
 def install(registry, hook_type):
+    from xtier.packs.speculative import dspark_truncate
+
+    dspark_truncate.install(registry, hook_type)
     if os.environ.get('XTIER_SPEC_HOT_RS', '1') == '0':
         return
     registry.register(f'{WORKER}.alloc_memory_pool', _alloc_memory_pool, hook_type.AROUND)
