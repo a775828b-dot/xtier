@@ -22,6 +22,12 @@
   cudaMalloc its buffers (512 MB); after a large prefill the device is full and the server dies (GLM-5.3 on the RTX
   PRO 5000, 10-24: "Failed to CUDA calloc 536870912 bytes" on the first tool request after a 64K prefill). XTier skips
   the call when the group has one rank.
+- MXFP8 GEMMs at prefill sizes on SM120: SGLang tunes FlashInfer's GEMM tactics on a dummy decode forward, so the
+  autotune cache holds the MXFP8 GEMM for 1-16 rows only; every prefill call misses and FlashInfer falls back to
+  tactic 0, the 128 x 32 tile of its SM120 CUTLASS configs (128 x 32, 128 x 64, 128 x 128, each without and with A/B
+  swap). From 256 rows the 128 x 128 tile (tactic 4) is 1.1-5.7x faster on the RTX PRO 5000 (MiniMax-M3.1's
+  8192 -> 6144 projection at 16384 rows: 20.5 -> 4.0 ms) with the same output bit for bit (every tile blocks K by
+  128); a miss from 256 rows takes it. Tuned shapes, tuning runs and pinned calls (SGLang's skip_ops) are left alone.
 """
 
 import ctypes
@@ -34,6 +40,8 @@ logger = logging.getLogger(__name__)
 TILELANG_TARGET = 'tilelang.backend.target.auto_detect_target'
 DROP_FILE_CACHE = 'sglang.srt.model_loader.weight_utils._drop_file_cache_after_load'
 TOKEN_SYNC = 'sglang.srt.layers.sampler.Sampler._sync_token_ids_across_tp'
+MXFP8_TUNER = 'flashinfer.autotuner.autotuner.AutoTuner.choose_one'
+MXFP8_LARGE_TILE, MXFP8_LARGE_ROWS = 4, 256   # SM120 CUTLASS MXFP8: tactic 4 = 128 x 128 x 128, no A/B swap
 _MADV_PAGEOUT = 21
 READ_AHEAD_FILES, READ_AHEAD_MAX = 2, 16 << 30
 
@@ -140,6 +148,25 @@ def _sync_token_ids(original, self, *args, **kwargs):
     return original(self, *args, **kwargs)
 
 
+@functools.lru_cache
+def _sm120_mxfp8_tiles(device_index, runner_type, tactics):
+    """Whether this is FlashInfer's SM120 MXFP8 CUTLASS runner with its six configs (three tiles x A/B swap)."""
+    import torch
+    return (runner_type == 'CutlassMxfp8GemmRunner' and tactics == 6
+            and torch.cuda.get_device_capability(device_index)[0] == 12)
+
+
+def _choose_one(original, self, custom_op, runners, tuning_config, inputs, *args, **kwargs):
+    runner, tactic = original(self, custom_op, runners, tuning_config, inputs, *args, **kwargs)
+    if (tactic == -1 and custom_op == 'mxfp8_gemm' and not self.is_tuning_mode
+            and custom_op not in getattr(self, '_effective_skip_ops', ())
+            and inputs and inputs[0].dim() == 2 and inputs[0].shape[0] >= MXFP8_LARGE_ROWS and inputs[0].is_cuda
+            and _sm120_mxfp8_tiles(inputs[0].device.index, type(runner).__name__,
+                                   len(runner.get_valid_tactics(inputs, None)))):
+        return runner, MXFP8_LARGE_TILE
+    return runner, tactic
+
+
 def install(registry, hook_type) -> list[str]:
     import importlib.util
     fixes = []
@@ -151,4 +178,7 @@ def install(registry, hook_type) -> list[str]:
         fixes.append('checkpoint-page-out')
     registry.register(TOKEN_SYNC, _sync_token_ids, hook_type.AROUND)
     fixes.append('tp1-token-sync')
+    if importlib.util.find_spec('flashinfer') is not None and os.environ.get('XTIER_MXFP8_PREFILL_TILE', '1') != '0':
+        registry.register(MXFP8_TUNER, _choose_one, hook_type.AROUND)
+        fixes.append('sm120-mxfp8-prefill-tile')
     return fixes
