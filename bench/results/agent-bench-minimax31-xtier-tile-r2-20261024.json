@@ -1,0 +1,89 @@
+{
+ "label": "m31-tile-r2",
+ "args": {
+  "label": "m31-tile-r2",
+  "url": "http://127.0.0.1:18195",
+  "model": "MiniMax-M3.1-Flash",
+  "tokenizer": "/data/fast/nvme2/models/modelscope/MiniMax/MiniMax-M3.1-Flash",
+  "repo": "/data/fast/workspaces/gh-ref/lsglang_ds4.1",
+  "lsglang": "/data/fast/workspaces/ds41-1017/source",
+  "out": "results/agent/m31-tile-r2.json",
+  "sessions": "64k",
+  "context_limit": 131072,
+  "steps": 24,
+  "max_tokens": 4096,
+  "temperature": null,
+  "seed": null,
+  "dry_run": false
+ },
+ "wall_s": 108.0,
+ "summary": {
+  "all": {
+   "requests": 1,
+   "output_tokens": 4096,
+   "decode_tps": 55.8,
+   "median_request_tps": 55.8,
+   "accept": 3.274,
+   "ms_per_step": 58.7
+  },
+  "ctx_0k_96": {
+   "requests": 1,
+   "output_tokens": 4096,
+   "decode_tps": 55.8,
+   "median_request_tps": 55.8,
+   "accept": 3.274,
+   "ms_per_step": 58.7
+  },
+  "sessions": {
+   "64k": {
+    "requests": 1,
+    "output_tokens": 4096,
+    "decode_tps": 55.8,
+    "median_request_tps": 55.8,
+    "accept": 3.274,
+    "ms_per_step": 58.7,
+    "ctx_start": 67120,
+    "ctx_end": 67120,
+    "steps": 1
+   }
+  },
+  "ttft_first_s": [
+   34.223
+  ],
+  "ttft_later_median_s": null,
+  "tool_call_requests": 0,
+  "cold_prefill": [
+   {
+    "session": "64k",
+    "prompt_tokens": 67120,
+    "cached_tokens": 128,
+    "ttft_s": 34.223,
+    "prefill_tps": 1957.5
+   }
+  ],
+  "output_tokens_p10_p50_p90": [
+   4096,
+   4096,
+   4096
+  ],
+  "long_output_share": 1.0
+ },
+ "rows": [
+  {
+   "prompt_tokens": 67120,
+   "cached_tokens": 128,
+   "output_tokens": 4096,
+   "ttft_s": 34.223,
+   "decode_s": 73.439,
+   "decode_tps": 55.8,
+   "verify_steps": 1251.0,
+   "accept": 3.274,
+   "step_ms": 58.7,
+   "tool_calls": [],
+   "reasoning_chars": 16481,
+   "text_chars": 0,
+   "session": "64k",
+   "step": 0
+  }
+ ]
+}

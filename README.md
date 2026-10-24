@@ -140,12 +140,15 @@ token，放不下，只跑 64k 会话；MiniMax 常在第一步就把 4096 个�
 
 | DSpark | 轮 | 冷 prefill 64K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|
+| XTier + 加速包 + MXFP8 prefill 修正 | 1–2 | 1,963 | 55.8 | 3.26 | 58.4 ms |
 | XTier + 加速包 | 1–4 | 1,606 | 54.3（52.5–55.7） | 3.23 | 59.5 ms |
 | 官方代码 + 必要修正 | 1–4 | 1,607 | 52.7（51.8–55.1） | 3.72 | 70.6 ms |
 
 - **官方代码 + 必要修正**（启动台「关加速包」）：PR 的代码加上在 SM120 上跑起来必需的修正（`xtier/packs/minimax_m3`：SM120 走 SGLang
   给 Hopper 的通用栈、CUDA 上的 DSpark verify），检查点的草稿长度 7，热专家每层 16 槽。**+ 加速包**：草稿长度 5、热专家换入节奏
   照 DeepSeek（每 2 窗、每次最多 32 个）、草稿词表头 FP8、6 行验证的 MXFP8 投影走 b12x。
+- 第一行是 10-24 上午加了平台修正（SM120 的 MXFP8 GEMM 在 prefill 大小上用 128×128 tile，见配置）之后的两轮：冷 prefill 快 22%，
+  decode 不受影响（与第二行的差别在轮次波动内）。官方代码那行同样受益（这个修正不属于加速包），没有复测。
 - 加速包每步快 16%（59.5 对 70.6 ms），接受长度短 13%（草稿 5 对 7），tok/s 快 3%；冷 prefill 相同。加速包的其他项配检查点的
   草稿 7 是每步 68.5 ms、53.2 tok/s（四轮中位数），所以默认用 5。
 - 8 槽 + 256K 池（启动台另一档，128k-write 会话放得下）：一轮，冷 prefill 64K 1,606、128K 1,588 tok/s，长回复 47.6 tok/s、每步
@@ -156,7 +159,7 @@ token，放不下，只跑 64k 会话；MiniMax 常在第一步就把 4096 个�
   1.3e-3（`tests/swiglu_oai_check.py`、`hybrid_prefill_check.py`、`cache_check.py`）。草稿长度、换入节奏、草稿词表头 FP8 都不改
   主模型的输出。
 - 原始数据 `bench/results/agent-bench-minimax31-{xtier,base,xtier-gamma7}-r{1,2,3,4}-20261024.json`、
-  `agent-bench-minimax31-xtier-256k-r1-20261024.json`。
+  `agent-bench-minimax31-xtier-tile-r{1,2}-20261024.json`、`agent-bench-minimax31-xtier-256k-r1-20261024.json`。
 
 ### 配置
 
@@ -177,11 +180,17 @@ token，放不下，只跑 64k 会话；MiniMax 常在第一步就把 4096 个�
   草稿词表头 FP8（`XTIER_DRAFT_LMHEAD_FP8`）和 wo_a 存检查点的 FP8、decode 走 Triton 分组 einsum（`XTIER_DS_WO_A`）、索引器 decode 走官方的分页路径（`XTIER_DS_PAGED_INDEXER`）；
   MiniMax 是 DSpark 草稿长度 5（`GAMMA`，检查点 7）、热专家换入节奏照 DeepSeek（`XTIER_CACHE_EVERY=2`、`XTIER_CACHE_SWAPS=32`）、
   草稿词表头 FP8（与 DeepSeek 同一个钩子）、6 行验证的 MXFP8 投影走 b12x（`XTIER_MXFP8_B12X_ROWS`，DeepSeek 包的钩子）。
+- **平台修正**（`xtier/platform.py`，与模型无关，开不开加速包都在）：SGLang 只按 decode 的形状给 FlashInfer 的 GEMM 做自动调优，
+  prefill 大小的 MXFP8 GEMM 查不到缓存，退回 SM120 上最小的 128×32 tile；256 行起改用 128×128（输出逐位相同，16384 行时快 1.5–5.7 倍）：
+  MiniMax 64K 冷 prefill +22%；DeepSeek 的 MXFP8 调用被 SGLang 固定了 tactic（`pin_tactic`），不受影响。
 - **接口参数与生产相同**：推理解析、工具调用解析（DeepSeek `deepseekv41`、GLM `glm47`、Qwen `qwen3_coder`、MiniMax `minimax-m3`）和缓存命中上报
   （`--enable-cache-report`：usage 里的 `prompt_tokens_details.cached_tokens`，dsh 一类客户端据此显示缓存命中）。
 
 ## 版本更新
 
+- 2026-10-24（上午，二）：平台修正：SM120 上 MXFP8 GEMM 在 prefill 大小（≥ 256 行）用 128×128 tile（SGLang 只按 decode 的形状
+  调优，prefill 退回 128×32；输出逐位相同）：MiniMax 64K 冷 prefill 1,606 → 1,963 tok/s，decode 不变，照抄 0 错。详见
+  [reports/2026-10-24-ds-woa-minimax.md](docs/reports/2026-10-24-ds-woa-minimax.md)。
 - 2026-10-24（上午）：新模型 MiniMax-M3.1-Flash（SGLang 的 M3.1 分支 PR #45925，单独的 venv）：`xtier/packs/minimax_m3` 修了 PR 在
   SM120 上的四处问题（参数解析选了 SM100 的原生栈、原生栈判定、专家 scheme、CUDA 上没有 DSpark verify），CPU 引擎和 GPU 内核加
   GPT-OSS SwiGLU；加速包：草稿长度 5、热专家换入照 DeepSeek 的节奏、草稿词表头 FP8，agent 长回复每步 70.6 → 59.5 ms，照抄 0 错；

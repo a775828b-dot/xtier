@@ -404,6 +404,50 @@ MiniMax 多数轮次在第一步就把 4096 个输出 token 全用在思考上�
   落在关键路径上。冷 prefill 不变（第 2 轮 64K 5,022、500K 4,793 tok/s）。
 - 原始数据 `bench/results/agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`。
 
+## 平台修正：SM120 的 MXFP8 GEMM 在 prefill 大小上用 128×128 tile（`xtier/platform.py`）
+
+MiniMax 冷 prefill 的 GPU-only 剖析（2.6 万 token 一次 prefill，两个分块，每块 7.1 s）：主流忙 5.97 s，专家上传 4.09 s 在拷贝流上并行，
+所以是计算受限；主流里路由专家的分组 GEMM（`_gate` + `_down`）2.89 s，MXFP8 投影 1.77 s，稀疏注意力 0.87 s。MXFP8 投影用的是
+`DeviceGemmMxfp8GemmSm120 … 128_32_128`，和 decode 同一个小 N 的 tile：
+
+- SGLang 启动时用一个 decode 形状的假 forward 给 FlashInfer 的 GEMM 做自动调优，缓存里 MXFP8 GEMM 只有 1–16 行；prefill 的调用全部
+  查不到，FlashInfer 退回 tactic 0。SM120 的 CUTLASS MXFP8 有 6 个 tactic：128×32、128×64、128×128 三种 tile，各分不交换 / 交换 A、B，
+  0 号就是 128×32 不交换。
+- 单独计时（`xtier-dev/mxfp8_tactics.py`，按 SGLang 的方式准备 MXFP8 输入和交织的权重缩放）：
+
+| MiniMax 的投影（K → N） | 512 行：t0 / t4 | 4096 行：t0 / t4 | 16384 行：t0 / t4 |
+|---|---:|---:|---:|
+| 6144 → 24576 | 0.62 / 0.40 ms | 4.63 / 3.04 ms | 29.9 / 13.2 ms |
+| 8192 → 6144 | 0.24 / 0.17 ms | 1.62 / 1.04 ms | 20.5 / 4.0 ms |
+| 6144 → 6144 | 0.19 / 0.13 ms | 1.21 / 0.78 ms | 7.2 / 3.1 ms |
+| 3072 → 6144 | 0.12 / 0.11 ms | 0.62 / 0.40 ms | 2.4 / 1.6 ms |
+| 12288 → 6144 | 0.34 / 0.22 ms | 2.36 / 1.54 ms | 33.8 / 6.0 ms |
+
+  六个 tactic 的输出逐位相同（每种 tile 的 K 方向都按 128 分块，累加顺序一样）。32–128 行时几个 tactic 只差几个 µs、有噪声，
+  256 行起 128×128 明显更快。
+- 修正：钩 FlashInfer 的 `AutoTuner.choose_one`，SM120 的 CUTLASS MXFP8 在非调优模式下查不到缓存、而且至少 256 行时用 tactic 4
+  （128×128 不交换）；调过的形状、调优过程和 SGLang 用 skip_ops 固定 tactic 的调用都不动（`XTIER_MXFP8_PREFILL_TILE=0` 关掉）。
+  与模型无关，开不开加速包都在。
+
+结果（MiniMax 加速包默认配置，`xtier-dev/m31_tile_test.sh`）：
+
+| MiniMax-M3.1-Flash | 修正前 | 修正后 |
+|---|---:|---:|
+| 16K 分块的 MXFP8 投影 | 1.77 s（128×32） | 0.67 s（128×128） |
+| 2.6 万 token 冷 prefill | 14.5 s，1,817 tok/s | 12.9 s，2,052 tok/s |
+| agent_bench 64k 会话冷 prefill | 1,606 tok/s（四轮中位数） | 1,968 / 1,958 tok/s |
+| 同几轮的长回复 decode | 54.3 tok/s、59.5 ms / 步 | 55.8 / 55.8 tok/s、58.1 / 58.7 ms / 步 |
+| 照抄单 / 双并发 | 0/8 | 0/8 |
+
+- 64K 会话快 22%，比 2.6 万 token 那次（+13%）多：它的四个分块都是满的 16K，大 M 时 tile 差得最多。decode 只用调过的 1–16 行，不受影响。
+- 修正后主流每块等别的流约 1.1 s（`_unpack_all` 解包和专家上传），上传 4.09 s 已接近主流的 4.87 s，再往下是上传和解包。
+
+- DeepSeek：官方 main 把块 FP8 当 MXFP8 的线性层都固定在 tactic 0（`pin_tactic`，SGLang 为了批次不变性用 skip_ops 跳过调优），
+  修正不动这些调用；这次启动的调优缓存里也没有 MXFP8 的记录。加修正后照着测了一遍（`xtier-dev/ds_tile_run.sh`，WebUI 启动）：
+  照抄单 / 双并发 0/8、1/8，那 1/8 是第 1 段 3665 个字符全部抄对后多输出了一个 `</src>`（结尾停不停的平局，不是内容错误）；
+  agent 两轮冷 prefill 64K 774 / 4,958（第 1 轮是启动后第一个长提示，现场编译内核）、500K 4,902 / 4,917 tok/s（分页索引器那两轮 3,196 / 5,022、4,788 / 4,793），长回复每步 31.8 ms（7 个长回复）。
+  SM120 上三种 tile 的累加顺序相同，固定 tactic 其实不影响批次不变性；在 DS 的形状上核对逐位相同后，可以让 DS 的 prefill 也用 128×128。
+
 ## 下一步
 
 - DSpark 按草稿置信度截断验证（MiniMax、DeepSeek 都受益，MiniMax 更明显）：MiniMax 每步约 60% 在等 CPU 专家，草稿 5 时每层约 16 个
@@ -411,7 +455,10 @@ MiniMax 多数轮次在第一步就把 4096 个输出 token 全用在思考上�
   自带的验证规划器只在变长验证下裁剪，M3.1 NVFP4 与 DeepSeek 生产都用 static；static 下要做到无损，需要在截断位置重采奖励 token（采样
   路径走 `cap_correct_len`，贪心路径在 CUDA 图里），还要配一个按采样分布的无损检查（照抄测试只覆盖贪心）。
 - MiniMax：注意力 qkv / o 的 MXFP8 投影做成小 M 专用内核（在寄存器里反量化、BF16 激活，估计每步省约 1.5 ms）；热专家种子档案（现在冷启动
-  后自适应）；CPU 引擎的 NVFP4 解码在 MiniMax 形状上约 470 GB/s；冷 prefill 64K 只有约 1,600 tok/s，先剖析分块里上传专家和计算的重叠；
+  后自适应）；CPU 引擎的 NVFP4 解码在 MiniMax 形状上约 470 GB/s；冷 prefill 64K 平台修正后约 1,960 tok/s，再往下要动专家上传和解包
+  （每块上传 4.1 s、主流 4.9 s）；
   SGLang 的 M3.1 支持合入 main 后，env-m31 并回主 venv。
+- DeepSeek 的 prefill：SGLang 把块 FP8 当 MXFP8 的线性层固定在 tactic 0（`pin_tactic`），SM120 上三种 tile 的累加顺序相同；在 DS 的
+  形状上核对逐位相同后，让 prefill 大小也用 128×128（MiniMax 上 64K 冷 prefill +22%）。
 - DeepSeek：离生产还差约 2%，GPU 侧已与生产持平（16K 剖析），剩下的在 CPU 专家等待里，先比两边的热专家命中和换入节奏随上下文的变化。
 - Qwen：64K 会话的冷 prefill 这次生产快 15–18%（文本测法下 XTier 快 3%），先对两边的分块（24K 对 32K）和第一个请求的预热查起。
