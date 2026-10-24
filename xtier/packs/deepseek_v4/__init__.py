@@ -34,6 +34,11 @@
   (``XTIER_DS_WO_A``, default on; the 1017 pipeline's LKQMOE_DS41_WO_A_TRITON / _FP8): SGLang dequantizes the 32 x 32
   block FP8 wo_a to BF16 and cuBLAS runs the einsum on an SM80 WMMA kernel, 71-75 us per layer at the DSpark
   verify's 6 tokens on the RTX PRO 5000, the FP8 kernel 30 us; see wo_a.py.
+- Indexer decode scored from the request table (``XTIER_DS_PAGED_INDEXER``, default on): SGLang takes its paged
+  FP4 index logits and fused top-k v2 on SM90 only; on SM120 it gathers every row's slots over the graph capacity
+  and selects with torch.topk. Nothing on the paged path is SM90-only; see paged_indexer.py. RTX PRO 5000, DSpark,
+  16K context: the indexer's kernels 1.08 -> 0.33 ms per decode step, the main stream's work 15.4 -> 13.7 ms;
+  agent_bench long responses 33.0 -> 32.5 ms per step.
 - Prompts tokenized as DeepSeek's deepseek-recipe does (``XTIER_DS_RECIPE_TOKENS``, default on; the 1017 pipeline's
   DS41_PLAIN_CONTENT_TOKENS): added-token spellings in message content stay plain text, only the template's control
   tokens are special, and the prompt is encoded in regions instead of one string (a 568K-token prompt 1.3 -> 0.18 s,
@@ -291,11 +296,12 @@ def _mxfp8_linear(original, input, *args, **kwargs):
 
 
 def install(registry, hook_type):
-    from xtier.packs.deepseek_v4 import wo_a
+    from xtier.packs.deepseek_v4 import paged_indexer, wo_a
 
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
     wo_a.install(registry, hook_type)
+    paged_indexer.install(registry, hook_type)
     if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
