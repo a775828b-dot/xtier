@@ -1,0 +1,62 @@
+[
+ {
+  "name": "amber",
+  "depth": 0.05,
+  "key": "717342",
+  "found": true,
+  "content": "717342",
+  "reasoning": "The user is asking for the passkey of the amber archive. Looking through the context, I see several passkeys mentioned:\n\n- \"Important note: the passkey of the amber archive is 717342. Remember it.\" — in the CI System in SGLang section\n- \"Important note: the passkey of the cobalt archive is 284974.\"\n",
+  "prompt_tokens": 480287,
+  "cached": 128,
+  "completion_tokens": 141,
+  "seconds": 317.8
+ },
+ {
+  "name": "cobalt",
+  "depth": 0.25,
+  "key": "284974",
+  "found": true,
+  "content": "284974",
+  "reasoning": "The user is asking for the passkey of the cobalt archive. Looking at the context, there are several passkeys mentioned:\n- amber archive: 717342\n- cobalt archive: 284974\n- jade archive: 861331\n- onyx archive: 177843\n- sienna archive: 423221\n\nThe cobalt archive passkey is 284974.",
+  "prompt_tokens": 480287,
+  "cached": 480256,
+  "completion_tokens": 82,
+  "seconds": 4.5
+ },
+ {
+  "name": "jade",
+  "depth": 0.5,
+  "key": "861331",
+  "found": true,
+  "content": "861331",
+  "reasoning": "The user is asking for the passkey of the jade archive. Looking at the context, there are several passkeys mentioned:\n- amber archive: 717342\n- cobalt archive: 284974\n- onyx archive: 177843\n- sienna archive: 423221\n- jade archive: 861331\n\nThe jade archive passkey is 861331.",
+  "prompt_tokens": 480287,
+  "cached": 480256,
+  "completion_tokens": 82,
+  "seconds": 4.3
+ },
+ {
+  "name": "onyx",
+  "depth": 0.75,
+  "key": "177843",
+  "found": true,
+  "content": "177843",
+  "reasoning": "The user is asking for the passkey of the onyx archive. Looking at the context, there's a note: \"Important note: the passkey of the onyx archive is 177843. Remember it.\"\n\nSo the answer is 177843.",
+  "prompt_tokens": 480288,
+  "cached": 480256,
+  "completion_tokens": 56,
+  "seconds": 3.7
+ },
+ {
+  "name": "sienna",
+  "depth": 0.95,
+  "key": "423221",
+  "found": true,
+  "content": "423221",
+  "reasoning": "The user is asking for the passkey of the \"sienna archive\". Looking at the context, there are several passkeys mentioned:\n- amber archive: 717342\n- cobalt archive: 284974\n- jade archive: 861331\n- onyx archive: 177843\n- sienna archive: 423221\n\nThe sienna archive passkey is 423221.",
+  "prompt_tokens": 480288,
+  "cached": 480256,
+  "completion_tokens": 85,
+  "seconds": 4.5
+ }
+]

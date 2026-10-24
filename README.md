@@ -25,14 +25,14 @@ xtier/
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
 ├── packs/     加速包：qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核、QSA 读 NVFP4 KV）、glm5_next（量化排除、DSA、NextN）、
 │              deepseek_v4（Engram 行放 NVMe、SM120 候选索引器、FP8 GEMM 调优配置、FP8 wo_a、recipe 分词、分页索引器）、
-│              minimax_m3（SM120 通用栈、CUDA 上的 DSpark verify、草稿词表头 FP8）、
-│              speculative（通用 EAGLE 投机解码：热词表配无损拒绝采样、草稿温度、按置信度截断验证）
+│              minimax_m3（SM120 通用栈、CUDA 上的 DSpark verify、草稿词表头 FP8、SM120 上读 NVFP4 KV）、
+│              speculative（通用投机解码：EAGLE 的热词表配无损拒绝采样、草稿温度、按置信度截断验证；DSpark 按置信度截断验证）
 ├── tables/    大嵌入表的行放在 NVMe：多段多文件、任意行宽、行缓存、CUDA 图内查表
 ├── console/   启动台：一个网页选模型、调启动参数、启动 / 停止，跟踪加载阶段与 decode 遥测（只用标准库）
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
 configs/       每个"模型 × 硬件"的启动配置，console.py 是它在启动台里的条目（选项、默认值、启动命令）
-tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4、GPT-OSS SwiGLU、wo_a）与启动台检查
+tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4、GPT-OSS SwiGLU、wo_a、MiniMax NVFP4 KV）与启动台检查
 bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟）与结果
 ```
 
@@ -56,8 +56,8 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 - **左边模型栏**：每个模型一张小卡片，写着端口和 README 实测速度，标签注明测法（AGENT = agent 速度，文本 = 文本速度），
   模型多了在栏内滚动。
-- **中间启动参数**：默认就是实测配置，改过的项会标出。公共的有加速包开关（关 = 测速表里「官方 main」的配置）、投机解码、上下文、
-  CPU 专家线程；各模型自己的有 Qwen 的 KV 精度、分块、常驻层布局、PLE 表放内存还是 NVMe，GLM 的拒绝采样、热专家槽、分块，
+- **中间启动参数**：默认就是实测配置，改过的项会标出。公共的有加速包开关（关 = 测速表里「官方 main」的配置）、投机解码、上下文
+  （MiniMax 固定 512K，没有这一项）、CPU 专家线程；各模型自己的有 Qwen 的 KV 精度、分块、常驻层布局、PLE 表放内存还是 NVMe，GLM 的拒绝采样、热专家槽、分块，
   DeepSeek 的 Engram 行缓存、热专家槽、分块，MiniMax 的热专家槽、DSpark 草稿长度、分块。
 - **右边运行状态**：加载阶段（权重 → 草稿 → 专家池 → CUDA 图 → 预热 → 在线），在线后显示 decode 速度、接受长度、显存和日志。
 
@@ -71,7 +71,7 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 | Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；按 agent_bench，加速包后 decode 每步与生产持平（14.1 对 13.9 ms），冷 prefill 500K 快 7%、64K 慢 15%；KV 存 NVFP4（与生产同参，加速包让官方 QSA 能读），省下的显存多放一层常驻；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
 | GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：按 agent_bench，加速包后 decode 每步比生产快 11%（27.5 对 30.9 ms，热词表拒绝采样与生产相同），冷 prefill 持平或略快，PPL 3.994（生产 4.060） |
 | DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；按生产的 agent_bench（同一套编码代理会话）实测：冷 prefill 500K 比生产快 24%，decode 每步慢约 2%（32.5 对 32.0 ms：wo_a 换成检查点的 FP8、索引器走分页路径之后） |
-| MiniMax-M3.1-Flash | `minimax_m3` | SGLang 的 M3.1 分支（PR #45925，还没合入 main）上跑通（含 DSpark）：SM120 上四处必需的修正（PR 把 SM120 当 SM100：原生栈、FP8 KV + TRT-LLM、MegaMoE、CUDA 上的 DSpark verify），CPU 引擎和 GPU 内核加了 GPT-OSS SwiGLU；按 agent_bench（64k 会话），加速包后 decode 每步快 16%（59.5 对 70.6 ms），tok/s 快 3%（草稿短了、接受长度也短），照抄 0 错；没有生产管线可比 |
+| MiniMax-M3.1-Flash | `minimax_m3` | SGLang 的 M3.1 分支（PR #45925，还没合入 main）上跑通（含 DSpark）：SM120 上四处必需的修正（PR 把 SM120 当 SM100：原生栈、FP8 KV + TRT-LLM、MegaMoE、CUDA 上的 DSpark verify），CPU 引擎和 GPU 内核加了 GPT-OSS SwiGLU；KV 存 NVFP4，固定 512K 上下文（480K 找数 5/5）；按 agent_bench（64k 会话），加速包后 decode 每步快 34%（55.4 对 84.1 ms），tok/s 快 12%（含无损的 DSpark 按置信度截断验证）；没有生产管线可比 |
 
 ## 测速
 
@@ -134,40 +134,43 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 ### MiniMax-M3.1-Flash
 
-SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，128K KV 池（FP8）：agent_bench 的 128k-write 会话预填的历史就有 13.3 万
-token，放不下，只跑 64k 会话；MiniMax 常在第一步就把 4096 个输出 token 全用来思考（没到工具调用就到了上限），所以每轮是一个
-64K 冷 prefill 加一到两个长回复，同一次启动连跑四轮，表里是中位数（括号里是范围）。没有生产管线可比，对比的是官方代码加必要修正。
+SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K 上下文，KV 存 NVFP4，热专家每层 8 槽。只跑 64k 会话，
+与之前 128K 池时的测法相同；更长的会话现在放得下，还没测。MiniMax 常在第一步就把 4096 个输出 token 全用来思考（没到工具调用
+就到了上限），所以每轮是一个 64K 冷 prefill 加一到两个长回复，同一次启动连跑两轮。没有生产管线可比，对比的是官方代码加必要修正。
 
 | DSpark | 轮 | 冷 prefill 64K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|
-| XTier + 加速包 + MXFP8 prefill 修正 | 1–2 | 1,963 | 55.8 | 3.26 | 58.4 ms |
-| XTier + 加速包 | 1–4 | 1,606 | 54.3（52.5–55.7） | 3.23 | 59.5 ms |
-| 官方代码 + 必要修正 | 1–4 | 1,607 | 52.7（51.8–55.1） | 3.72 | 70.6 ms |
+| XTier + 加速包 | 1 | 1,854 | 53.4 | 3.04 | 56.9 ms |
+|  | 2 | 1,877 | 50.0 | 2.70 | 54.0 ms |
+| 官方代码 + 必要修正 | 1 | 1,824 | 46.8 | 3.94 | 84.3 ms |
+|  | 2 | 1,883 | 45.5 | 3.82 | 84.0 ms |
 
 - **官方代码 + 必要修正**（启动台「关加速包」）：PR 的代码加上在 SM120 上跑起来必需的修正（`xtier/packs/minimax_m3`：SM120 走 SGLang
-  给 Hopper 的通用栈、CUDA 上的 DSpark verify），检查点的草稿长度 7，热专家每层 16 槽。**+ 加速包**：草稿长度 5、热专家换入节奏
-  照 DeepSeek（每 2 窗、每次最多 32 个）、草稿词表头 FP8、6 行验证的 MXFP8 投影走 b12x。
-- 第一行是 10-24 上午加了平台修正（SM120 的 MXFP8 GEMM 在 prefill 大小上用 128×128 tile，见配置）之后的两轮：冷 prefill 快 22%，
-  decode 不受影响（与第二行的差别在轮次波动内）。官方代码那行同样受益（这个修正不属于加速包），没有复测。
-- 加速包每步快 16%（59.5 对 70.6 ms），接受长度短 13%（草稿 5 对 7），tok/s 快 3%；冷 prefill 相同。加速包的其他项配检查点的
-  草稿 7 是每步 68.5 ms、53.2 tok/s（四轮中位数），所以默认用 5。
-- 8 槽 + 256K 池（启动台另一档，128k-write 会话放得下）：一轮，冷 prefill 64K 1,606、128K 1,588 tok/s，长回复 47.6 tok/s、每步
-  68.1 ms（槽少一半，热专家命中 0.24）。
-- decode 受 CPU 专家限制：每步约 60% 在等 CPU（未命中的专家每个约 32 MB，读一个约 67 µs，约 470 GB/s）；草稿短一点每层少读专家，
-  接受长度也短一点，更多见[报告](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 精度：照抄 0 错（单 / 双并发各 8 段，温度 0）；CPU 引擎的 GPT-OSS SwiGLU 与 FP32 参考相对误差 1e-6，GPU 部分（W4A16）与 CPU 引擎
-  1.3e-3（`tests/swiglu_oai_check.py`、`hybrid_prefill_check.py`、`cache_check.py`）。草稿长度、换入节奏、草稿词表头 FP8 都不改
-  主模型的输出。
-- 原始数据 `bench/results/agent-bench-minimax31-{xtier,base,xtier-gamma7}-r{1,2,3,4}-20261024.json`、
-  `agent-bench-minimax31-xtier-tile-r{1,2}-20261024.json`、`agent-bench-minimax31-xtier-256k-r1-20261024.json`。
+  给 Hopper 的通用栈、CUDA 上的 DSpark verify、NVFP4 KV），检查点的草稿长度 7。**+ 加速包**：草稿长度 5、热专家换入节奏照
+  DeepSeek（每 2 窗、每次最多 32 个）、草稿词表头 FP8、6 行验证的 MXFP8 投影走 b12x、DSpark 按置信度截断验证。
+- 加速包每步快 34%（两轮 55.4 对 84.1 ms），tok/s 快 12%（51.6 对 45.9），接受长度短 26%（草稿 5 加截断，对比草稿 7）；
+  冷 prefill 相同。
+- 按置信度截断验证：草稿的置信度头预测每个草稿 token 被接受的概率，生存概率（累乘）低于 0.3 之后的草稿直接判拒绝（与 SGLang 的
+  cap-accept 同一个机制，无损），这些行跳过 CPU 专家。CPU 每层从 798 降到 493–517 µs，decode +11%。
+- 与之前的默认（128K FP8 KV、16 槽、不截断，今天复测：冷 prefill 1,900 / 1,953，decode 55.5 tok/s，每步 56.2 ms）相比：
+  冷 prefill −3%，每步持平，tok/s −7%。512K 的 KV 从 FP8 的 42.5 GiB 降到 24 GiB（NVFP4 19 GiB，加 BF16 草稿 5 GiB），所以
+  热专家从 16 槽减到 8 槽（命中率 0.43 → 0.27）。
+- decode 受 CPU 专家限制：未命中的专家每个约 32 MB，读一个约 67 µs（约 470 GB/s），更多见
+  [报告](docs/reports/2026-10-24-ds-woa-minimax.md)。
+- 精度：NVFP4 KV 轻微。照抄（温度 0，单 / 双并发各 8 段）：单并发三次里有两次错同一个 token（前两名 logit 很接近），双并发都是
+  0 错（FP8 都是 0 错）；480K 长文找数 5/5。截断验证无损（照抄 0 错）。MiniMax 的 PPL 不适合衡量精度：裸文本和聊天里用户
+  文档的 NLL 都在 4–6，FP8 和 NVFP4 一样，见[报告](docs/reports/2026-10-24-minimax-512k.md)。CPU 引擎的 GPT-OSS SwiGLU
+  与 FP32 参考的相对误差是 1e-6；草稿长度、换入节奏、草稿词表头 FP8 都不改变主模型的输出。
+- 原始数据 `bench/results/agent-bench-minimax31-{xtier-512k,base-512k,xtier-fp8kv-128k}-r{1,2}-20261024.json`、
+  `needle-minimax31-512k-20261024.json`。
 
 ### 配置
 
 - **官方 main**（启动台「关加速包」）：XTier 后端加上跑起来必需的修正，不开任何提速项。必需的修正：Qwen 的 PLE 表锁页分配；GLM 的量化排除、DSA
   别名、NextN 草稿量化；DeepSeek 的 SM120 候选索引器、Engram 行放 NVMe、尾部重放不走 CUDA 图；
-  MiniMax 的 SM120 通用栈和 CUDA 上的 DSpark verify（`xtier/packs/minimax_m3`）。
+  MiniMax 的 SM120 通用栈、CUDA 上的 DSpark verify 和 NVFP4 KV（`xtier/packs/minimax_m3`；512K 时 FP8 KV 放不下）。
 - **热专家布局与启动参数与生产相同**：Qwen NVFP4 KV、其余层每层 155 槽；GLM 每层 60 槽、16K 分块、BF16 SSM 状态、拒绝采样；
-  DeepSeek 每层 50 槽；MiniMax（没有生产管线）每层 16 槽、128K FP8 KV 池、16K 分块。
+  DeepSeek 每层 50 槽；MiniMax（没有生产管线）每层 8 槽、512K NVFP4 KV 池、16K 分块。
   不同的地方：Qwen 加速包那行 26 层常驻（比生产多第 27 层，用 NVFP4 KV 省下的显存，prefill +0.5–1.4%）、
   24K 分块（生产 32K：这里 32K 在 64K 冷 prefill 慢 3%），见[报告](docs/reports/2026-10-24-qwen-kv-ds-agent.md)；Qwen 官方 main
   用 FP8 KV（官方 main 的 QSA 读不了 NVFP4）、16K 分块、生产的 25 层常驻；GLM 的官方 main 用 BF16 权重，60 槽时 prefill 显存不够，
@@ -179,7 +182,8 @@ token，放不下，只跑 64k 会话；MiniMax 常在第一步就把 4096 个�
   DeepSeek 是调好的块 FP8 GEMM 配置、MXFP8 走 FlashInfer CUTLASS（解码宽度走 b12x）、Engram 提前查表（`XTIER_ENGRAM_PREFETCH`）、
   草稿词表头 FP8（`XTIER_DRAFT_LMHEAD_FP8`）和 wo_a 存检查点的 FP8、decode 走 Triton 分组 einsum（`XTIER_DS_WO_A`）、索引器 decode 走官方的分页路径（`XTIER_DS_PAGED_INDEXER`）；
   MiniMax 是 DSpark 草稿长度 5（`GAMMA`，检查点 7）、热专家换入节奏照 DeepSeek（`XTIER_CACHE_EVERY=2`、`XTIER_CACHE_SWAPS=32`）、
-  草稿词表头 FP8（与 DeepSeek 同一个钩子）、6 行验证的 MXFP8 投影走 b12x（`XTIER_MXFP8_B12X_ROWS`，DeepSeek 包的钩子）。
+  草稿词表头 FP8（与 DeepSeek 同一个钩子）、6 行验证的 MXFP8 投影走 b12x（`XTIER_MXFP8_B12X_ROWS`，DeepSeek 包的钩子）、
+  DSpark 按置信度截断验证（`XTIER_DSPARK_TRUNCATE=0.3`，截掉的 token 跳过 CPU 专家，`xtier/packs/speculative/dspark_truncate.py`）。
 - **平台修正**（`xtier/platform.py`，与模型无关，开不开加速包都在）：SGLang 只按 decode 的形状给 FlashInfer 的 GEMM 做自动调优，
   prefill 大小的 MXFP8 GEMM 查不到缓存，退回 SM120 上最小的 128×32 tile；256 行起改用 128×128（输出逐位相同，16384 行时快 1.5–5.7 倍）：
   MiniMax 64K 冷 prefill +22%；DeepSeek 的 MXFP8 调用被 SGLang 固定了 tactic（`pin_tactic`），不受影响。
@@ -188,6 +192,11 @@ token，放不下，只跑 64k 会话；MiniMax 常在第一步就把 4096 个�
 
 ## 版本更新
 
+- 2026-10-24（下午）：MiniMax 固定 512K 上下文，KV 改存 NVFP4，用的是 SGLang 给 SM100 的 MSA-v1 池：decode 用在寄存器里解码的
+  Triton 内核读；prefill 先反量化成 BF16 临时区，再走官方内核；写入用官方的融合内核（在 SM120 上验证逐字节一致后打开）。512K 的
+  KV 从 42.5 GiB 降到 24 GiB，热专家 8 槽，480K 找数 5/5。DSpark 按置信度截断验证：草稿生存概率低于 0.3 的位置之后判拒绝并跳过
+  CPU 专家，无损，照抄 0 错，agent decode +11%。与之前的 128K FP8 / 16 槽相比，冷 prefill −3%，每步持平（55.4 对 56.2 ms），
+  tok/s −7%。`bench/ppl_eval.py` 加了 `--prefix`。详见 [reports/2026-10-24-minimax-512k.md](docs/reports/2026-10-24-minimax-512k.md)。
 - 2026-10-24（上午，二）：平台修正：SM120 上 MXFP8 GEMM 在 prefill 大小（≥ 256 行）用 128×128 tile（SGLang 只按 decode 的形状
   调优，prefill 退回 128×32；输出逐位相同）：MiniMax 64K 冷 prefill 1,606 → 1,963 tok/s，decode 不变，照抄 0 错。详见
   [reports/2026-10-24-ds-woa-minimax.md](docs/reports/2026-10-24-ds-woa-minimax.md)。

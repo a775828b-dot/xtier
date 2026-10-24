@@ -1,0 +1,107 @@
+{
+ "label": "m31-speed-fp4-512k-r2",
+ "args": {
+  "label": "m31-speed-fp4-512k-r2",
+  "url": "http://127.0.0.1:18195",
+  "model": "MiniMax-M3.1-Flash",
+  "tokenizer": "/data/fast/nvme2/models/modelscope/MiniMax/MiniMax-M3.1-Flash",
+  "repo": "/data/fast/workspaces/gh-ref/lsglang_ds4.1",
+  "lsglang": "/data/fast/workspaces/ds41-1017/source",
+  "out": "results/agent/m31-speed-fp4-512k-r2.json",
+  "sessions": "64k",
+  "context_limit": 524288,
+  "steps": 24,
+  "max_tokens": 4096,
+  "temperature": null,
+  "seed": null,
+  "dry_run": false
+ },
+ "wall_s": 139.6,
+ "summary": {
+  "all": {
+   "requests": 2,
+   "output_tokens": 4237,
+   "decode_tps": 45.8,
+   "median_request_tps": 47.9,
+   "accept": 3.267,
+   "ms_per_step": 71.28
+  },
+  "ctx_0k_96": {
+   "requests": 2,
+   "output_tokens": 4237,
+   "decode_tps": 45.8,
+   "median_request_tps": 47.9,
+   "accept": 3.267,
+   "ms_per_step": 71.28
+  },
+  "sessions": {
+   "64k": {
+    "requests": 2,
+    "output_tokens": 4237,
+    "decode_tps": 45.8,
+    "median_request_tps": 47.9,
+    "accept": 3.267,
+    "ms_per_step": 71.28,
+    "ctx_start": 67119,
+    "ctx_end": 67173,
+    "steps": 2
+   }
+  },
+  "ttft_first_s": [
+   45.215
+  ],
+  "ttft_later_median_s": 1.4,
+  "tool_call_requests": 1,
+  "cold_prefill": [
+   {
+    "session": "64k",
+    "prompt_tokens": 67119,
+    "cached_tokens": 128,
+    "ttft_s": 45.215,
+    "prefill_tps": 1481.6
+   }
+  ],
+  "output_tokens_p10_p50_p90": [
+   141,
+   141,
+   141
+  ],
+  "long_output_share": 0.967
+ },
+ "rows": [
+  {
+   "prompt_tokens": 67119,
+   "cached_tokens": 128,
+   "output_tokens": 141,
+   "ttft_s": 45.215,
+   "decode_s": 2.796,
+   "decode_tps": 50.1,
+   "verify_steps": 42.0,
+   "accept": 3.357,
+   "step_ms": 66.56,
+   "tool_calls": [
+    "list_dir"
+   ],
+   "reasoning_chars": 460,
+   "text_chars": 0,
+   "session": "64k",
+   "step": 0
+  },
+  {
+   "prompt_tokens": 67173,
+   "cached_tokens": 67072,
+   "output_tokens": 4096,
+   "ttft_s": 1.402,
+   "decode_s": 89.658,
+   "decode_tps": 45.7,
+   "verify_steps": 1255.0,
+   "accept": 3.264,
+   "step_ms": 71.44,
+   "tool_calls": [],
+   "reasoning_chars": 16862,
+   "text_chars": 0,
+   "session": "64k",
+   "step": 1
+  }
+ ]
+}
