@@ -2,7 +2,7 @@
 
 ## 目标
 
-在官方 SGLang（跟 main 分支）上，用一个插件包实现 CPU/GPU 分层 MoE 推理：专家分布在显存、内存和 NVMe 三层，按热度放置、按需调度。
+在官方 SGLang（跟 main 分支）上，用一个插件包实现 CPU/GPU 分层 MoE 推理：专家分布在显存和内存两层，按热度放置、按需调度；NVMe 只放大嵌入表的行（DeepSeek 的 Engram、Qwen 的 PLE）。
 三个模型（DeepSeek V4.1 Flash 1017、Qwen3.8 Flash Next、GLM-5.3 Flash）的速度和精度对齐现在的生产管线后切换过去；以后加新的 MoE 模型不需要写混合推理代码。
 
 ## 原则

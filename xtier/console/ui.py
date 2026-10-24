@@ -10,7 +10,7 @@ data['api']); page_html() is the standalone page of `python -m xtier.console`.
 import html
 import json
 
-SUBTITLE = '官方 SGLang main + XTier 插件 · 专家分布在显存 / 内存 / NVMe 三层 · 每个模型在自己的端口上提供 OpenAI 兼容接口'
+SUBTITLE = '官方 SGLang main + XTier 插件 · 专家分布在显存 / 内存两层，NVMe 只放大嵌入表（Engram / PLE） · 每个模型在自己的端口上提供 OpenAI 兼容接口'
 FOOT = '默认参数 = configs/*/console.py 里的实测配置，改动过的项会标出。一次只跑一个模型：启动新的模型前会先停掉当前的。'
 
 CSS = r"""
