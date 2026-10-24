@@ -1,0 +1,7 @@
+glm-hand512 72824
+glm-pace 72824
+minimax-hand 72650
+qwen-auto2 71354
+qwen-auto 71338
+qwen-r26 71402
+qwen-v2fast 42702

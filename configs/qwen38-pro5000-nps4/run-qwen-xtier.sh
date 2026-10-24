@@ -16,7 +16,14 @@ export XTIER_GPU_PREFILL_CHUNK=${XTIER_GPU_PREFILL_CHUNK:-8192} XTIER_PREFILL_EX
 export XTIER_PREFILL_PREFETCH=${XTIER_PREFILL_PREFETCH:-1} XTIER_PREFILL_RELEASE_WORKSPACE=${XTIER_PREFILL_RELEASE_WORKSPACE:-1}
 export XTIER_PREFILL_ROUTE_ACCUM=${XTIER_PREFILL_ROUTE_ACCUM:-1} XTIER_PREFILL_UNPACK=${XTIER_PREFILL_UNPACK:-1}
 export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFILL_MIN=${XTIER_GPU_PREFILL_MIN:-1024}
-if [ "${LAYOUT:-}" = prod ]; then
+# LAYOUT=auto: the same memory, laid out by the planner at startup (docs/planner.md): decode no worse than that layout by
+# its cost model (this host's probe, planner-probe.json; adaptive gain 1.6, measured against production's layouts),
+# then as many fully resident layers as possible
+if [ "${LAYOUT:-}" = auto ]; then
+  export XTIER_CACHE_PLAN=${XTIER_CACHE_PLAN:-auto} XTIER_PLANNER_PROBE=${XTIER_PLANNER_PROBE:-$(dirname "$0")/planner-probe.json}
+  export XTIER_PLANNER_KEEP=${XTIER_PLANNER_KEEP:-1} XTIER_PLANNER_ADAPT=${XTIER_PLANNER_ADAPT:-1.6}
+fi
+if [ "${LAYOUT:-}" = prod ] || [ "${LAYOUT:-}" = auto ]; then
   export XTIER_CACHE_FULL=${XTIER_CACHE_FULL:-0,1,2,5,6,7,8,10,11,12,13,14,17,18,19,20,21,22,26,28,29,33,34,37,38}
   export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-155} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-32} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
   export XTIER_CACHE_PROFILE=${XTIER_CACHE_PROFILE:-/data/fast/workspaces/lkqmoe-20260928/deploy-0.3.2/lkqstrata-qwen38.json}

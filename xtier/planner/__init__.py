@@ -5,10 +5,25 @@ experts. Step 2: every selected layer (XTIER_LAYERS) runs on XTier; the layers o
 on the GPU, the others XTIER_CACHE_SLOTS hot experts (the rest on the CPU engine). With XTIER_DRAFT=1 the MoE layers
 of a speculative draft run on XTier too, by default with every expert on the GPU (GPU-only W4A16, the draft must be
 fast); XTIER_DRAFT_SLOTS gives them N hot slots or none instead (small GPUs). XTIER_CACHE_PLAN: per-layer slots
-from a global budget (planner/budget.py, tools/plan_cache.py).
+from a file (tools/plan_auto.py --write) or, with "auto", computed at startup (planner/auto.py: cost model of
+planner/cost.py with the coefficients tools/plan_probe.py measured on this host, the routing profile's counts, the
+budget of the hand layout or XTIER_CACHE_BUDGET[_GIB]).
 """
 
+import os
+
 from xtier import config
+
+_auto = []
+
+
+def cache_plan() -> dict[int, int]:
+    if os.environ.get('XTIER_CACHE_PLAN', '').strip() != 'auto':
+        return config.cache_plan()
+    if not _auto:
+        from xtier.planner import auto
+        _auto.append(auto.from_env(config.cache_full(), config.cache_slots()))
+    return _auto[0]
 
 
 def layer_config(layer_idx: int):
@@ -25,7 +40,7 @@ def layer_config(layer_idx: int):
     selected = config.layers()
     if selected is not None and layer_idx not in selected:
         return None
-    planned = config.cache_plan().get(int(layer_idx))
+    planned = cache_plan().get(int(layer_idx))
     if planned is not None:   # as many slots as experts: the layer is fully resident (the pool's S >= E)
         slots = planned
     else:

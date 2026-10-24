@@ -22,7 +22,7 @@ XTier 是官方 SGLang 的插件（跟 main 分支），做 CPU/GPU 分层 MoE �
 xtier/
 ├── backend/   混合 MoE 后端：接管官方量化方法，权重加载完即交给 CPU 引擎；解码走信箱（CUDA 图可捕获），prefill 走 GPU 分组 GEMM 或 CPU
 ├── cache/     热专家缓存：每层槽数可不同，全部常驻的层不经过 CPU；自适应换入换出；常驻层的 prefill 直接在槽上算
-├── planner/   规划器：决定每层由谁算、缓存多少（目前按配置，目标是 CPU 和 GPU 同时算完）
+├── planner/   规划器：本机探测的 GPU / CPU 耗时 + 路由档案 → 显存预算内每层的热专家槽数（按 CPU 和 GPU 同时算完分配），可在启动时自动算
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
 ├── packs/     加速包：qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核、QSA 读 NVFP4 KV）、glm5_next（量化排除、DSA、NextN）、
 │              deepseek_v4（Engram 行放 NVMe、SM120 候选索引器、FP8 GEMM 调优配置、FP8 wo_a、recipe 分词、分页索引器）、
@@ -33,7 +33,8 @@ xtier/
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
 configs/       每个"模型 × 硬件"的启动配置，console.py 是它在启动台里的条目（选项、默认值、启动命令）
-tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4、GPT-OSS SwiGLU、wo_a、MiniMax NVFP4 KV）与启动台检查
+tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4、GPT-OSS SwiGLU、wo_a、MiniMax NVFP4 KV）、启动台与规划器检查
+tools/         构建、内存看门狗、规划器（plan_probe 探测、plan_trace 路由档案、plan_auto 出方案、plan_calibrate 校准，见 docs/planner.md）
 bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟）与结果
 ```
 
@@ -193,6 +194,13 @@ SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K �
 
 ## 版本更新
 
+- 2026-10-24（晚）：自动规划器第一版（PLAN 第 3 步）：`tools/plan_probe.py` 按层形状用合成权重在本机测 GPU / CPU 每专家
+  耗时（CPU 另按 token-专家对计）和上传带宽，`xtier/planner/cost.py` 按"每层 GPU 和 CPU 同时算、慢的一边决定时间"估 decode，
+  `auto.py` 在显存预算内逐层定热专家槽数（不让 decode 变慢时多放全常驻层），可离线出方案或启动时算（`XTIER_CACHE_PLAN=auto`）；
+  `tools/plan_trace.py` 从路由记录生成档案，`tools/plan_calibrate.py` 校准。Qwen3.8 启动时自动规划（`LAYOUT=auto`，可选，同显存）：29 层全常驻 + 18 层 64–88 槽（手工 26 + 22 × 155），
+  agent 冷 prefill 各会话 +2.4–2.9%、decode 持平；GLM、DeepSeek、MiniMax 各层偏斜接近，同显存下均匀分槽已是最优附近（保留手工布局）。
+  用法见 [docs/planner.md](docs/planner.md)，
+  详见 [reports/2026-10-24-planner.md](docs/reports/2026-10-24-planner.md)。
 - 2026-10-24（下午）：MiniMax 固定 512K 上下文，KV 改存 NVFP4，用的是 SGLang 给 SM100 的 MSA-v1 池：decode 用在寄存器里解码的
   Triton 内核读；prefill 先反量化成 BF16 临时区，再走官方内核；写入用官方的融合内核（在 SM120 上验证逐字节一致后打开）。512K 的
   KV 从 42.5 GiB 降到 24 GiB，热专家 8 槽，480K 找数 5/5。DSpark 按置信度截断验证：草稿生存概率低于 0.3 的位置之后判拒绝并跳过

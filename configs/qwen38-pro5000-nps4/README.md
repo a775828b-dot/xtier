@@ -8,6 +8,11 @@ Development launchers of step 2 (paths of the test host; the declarative configu
   tokenizer without `tokenizer.json`; the converted copy encodes identically), `--skip-server-warmup` (the upstream
   warm-up request fails in the Qwen VL processor), `--cuda-graph-backend-prefill disabled` (XTier's prefill paths
   synchronize; decode graphs only).
+- `LAYOUT=auto`: the expert cache laid out by the planner at startup (`XTIER_CACHE_PLAN=auto`,
+  [docs/planner.md](../../docs/planner.md)) within the memory of the hand layout (`XTIER_CACHE_FULL` / `XTIER_CACHE_SLOTS`),
+  its decode no worse by the cost model (this host's probe `planner-probe.json`, adaptive gain 1.6). With `run-qwen-long.sh`:
+  29 resident layers + 18 x 64-88 slots instead of 26 + 22 x 155; agent_bench cold prefill +2.4-2.9% per session, decode
+  unchanged ([docs/reports/2026-10-24-planner.md](../../docs/reports/2026-10-24-planner.md)).
 - `run-qwen-mtp.sh`: the same with MTP as in production (NEXTN, 3 steps, 4 draft tokens, draft token map). The
   draft's MoE runs either on SGLang (`--speculative-moe-runner-backend flashinfer_cutlass`) or on XTier
   (`XTIER_DRAFT=1`, every expert on the GPU).
