@@ -13,7 +13,10 @@ MODEL = {
     'name': 'MiniMax M3.1 Flash', 'code': 'MINIMAX-M3.1-F', 'port': 18195, 'served': 'MiniMax-M3.1-Flash',
     'spec': 'DSpark', 'arch': '60 层 · 128 专家 top-4 + 共享专家 · MSA 稀疏注意力 · NVFP4 专家 / MXFP8',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 3600,
-    'bench': {'kind': 'agent', 'dec': '--', 'pre': '-- / --', 'title': '待测'},
+    # README agent speed (production's agent_bench, 64k session only: the 128k-write history does not fit the 128K
+    # context; four rounds): decode of the long responses (>= 300 tokens), the 64K cold prefill (medians)
+    'bench': {'kind': 'agent', 'dec': '54.3', 'pre': '1606',
+              'title': 'agent 速度（生产的 agent_bench 64k 会话，四轮中位数）：decode = 长回复（≥ 300 token），prefill = 64K 会话的冷 prefill（128K 池放不下 128k-write 会话）'},
     'options': common_options('DSpark', contexts=('131072', '262144')) + [
         {'key': 'slots', 'label': '热专家槽 / 层', 'default': '16',
          'choices': [['16', '16 · 128K'], ['8', '8 · 256K'], ['12', '12']]},
