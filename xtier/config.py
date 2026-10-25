@@ -20,6 +20,8 @@
   XTIER_CACHE_PROFILE=file   ranking profile that fills the slots at start (LKQstrata format)
   XTIER_CACHE_ADAPT=1, XTIER_CACHE_EVERY=4, XTIER_CACHE_SWAPS=16, XTIER_CACHE_DECAY=0.7, XTIER_CACHE_MIN_GAIN=1.5,
   XTIER_CACHE_LOG=N          adaptive residency (see cache/pool.py)
+  XTIER_CACHE_PROMPT=0       1: warm the cache from each prompt's routes (cache/pool.py record_prompt;
+                             XTIER_CACHE_PROMPT_KEEP=0.7, _WINDOWS=10, _ROUNDS=4, _SWAPS=256)
 Engine switches (XTIER_DYNAMIC, XTIER_DOWN_BF16, XTIER_SPIN_COUNT, ...) are read by the engine itself, see csrc/.
 """
 

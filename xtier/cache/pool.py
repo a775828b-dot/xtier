@@ -19,6 +19,9 @@ The residency table is device memory read at replay time: changing it needs no r
 Adaptive residency (XTIER_CACHE_ADAPT=1, default): the mailbox dispatcher's policy thread decides swaps from the routes
 it sees and posts them to a mapped command ring; the first cached layer of every decode window runs a commit kernel
 that unpublishes replaced experts at once and publishes new ones once their copy has landed (csrc/mailbox).
+Prompt warm-up (XTIER_CACHE_PROMPT=1, default off; record_prompt): the decode windows alone leave a new request with
+the previous one's experts for its first tens of windows; the prefill's routes, counted on the GPU, reach the policy
+once per prompt and start a few large rounds at the first decode window.
 
 Numerics: GPU routes are W4A16 (hardware FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
 CPU routes unchanged. Without cached experts the result equals the plain mailbox path except for the FP32 addition of
@@ -411,6 +414,30 @@ def maybe_start():
                 'min gain %s', every, budget, decay, gain)
 
 
+def record_prompt(pool, ids):
+    """Prefill of a partly cached layer (XTIER_CACHE_PROMPT=1): count its routes on the GPU (int32 [m, k] on the
+    current stream; -1 lands in a spare column). The last partly cached layer of a forward hands the counts to the
+    policy through pinned memory and a host function on the stream (no synchronization) and clears them; with
+    DeepSeek V4's decoder replay the layers past 20 run on a prompt's last chunk only, so a long prompt hands over
+    once, with every chunk's counts of the earlier layers."""
+    p = _glob.get('prompt')
+    if p is None or pool.index is None:
+        return
+    flat = ids.reshape(-1)
+    n = flat.numel()
+    if p['ones'] is None or p['ones'].numel() < n:
+        p['ones'] = torch.ones(max(n, 1 << 17), dtype=torch.float32, device=ids.device)
+    row = p['counts'][pool.index]
+    row.index_add_(0, torch.where(flat >= 0, flat, p['stride'] - 1), p['ones'][:n])
+    if pool.index == p['rows'] - 1:
+        p['host'].copy_(p['counts'], non_blocking=True)
+        lib = p['lib']
+        if lib.xtier_mailbox_pool_prompt(C.c_void_p(torch.cuda.current_stream().cuda_stream),
+                                         C.c_void_p(p['host'].data_ptr()), p['rows'], p['stride']) < 0:
+            raise RuntimeError(lib.xtier_mailbox_error().decode())
+        p['counts'].zero_()
+
+
 def fill_all():
     """Outside capture, after the shards are pinned: load the slots of every layer not filled yet (profile order, or
     every expert). The partly cached layers of the first call get the adaptive policy (a speculative draft, loaded
@@ -441,6 +468,20 @@ def fill_all():
                                              C.cast(arena, C.c_void_p), C.cast(res, C.c_void_p)) < 0:
                 raise RuntimeError(pool.mailbox.error())
         _glob['adapt'] = (lib, every, budget, decay, gain)
+        if os.environ.get('XTIER_CACHE_PROMPT', '0') == '1':
+            keep = float(os.environ.get('XTIER_CACHE_PROMPT_KEEP', '0.7'))
+            windows = float(os.environ.get('XTIER_CACHE_PROMPT_WINDOWS', '10'))
+            rounds = int(os.environ.get('XTIER_CACHE_PROMPT_ROUNDS', '4'))
+            swaps = int(os.environ.get('XTIER_CACHE_PROMPT_SWAPS', '256'))
+            if lib.xtier_mailbox_pool_warm(C.c_float(keep), C.c_float(windows), rounds, swaps) < 0:
+                raise RuntimeError(lib.xtier_mailbox_error().decode())
+            rows, stride = max(p.index for p in partial) + 1, max(p.E for p in partial) + 1
+            dev = partial[0].arena[0].device
+            _glob['prompt'] = dict(lib=lib, rows=rows, stride=stride, ones=None,
+                                   counts=torch.zeros((rows, stride), dtype=torch.float32, device=dev),
+                                   host=torch.zeros((rows, stride), dtype=torch.float32, pin_memory=True))
+            logger.info('xtier cache: prompt warm-up on: a prompt\'s routes as %s decode windows (old counts x %s), '
+                        'then %d rounds of up to %d swaps', windows, keep, rounds, swaps)
     gib = sum(p.bytes() for p in todo) / 2**30
     full = [p.layer_id for p in todo if p.full]
     logger.info('xtier cache: %d layers (%d with every expert: %s), %.1f GiB, %d experts loaded from %s in %.1f s',

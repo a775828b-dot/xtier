@@ -227,6 +227,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
         capturing = torch.cuda.is_current_stream_capturing()
         if not capturing and XTierMoEMethod._registered < len(XTierMoEMethod.layers):
             XTierMoEMethod._register_all()
+        if not capturing and m > config.decode_max() and self.pool is not None and not self.pool.full:
+            from xtier.cache import pool as cache_pool
+            cache_pool.record_prompt(self.pool, ids)   # XTIER_CACHE_PROMPT=1: the prompt warms the expert cache
         timed = config.timing() and not capturing and m > config.decode_max()
         if timed:
             torch.cuda.current_stream().synchronize()

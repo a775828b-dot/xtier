@@ -131,7 +131,8 @@ def mailbox_lib() -> C.CDLL:
             'slot': ([_P, _P, _I, _I, _P], _I), 'notify': ([_P, _P, _I, _I], _I), 'slot2': ([_P, _P, _I, _I, _P], _I),
             'signal': ([_P, _P, _I, _I, _I], _I), 'pool_enable': ([_P, _I], _I), 'pool_stats': ([_P, _P], _I),
             'pool_ring': ([_P], _I), 'pool_attach': ([_P, _I, _I, _I, _P, _P], _I),
-            'pool_start': ([_I, _I, C.c_float, C.c_float], _I), 'stats': ([_P, _P], _I), 'timing': ([_P, _P], _I),
+            'pool_start': ([_I, _I, C.c_float, C.c_float], _I), 'pool_prompt': ([_P, _P, _I, _I], _I),
+            'pool_warm': ([C.c_float, C.c_float, _I, _I], _I), 'stats': ([_P, _P], _I), 'timing': ([_P, _P], _I),
             'destroy': ([_P], _I),
         }
         for name, (args, res) in signatures.items():

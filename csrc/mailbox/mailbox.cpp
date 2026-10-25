@@ -174,6 +174,14 @@ public:
     int every=4,budget=16;float decay=0.7f,min_gain=1.5f;
     bool running=false,quit=false;
     long windows=0,round_at=0,swaps=0,rounds=0;
+    // Prompt warm-up (XTIER_CACHE_PROMPT, pool.py record_prompt): a prefill's route counts, scaled to warm_windows
+    // decode windows' worth, blend into the counts (the old ones x warm_keep), and the next warm_rounds rounds run
+    // at once (from the next decode window) with up to warm_budget swaps each: the decode that follows finds the
+    // prompt's hot experts instead of the previous request's (the idea of Strata 0.2.4's cache_settle).
+    float warm_keep=0.7f,warm_windows=10.f;int warm_rounds=4,warm_budget=256;
+    std::atomic<int> warm_left{0};
+    double route_avg=0.;   // routes per pool layer call of decode: the size of a window's counts
+    long prompts=0;
     uint32_t next_seq=0;
     std::thread worker;
     uint32_t *posted(){return seqs;}uint32_t *applied(){return seqs+16;}uint32_t *landed(){return seqs+32;}
@@ -193,7 +201,27 @@ public:
         if(layer<0||size_t(layer)>=layers.size()||!layers[layer])return;
         auto &u=layers[layer]->usage;
         for(int i=0;i<n;i++)if(orig[i]>=0&&orig[i]<int(u.size()))u[orig[i]]+=1.f;
-        if(layer==0&&running&&++windows-round_at>=every){round_at=windows;lock.unlock();cv.notify_one();}
+        route_avg=route_avg>0.?0.99*route_avg+0.01*n:double(n);
+        if(layer==0&&running&&(++windows-round_at>=every||warm_left.load(std::memory_order_relaxed)>0)) {
+            round_at=windows;lock.unlock();cv.notify_one();
+        }
+    }
+    // a prefill's route counts per pool layer (row l of `stride` floats), from a CUDA host function after their copy
+    void prompt(const float *counts,int n_layers,int stride) {
+        std::lock_guard<std::mutex> lock(mu);
+        const double window=route_avg>0.?route_avg:36.;
+        bool any=false;
+        for(int l=0;l<n_layers&&size_t(l)<layers.size();l++) {
+            auto *L=layers[l].get();if(!L)continue;
+            const float *row=counts+size_t(l)*stride;
+            const int E=std::min(L->E,stride);
+            double total=0.;for(int e=0;e<E;e++)total+=row[e];
+            if(total<=0.)continue;
+            const float scale=float(warm_windows*window/total);
+            for(int e=0;e<E;e++)L->usage[e]=L->usage[e]*warm_keep+row[e]*scale;
+            any=true;
+        }
+        if(any){warm_left.store(warm_rounds,std::memory_order_relaxed);prompts++;}
     }
     void upload(PoolLayer &L,int expert,int slot) {
         const size_t H=L.H,I=L.I,IN=I/L.nodes,HN=H/L.nodes;
@@ -256,7 +284,9 @@ public:
             }
         }
         std::sort(swaps_round.begin(),swaps_round.end(),[](const Swap&a,const Swap&b){return a.gain>b.gain;});
-        size_t limit=size_t(std::max(0,budget*every));
+        const bool warm=warm_left.load(std::memory_order_relaxed)>0;
+        if(warm)warm_left.fetch_sub(1,std::memory_order_relaxed);
+        size_t limit=size_t(std::max(0,warm?warm_budget:budget*every));
         // never more commands in flight than the ring holds
         uint32_t applied_now=__atomic_load_n(applied(),__ATOMIC_ACQUIRE);
         size_t room=POOL_RING/2>next_seq-applied_now?POOL_RING/2-(next_seq-applied_now):0;
@@ -374,8 +404,8 @@ void CUDART_CB execute(void *p) noexcept {
         win_n+=n;win_hit+=hit;win_wall+=wall;win_calls++;
         if(every>0&&b->index==0&&++windows%every==0) {
             auto &pm=pool_manager();
-            std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far\n",
-                         every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds);
+            std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far, %ld prompts\n",
+                         every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds,pm.prompts);
             win_n=win_hit=win_wall=win_calls=0;
         }
     }
@@ -500,6 +530,12 @@ void notify_and_wait(cudaStream_t stream,Slot *s,int parts=3) {
     cudaGraphNode_t runtime_node=reinterpret_cast<cudaGraphNode_t>(node);
     check(cudaStreamUpdateCaptureDependencies(stream,&runtime_node,nullptr,1,cudaStreamSetCaptureDependencies));
 }
+struct PromptCounts {const float *host;int layers,stride;};
+void CUDART_CB prompt_counts(void *p) noexcept {   // (a host function: no CUDA calls)
+    auto *c=static_cast<PromptCounts*>(p);
+    try{pool_manager().prompt(c->host,c->layers,c->stride);}catch(...){}
+    delete c;
+}
 }
 extern "C" {
 const char *xtier_mailbox_error(){return error.c_str();}
@@ -619,6 +655,22 @@ int xtier_mailbox_pool_start(int every,int budget,float decay,float min_gain) {
         auto &m=pool_manager();std::lock_guard<std::mutex> lock(m.mu);
         if(every<1||budget<0||!(decay>0.f&&decay<=1.f))throw std::runtime_error("Invalid pool policy");
         m.every=every;m.budget=budget;m.decay=decay;m.min_gain=min_gain;m.start();
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// the prompt counts in pinned host memory once the stream reaches this point (after their copy): blended in then
+int xtier_mailbox_pool_prompt(void *stream,const float *host,int layers,int stride) {
+    try {
+        if(!host||layers<1||stride<1)throw std::runtime_error("Invalid pool prompt counts");
+        check(cudaLaunchHostFunc(static_cast<cudaStream_t>(stream),prompt_counts,new PromptCounts{host,layers,stride}));
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+int xtier_mailbox_pool_warm(float keep,float windows,int rounds,int budget) {
+    try {
+        if(!(keep>=0.f&&keep<=1.f)||!(windows>0.f)||rounds<0||budget<0)throw std::runtime_error("Invalid pool warm-up");
+        auto &m=pool_manager();std::lock_guard<std::mutex> lock(m.mu);
+        m.warm_keep=keep;m.warm_windows=windows;m.warm_rounds=rounds;m.warm_budget=budget;
         return 0;
     }catch(const std::exception&e){error=e.what();return -1;}
 }
