@@ -78,6 +78,30 @@ def models_ok(port, timeout=2.0):
     return _get_ok(f'http://127.0.0.1:{port}/v1/models', timeout)
 
 
+# the warm-up prompts: this sentence (about 17 tokens) repeated, sized for the hybrid, split and GPU prefill regimes
+_WARM_TEXT = 'The console sends a few requests through the server before it reports the model online. '
+WARM_REPEATS = (20, 150, 400)
+
+
+def warm_up(port, served, deadline):
+    """Sampled chat requests of about 340, 2,500 and 6,800 prompt tokens, one after the other, each to its end. They run
+    what /health's one-token generation does not reach, and so what a server builds on its first use: FlashInfer's
+    sampling module, the kernels of each prefill regime, Triton kernels changed since the last start. With a cold JIT
+    cache that is a minute or more (10-26: the first client request after a start waited 88 s). Until the monotonic
+    deadline; returns '' or why a request failed (the server stays up either way)."""
+    for tag, repeat in zip('ABC', WARM_REPEATS):
+        body = {'model': served, 'max_tokens': 8, 'temperature': 1.0, 'top_p': 0.95, 'top_k': 40,
+                'messages': [{'role': 'user', 'content': f'Warm-up {tag}. ' + _WARM_TEXT * repeat + 'Reply with ok.'}]}
+        req = urllib.request.Request(f'http://127.0.0.1:{port}/v1/chat/completions', json.dumps(body).encode(),
+                                     {'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=max(30.0, deadline - time.monotonic())) as resp:
+                resp.read()
+        except Exception as exc:   # noqa: BLE001 - a failed warm-up only leaves the first-use work to the first request
+            return f'{type(exc).__name__}: {exc}'[:300]
+    return ''
+
+
 def _number(text):
     try:
         return float(text)
@@ -189,6 +213,15 @@ def _fresh(stamps, now, floor, cap=60.0):
 def _count(n):
     n = int(n)
     return str(n) if n < 1000 else f'{n / 1000:.1f}K' if n < 10000 else f'{n / 1000:.0f}K'
+
+
+def _note(path, text):
+    """One console line in the server's log."""
+    try:
+        with open(path, 'ab') as fh:
+            fh.write(f"[xtier-console] {time.strftime('%F %T')} {text}\n".encode())
+    except (OSError, TypeError):
+        pass
 
 
 def _read_tail(path, size=262144):
@@ -423,7 +456,8 @@ class Console:
         return not (state and self.active(state))
 
     def wait_ready(self, state, timeout):
-        """Until /health passes (True, ''), the server exits or timeout seconds pass (False, why)."""
+        """Until /health passes and the warm-up requests ran (True, ''), the server exits or timeout seconds pass
+        (False, why). The page shows the warm-up as the last loading phase ("预热")."""
         deadline = time.monotonic() + timeout
         self._waiting.add(state['port'])
         try:
@@ -431,6 +465,10 @@ class Console:
                 if not self.active(state):
                     return False, '服务提前退出：' + ' | '.join(log_tail(state.get('log'), 6))
                 if health(state['port']):
+                    t0 = time.monotonic()
+                    why = warm_up(state['port'], state.get('served'), deadline)
+                    _note(state.get('log'), f'warm-up {"failed after" if why else "done in"} '
+                                            f'{time.monotonic() - t0:.1f} s{": " + why if why else ""}')
                     state['ready_at'] = time.time()
                     self.write_state(state)
                     return True, ''

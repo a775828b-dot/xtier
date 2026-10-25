@@ -11,9 +11,10 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -96,4 +97,31 @@ assert status == 400 and not json.loads(body)['ok']
 status, body = call('/api/job')
 assert status == 200 and json.loads(body)['state'] == 'idle'
 httpd.shutdown()
-print(f'console ok: {len(models)} models, {combos} option combinations built')
+
+# the warm-up before "online": sampled chat requests of growing prompts, each to its end; a failure is reported
+seen = []
+
+
+class FakeOpenAI(BaseHTTPRequestHandler):
+    def do_POST(self):
+        seen.append((self.path, json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+        self.send_response(500 if len(seen) > 3 else 200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{}')
+
+    def log_message(self, *args):
+        pass
+
+
+fake = ThreadingHTTPServer(('127.0.0.1', 0), FakeOpenAI)
+threading.Thread(target=fake.serve_forever, daemon=True).start()
+deadline = time.monotonic() + 60
+assert core.warm_up(fake.server_address[1], 'Some-Model', deadline) == ''
+assert [p for p, _ in seen] == ['/v1/chat/completions'] * 3
+sizes = [len(b['messages'][0]['content']) for _, b in seen]
+assert sizes == sorted(sizes) and all(b['model'] == 'Some-Model' and b['max_tokens'] == 8 and b['top_k'] > 0
+                                     and 0 < b['top_p'] < 1 and b['temperature'] > 0 for _, b in seen), seen
+assert 'HTTP Error 500' in core.warm_up(fake.server_address[1], 'Some-Model', deadline)
+fake.shutdown()
+print(f'console ok: {len(models)} models, {combos} option combinations built, warm-up requests checked')
