@@ -27,10 +27,13 @@ attention), on SGLang's MiniMax M3.1 branch (PR #45925).
   the target's BF16 LM head (200064 x 6144, 2.46 GB). The DeepSeek pack's row-scaled FP8 copy and its
   ``project_through_lm_head`` hook serve SGLang's generic DSpark draft as well; here the copy is made when that draft
   attaches the head. Draft proposals only: the target verifies every token with its BF16 head.
+- On an SGLang without the M3.1 branch (upstream main, where DeepSeek, GLM and Qwen run) the pack installs nothing:
+  its hook targets are not there (``m31_branch``).
 """
 
 import copy
 import functools
+import importlib.util
 import logging
 import os
 
@@ -51,6 +54,15 @@ _kv_pool_scope = [False]
 def sm120():
     from sglang.srt.runtime_context import get_platform   # no CUDA context in the serving process
     return bool(get_platform().is_sm120)
+
+
+@functools.lru_cache
+def m31_branch():
+    """SGLang's MiniMax M3.1 branch (PR #45925) is installed: its NVFP4 MoE scheme module is there. By file, without
+    importing SGLang (hooks are installed while it starts)."""
+    spec = importlib.util.find_spec('sglang')
+    roots = list(spec.submodule_search_locations or []) if spec else []
+    return any(os.path.exists(os.path.join(r, 'srt', 'layers', 'quantization', 'minimax_m3_nvfp4.py')) for r in roots)
 
 
 def kv_fp4_enabled():
@@ -148,6 +160,8 @@ def _forward_extend(original, self, q, k, v, layer, forward_batch, *args, **kwar
 
 
 def install(registry, hook_type):
+    if not m31_branch():
+        return
     registry.register(NATIVE_STACK, _native_stack, hook_type.AROUND)
     registry.register(f'{MOE_SCHEME}.__init__', _moe_scheme_init, hook_type.AROUND)
     registry.register(f'{SPARSE}.init_forward_metadata_in_graph', _metadata_in_graph, hook_type.AROUND)
@@ -170,6 +184,8 @@ def install(registry, hook_type):
 
 def install_serving(registry, hook_type):
     """Hooks of the process that resolves the server arguments and serves the API."""
+    if not m31_branch():
+        return False
     registry.register(NATIVE_STACK, _native_stack, hook_type.AROUND)
     registry.register(INVOKE_OVERRIDE, _invoke_override, hook_type.AROUND)
     return True
