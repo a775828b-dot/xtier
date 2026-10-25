@@ -22,6 +22,10 @@
   XTIER_CACHE_LOG=N          adaptive residency (see cache/pool.py)
   XTIER_CACHE_PROMPT=0       1: warm the cache from each prompt's routes (cache/pool.py record_prompt;
                              XTIER_CACHE_PROMPT_KEEP=0.7, _WINDOWS=10, _ROUNDS=4, _SWAPS=256)
+  XTIER_CACHE_ELASTIC=0      1: extra hot-expert slots in the memory only a prefill needs, released before it
+                             (cache/elastic.py; XTIER_CACHE_ELASTIC_RESERVE_GIB=2, _CRITICAL_GIB=1, _MARGIN=1.25,
+                             _MAX=2.0 / _MAX_SLOTS, _BASE=1.0, _IDLE=32, _SMALL=4096, _CHECK=16,
+                             _COOLDOWN_S=600)
 Engine switches (XTIER_DYNAMIC, XTIER_DOWN_BF16, XTIER_SPIN_COUNT, ...) are read by the engine itself, see csrc/.
 """
 

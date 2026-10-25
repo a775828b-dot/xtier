@@ -155,6 +155,9 @@ constexpr uint32_t POOL_RING=4096;
 struct PoolLayer {
     Bridge *bridge=nullptr;
     int layer=0,S=0,E=0,H=0,I=0,group=16;
+    bool elastic=false;               // XTIER_CACHE_ELASTIC: S slots of address space, the first `active` mapped
+    int base=0;                       // slots mapped for good (the planner's / XTIER_CACHE_SLOTS count)
+    std::atomic<int> active{0};       // slots the policy may fill: base + the elastic cache's extra ones
     char *arena[4]{};                 // device: w13, w2, s13, s2 slots (xtier shard layout)
     int nodes=0;                      // xtier worker nodes (each holds 1/nodes of every expert's rows)
     const char *shard[16][6]{};       // host (pinned): per worker node, gate, up, gate scales, up scales, down, down scales
@@ -182,6 +185,11 @@ public:
     std::atomic<int> warm_left{0};
     double route_avg=0.;   // routes per pool layer call of decode: the size of a window's counts
     long prompts=0;
+    // Elastic slots (cache/elastic.py): no rounds while paused. round_mu is held by a round and, from
+    // xtier_mailbox_pool_quiesce to _resume, by the scheduler thread that releases slots (same thread both).
+    std::atomic<bool> paused{false};
+    std::timed_mutex round_mu;
+    bool held=false;
     uint32_t next_seq=0;
     std::thread worker;
     uint32_t *posted(){return seqs;}uint32_t *applied(){return seqs+16;}uint32_t *landed(){return seqs+32;}
@@ -269,7 +277,8 @@ public:
             auto *L=layers[l].get();if(!L)continue;
             cand.clear();vict.clear();
             for(int e=0;e<L->E;e++)if(L->slot_of[e]<0&&u[l][e]>=2.f)cand.emplace_back(u[l][e],e);
-            for(int s=0;s<L->S;s++) {
+            const int A=L->active.load(std::memory_order_acquire);
+            for(int s=0;s<A;s++) {
                 if(L->busy[s]&&L->busy[s]>done)continue;   // its copy has not landed yet
                 L->busy[s]=0;
                 vict.emplace_back(L->resident[s]<0?-1.f:u[l][L->resident[s]],s);
@@ -313,6 +322,8 @@ public:
                 cv.wait(lock);
                 if(quit)return;
                 lock.unlock();
+                std::unique_lock<std::timed_mutex> rl(round_mu);
+                if(paused.load(std::memory_order_acquire))continue;
                 try{round();}
                 catch(const std::exception &e){std::fprintf(stderr,"[xtier] XTier cache policy stopped: %s\n",e.what());return;}
             }
@@ -404,8 +415,10 @@ void CUDART_CB execute(void *p) noexcept {
         win_n+=n;win_hit+=hit;win_wall+=wall;win_calls++;
         if(every>0&&b->index==0&&++windows%every==0) {
             auto &pm=pool_manager();
-            std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far, %ld prompts\n",
-                         every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds,pm.prompts);
+            char slots[48]="";
+            for(auto &L:pm.layers)if(L&&L->elastic){std::snprintf(slots,sizeof slots,", +%d of +%d slots",L->active.load()-L->base,L->S-L->base);break;}
+            std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far, %ld prompts%s\n",
+                         every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds,pm.prompts,slots);
             win_n=win_hit=win_wall=win_calls=0;
         }
     }
@@ -536,6 +549,26 @@ void CUDART_CB prompt_counts(void *p) noexcept {   // (a host function: no CUDA 
     try{pool_manager().prompt(c->host,c->layers,c->stride);}catch(...){}
     delete c;
 }
+// ---- elastic expert arenas (XTIER_CACHE_ELASTIC, cache/elastic.py) ------------------------------------------------
+// Device address space reserved for an arena's most slots, physical granules mapped for the slots in use
+// (cuMemAddressReserve / cuMemCreate / cuMemMap, one allocation per granule so any tail can go back). The arena
+// pointers captured in the decode graphs stay valid while slots are released and mapped again; released granules
+// return to the driver, where a prefill's activations take them.
+struct VmmRegion {
+    CUdeviceptr va=0;size_t size=0,gran=0;int device=0;
+    std::vector<CUmemGenericAllocationHandle> handle;   // per granule, 0 = not mapped
+};
+std::mutex vmm_mu;
+std::vector<std::unique_ptr<VmmRegion>> vmm_regions;
+VmmRegion *vmm_find(void *va) {
+    for(auto &r:vmm_regions)if(r->va==reinterpret_cast<CUdeviceptr>(va))return r.get();
+    throw std::runtime_error("Unknown elastic arena");
+}
+CUmemAllocationProp vmm_prop(int device) {
+    CUmemAllocationProp prop{};
+    prop.type=CU_MEM_ALLOCATION_TYPE_PINNED;prop.location.type=CU_MEM_LOCATION_TYPE_DEVICE;prop.location.id=device;
+    return prop;
+}
 }
 extern "C" {
 const char *xtier_mailbox_error(){return error.c_str();}
@@ -620,14 +653,16 @@ int xtier_mailbox_pool_ring(void **pointers) {
         return 0;
     }catch(const std::exception&e){error=e.what();return -1;}
 }
-int xtier_mailbox_pool_attach(void *bridge,int layer,int slots,int experts,void **arena,const int32_t *resident) {
+int xtier_mailbox_pool_attach(void *bridge,int layer,int slots,int active,int experts,void **arena,const int32_t *resident) {
     try {
-        if(!bridge||layer<0||layer>4095||slots<1||experts<1||!arena||!resident)throw std::runtime_error("Invalid pool attach");
+        if(!bridge||layer<0||layer>4095||slots<1||active<1||active>slots||experts<1||!arena||!resident)
+            throw std::runtime_error("Invalid pool attach");
         auto*b=static_cast<Bridge*>(bridge);
         auto L=std::make_unique<PoolLayer>();
         int shape[4];if(xtier_shape(b->plan,shape)<0)throw std::runtime_error(xtier_last_error());
         if(shape[2]!=experts)throw std::runtime_error("Pool attach: expert count mismatch");
         L->bridge=b;L->layer=layer;L->S=slots;L->E=experts;L->H=shape[0];L->I=shape[1];
+        L->active.store(active);L->base=active;L->elastic=active<slots;
         for(int j=0;j<4;j++)L->arena[j]=static_cast<char*>(arena[j]);
         L->nodes=xtier_nodes(b->plan);
         if(L->nodes<1||L->nodes>16)throw std::runtime_error("Pool attach: invalid worker node count");
@@ -698,6 +733,161 @@ int xtier_mailbox_destroy(void *bridge) {
         // Caller must destroy graphs referring to this bridge before close.
         // Synchronize before releasing pinned memory and the retained plan.
         check(cudaDeviceSynchronize());delete static_cast<Bridge*>(bridge);return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// Elastic slots (cache/elastic.py), releasing before a prefill that needs their memory, all on the scheduler thread:
+// pause (no new rounds); quiesce until 0 (1: a round still runs, 2: copies in flight; the caller runs a commit kernel
+// on its stream, synchronizes and asks again; a round waits for that commit); shrink to `extra` slots over each
+// layer's base (evictions of the experts in the slots above, without an upload: landed at once; the caller's next
+// commit kernel takes them out of the table, then the granules can go); resume. Growing only raises the usable count
+// over mapped granules: the new slots are empty and the policy fills them like any victim.
+int xtier_mailbox_pool_pause(int on) {
+    pool_manager().paused.store(on!=0,std::memory_order_release);return 0;
+}
+int xtier_mailbox_pool_quiesce(int timeout_ms) {
+    try {
+        auto &m=pool_manager();
+        if(!m.held) {
+            if(!m.round_mu.try_lock_for(std::chrono::milliseconds(timeout_ms)))return 1;
+            m.held=true;
+        }
+        if(!m.ring)return 0;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(timeout_ms);
+        while(int32_t(__atomic_load_n(m.applied(),__ATOMIC_ACQUIRE)-m.next_seq)<0||
+              int32_t(__atomic_load_n(m.landed(),__ATOMIC_ACQUIRE)-m.next_seq)<0) {
+            if(std::chrono::steady_clock::now()>deadline)return 2;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+int xtier_mailbox_pool_shrink(int extra) {
+    try {
+        auto &m=pool_manager();
+        if(!m.held)throw std::runtime_error("Pool shrink without quiesce");
+        std::lock_guard<std::mutex> lock(m.mu);
+        uint32_t last=0;size_t n=0;
+        for(auto &L:m.layers) {
+            if(!L||!L->elastic)continue;
+            const int A=L->active.load(),keep=std::min(A,L->base+std::max(0,extra));
+            for(int s=keep;s<A;s++)if(L->resident[s]>=0)n++;
+        }
+        if(n>POOL_RING/2)throw std::runtime_error("Pool shrink: too many evictions for the command ring");
+        for(auto &L:m.layers) {
+            if(!L||!L->elastic)continue;
+            const int A=L->active.load(),keep=std::min(A,L->base+std::max(0,extra));
+            for(int s=keep;s<A;s++) {
+                const int out=L->resident[s];
+                if(out<0)continue;
+                const uint32_t seq=++m.next_seq;
+                m.ring[seq%POOL_RING]=PoolCmd{L->layer,-1,out,s};
+                L->slot_of[out]=-1;L->resident[s]=-1;L->busy[s]=seq;last=seq;
+            }
+            L->active.store(keep,std::memory_order_release);
+        }
+        if(last) {
+            __atomic_store_n(m.posted(),last,__ATOMIC_RELEASE);
+            if(m.copy)driver(cuStreamWriteValue32(reinterpret_cast<CUstream>(m.copy),m.dev_seqs+32*4,last,0));
+            else __atomic_store_n(m.landed(),last,__ATOMIC_RELEASE);
+        }
+        return int(n);
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+int xtier_mailbox_pool_resume() {
+    auto &m=pool_manager();
+    m.paused.store(false,std::memory_order_release);
+    if(m.held){m.held=false;m.round_mu.unlock();}
+    return 0;
+}
+int xtier_mailbox_pool_grow(int extra) {
+    try {
+        auto &m=pool_manager();std::lock_guard<std::mutex> lock(m.mu);
+        for(auto &L:m.layers) {
+            if(!L||!L->elastic)continue;
+            const int t=std::min(L->S,L->base+std::max(0,extra));
+            if(t>L->active.load())L->active.store(t,std::memory_order_release);
+        }
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// extra slots of the first elastic layer (all move together), -1 without one
+int xtier_mailbox_pool_active() {
+    auto &m=pool_manager();
+    for(auto &L:m.layers)if(L&&L->elastic)return L->active.load()-L->base;
+    return -1;
+}
+// mapping granularity of the current device (0 on error)
+size_t xtier_mailbox_vmm_granularity() {
+    try {
+        check(cudaFree(nullptr));
+        int device=0;check(cudaGetDevice(&device));
+        auto prop=vmm_prop(device);size_t gran=0;
+        driver(cuMemGetAllocationGranularity(&gran,&prop,CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        return gran;
+    }catch(const std::exception&e){error=e.what();return 0;}
+}
+// address space of `bytes` (rounded up to the granularity) for an elastic arena; nothing mapped yet
+int xtier_mailbox_vmm_reserve(size_t bytes,void **va,size_t *granularity) {
+    try {
+        if(!bytes||!va)throw std::runtime_error("Invalid elastic reserve");
+        check(cudaFree(nullptr));   // the runtime's primary context is current on this thread
+        int device=0;check(cudaGetDevice(&device));
+        auto prop=vmm_prop(device);size_t gran=0;
+        driver(cuMemGetAllocationGranularity(&gran,&prop,CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        auto r=std::make_unique<VmmRegion>();
+        r->gran=gran;r->size=(bytes+gran-1)/gran*gran;r->device=device;
+        driver(cuMemAddressReserve(&r->va,r->size,gran,0,0));
+        r->handle.assign(r->size/gran,0);
+        *va=reinterpret_cast<void*>(r->va);if(granularity)*granularity=gran;
+        std::lock_guard<std::mutex> lock(vmm_mu);vmm_regions.push_back(std::move(r));
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// physical granules over [offset, offset + bytes) of a reserved arena (those already mapped stay)
+int xtier_mailbox_vmm_map(void *va,size_t offset,size_t bytes) {
+    try {
+        std::lock_guard<std::mutex> lock(vmm_mu);
+        auto *r=vmm_find(va);
+        check(cudaSetDevice(r->device));   // its primary context current on this thread (a background one too)
+        if(offset>r->size||bytes>r->size-offset)throw std::runtime_error("Elastic map out of range");
+        auto prop=vmm_prop(r->device);
+        CUmemAccessDesc access{};access.location=prop.location;access.flags=CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        for(size_t g=offset/r->gran;g<(offset+bytes+r->gran-1)/r->gran;g++) {
+            if(r->handle[g])continue;
+            CUmemGenericAllocationHandle h=0;
+            driver(cuMemCreate(&h,r->gran,&prop,0));
+            const CUdeviceptr at=r->va+g*r->gran;
+            CUresult rc=cuMemMap(at,r->gran,0,h,0);
+            if(rc!=CUDA_SUCCESS){cuMemRelease(h);driver(rc);}
+            rc=cuMemSetAccess(at,r->gran,&access,1);
+            if(rc!=CUDA_SUCCESS){cuMemUnmap(at,r->gran);cuMemRelease(h);driver(rc);}
+            r->handle[g]=h;
+        }
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// release the granules wholly at or above `offset` (the one holding offset stays: it holds lower slots too)
+int xtier_mailbox_vmm_unmap(void *va,size_t offset) {
+    try {
+        std::lock_guard<std::mutex> lock(vmm_mu);
+        auto *r=vmm_find(va);
+        check(cudaSetDevice(r->device));
+        for(size_t g=(offset+r->gran-1)/r->gran;g<r->handle.size();g++) {
+            if(!r->handle[g])continue;
+            driver(cuMemUnmap(r->va+g*r->gran,r->gran));
+            driver(cuMemRelease(r->handle[g]));
+            r->handle[g]=0;
+        }
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// mapped bytes of an elastic arena
+long long xtier_mailbox_vmm_mapped(void *va) {
+    try {
+        std::lock_guard<std::mutex> lock(vmm_mu);
+        auto *r=vmm_find(va);
+        long long n=0;for(auto h:r->handle)if(h)n++;
+        return n*(long long)r->gran;
     }catch(const std::exception&e){error=e.what();return -1;}
 }
 }

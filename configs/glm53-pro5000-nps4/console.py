@@ -4,7 +4,7 @@ README "+ 加速包" row: 60 hot slots, FP8 attention / dense weights, 16K chunk
 
 from pathlib import Path
 
-from xtier.console.core import common_options
+from xtier.console.core import common_options, elastic_option
 
 HERE = Path(__file__).resolve().parent
 GLM_REF = '/data/fast/workspaces/gh-ref/lsglang_glm5.3'   # production's adaptive draft steps and draft token map
@@ -26,6 +26,7 @@ MODEL = {
         {'key': 'slots', 'label': '热专家槽 / 层', 'default': '60', 'choices': [['60', '60 · 实测'], ['55', '55']],
          'off_when': [{'packs': 'off'}]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '16384', 'choices': [['16384', '16K'], ['8192', '8K']]},
+        elastic_option('on', 'decode 时多 11–13 槽 / 层（prefill 余量 6–7 GiB），agent 每步 −1.8%（10-26）'),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：BF16 权重、55 槽、不开拒绝采样'}],
 }
@@ -38,6 +39,8 @@ def build(o, port):
     env = {'XTIER_THREADS': o['threads'], 'PORT': str(port), 'XTIER_CACHE_SLOTS': slots, 'MAX_TOTAL_TOKENS': ctx}
     if base:
         env['XTIER_FP8_WEIGHTS'] = '0'
+    elif o['elastic'] == 'on':
+        env['XTIER_CACHE_ELASTIC'] = '1'
     args = ['--context-length', ctx, '--chunked-prefill-size', o['chunk'], '--mamba-ssm-dtype', 'bfloat16',
             '--mem-fraction-static', '0.92', '--max-mamba-cache-size', '10', '--cuda-graph-max-bs-decode', '2',
             '--dsa-decode-backend', 'tilelang', '--dsa-prefill-backend', 'tilelang', '--kv-cache-dtype', 'fp8_e4m3']
@@ -54,4 +57,6 @@ def build(o, port):
 
 def tags(o):
     """Extra parts of the server's label."""
-    return ['拒绝采样'] if o['packs'] == 'on' and o['spec'] == 'on' and o['rs'] == 'on' else []
+    on = o['packs'] == 'on'
+    return (['拒绝采样'] if on and o['spec'] == 'on' and o['rs'] == 'on' else []) + (
+        ['弹性热专家'] if on and o['elastic'] == 'on' else [])

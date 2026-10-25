@@ -62,10 +62,14 @@ env, argv = console.build('qwen38', {**console.defaults('qwen38'), 'kv': 'fp8', 
 assert argv[argv.index('--chunked-prefill-size') + 1] == '24576' and ',27' not in env['XTIER_CACHE_FULL']
 env, argv = console.build('glm53', console.defaults('glm53'))
 assert '--speculative-use-rejection-sampling' in argv and env['XTIER_CACHE_SLOTS'] == '60'
+assert env['XTIER_CACHE_ELASTIC'] == '1'
 env, argv = console.build('glm53', {**console.defaults('glm53'), 'packs': 'off'})
 assert '--speculative-use-rejection-sampling' not in argv and env['XTIER_FP8_WEIGHTS'] == '0'
+assert 'XTIER_CACHE_ELASTIC' not in env
 env, argv = console.build('ds41', console.defaults('ds41'))
 assert env['DSPARK'] == '1' and env['BATCH'] == '22528' and env['XTIER_ENGRAM_CACHE_GIB'] == '4'
+assert env['XTIER_CACHE_ELASTIC'] == '1' and env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '68'
+assert 'XTIER_CACHE_ELASTIC' not in console.build('ds41', {**console.defaults('ds41'), 'packs': 'off'})[0]
 
 # the page
 data = {**console.console_data(), 'status': console.status()}

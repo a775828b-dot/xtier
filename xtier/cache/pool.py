@@ -22,6 +22,9 @@ that unpublishes replaced experts at once and publishes new ones once their copy
 Prompt warm-up (XTIER_CACHE_PROMPT=1, default off; record_prompt): the decode windows alone leave a new request with
 the previous one's experts for its first tens of windows; the prefill's routes, counted on the GPU, reach the policy
 once per prompt and start a few large rounds at the first decode window.
+Elastic slots (XTIER_CACHE_ELASTIC=1, default off; cache/elastic.py): a partly cached layer reserves address space for
+S slots and maps `base` of them for good; the memory a prefill needs only while it runs backs the others (`active`
+usable) between prefills.
 
 Numerics: GPU routes are W4A16 (hardware FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
 CPU routes unchanged. Without cached experts the result equals the plain mailbox path except for the FP32 addition of
@@ -110,7 +113,8 @@ def _commit(RING_P, SEQS, STATE, TABLE, OWNER, E, NR: tl.constexpr):
         layer = tl.load(RING_P + i, volatile=True)
         ein = tl.load(RING_P + i + 1, volatile=True)
         slot = tl.load(RING_P + i + 3, volatile=True)
-        tl.store(TABLE + layer * E + ein, slot)
+        if ein >= 0:   # -1: a slot the elastic cache released (cache/elastic.py), nothing to publish
+            tl.store(TABLE + layer * E + ein, slot)
         tl.store(OWNER + layer * E + slot, ein)
     tl.store(STATE + 1, upto)
     for s in range(done + 1, posted + 1):
@@ -284,8 +288,17 @@ class LayerPool:
             raise ValueError(f'xtier cache: unsupported shape H={H} I={I}')
         dev = torch.device('cuda', torch.cuda.current_device())
         # same per-expert shapes as the prefill staging slots: w13, w2, s13, s2 (bytes, unchanged)
-        self.arena = [torch.empty((self.S,) + tuple(s[1:]), dtype=torch.uint8, device=dev)
-                      for s in prefill.shapes[:4]]
+        from xtier.cache import elastic
+        self.base, top = elastic.layout(self.S, E) if not self.full else (self.S, self.S)
+        if top > self.base:   # address space for `top` slots, `base` mapped (the rest backs extra ones between prefills)
+            self.base = elastic.fit_base(mailbox.lib, self.base, [tuple(s[1:]) for s in prefill.shapes[:4]])
+            self.S = top
+            self.arena = [elastic.arena(mailbox.lib, self.S, tuple(s[1:]), self.base, dev) for s in prefill.shapes[:4]]
+        else:
+            self.S = self.base
+            self.arena = [torch.empty((self.S,) + tuple(s[1:]), dtype=torch.uint8, device=dev)
+                          for s in prefill.shapes[:4]]
+        self.active = self.base
         if self.full:   # never swapped: a private table, filled in expert order (slot e = expert e)
             self.index = None
             self.table = torch.full((E,), -1, dtype=torch.int32, device=dev)
@@ -318,12 +331,12 @@ class LayerPool:
         LayerPool.layers.append(self)
 
     def bytes(self):
-        return sum(a.numel() for a in self.arena)
+        return sum(a[:self.active].numel() for a in self.arena)
 
     def fill(self, experts, stream):
         """Upload `experts` into slots 0.. (copy engine, from the pinned NUMA shards) and publish them.
         Call outside graph capture, with no decode in flight (startup)."""
-        experts = list(range(self.E)) if self.full else [e for e in experts if 0 <= e < self.E][:self.S]
+        experts = list(range(self.E)) if self.full else [e for e in experts if 0 <= e < self.E][:self.active]
         upload = type(self.prefill)._upload_chunk   # from host memory (a fully cached layer's prefill reads the slots)
         with torch.cuda.stream(stream):
             if self.full:
@@ -400,6 +413,18 @@ class LayerPool:
                                                    m * self.H, BLOCK)
 
 
+def started():
+    """The adaptive policy runs (its swaps fill the elastic slots)."""
+    return bool(_glob.get('started'))
+
+
+def commit_now():
+    """The commit kernel on the current stream, outside a decode window (cache/elastic.py before releasing slots)."""
+    E = _glob['E']
+    _commit[(1,)](Pointer(_glob['ring'], torch.int32), Pointer(_glob['seqs'], torch.int32), _glob['state'],
+                  _glob['table'], _glob['owner'], E, RING)
+
+
 def maybe_start():
     """At any MoE call outside capture: start the adaptive policy once the decode graphs have been captured, so its
     copies never overlap a capture."""
@@ -464,10 +489,14 @@ def fill_all():
         for pool in partial:
             arena = (C.c_void_p * 4)(*[a.data_ptr() for a in pool.arena])
             res = (C.c_int32 * pool.S)(*pool.resident)
-            if lib.xtier_mailbox_pool_attach(pool.mailbox.bridge, pool.index, pool.S, pool.E,
+            if lib.xtier_mailbox_pool_attach(pool.mailbox.bridge, pool.index, pool.S, pool.active, pool.E,
                                              C.cast(arena, C.c_void_p), C.cast(res, C.c_void_p)) < 0:
                 raise RuntimeError(pool.mailbox.error())
         _glob['adapt'] = (lib, every, budget, decay, gain)
+        stretch = [p for p in partial if p.S > p.base]
+        if stretch:
+            from xtier.cache import elastic
+            elastic.register(stretch, lib, commit_now)
         if os.environ.get('XTIER_CACHE_PROMPT', '0') == '1':
             keep = float(os.environ.get('XTIER_CACHE_PROMPT_KEEP', '0.7'))
             windows = float(os.environ.get('XTIER_CACHE_PROMPT_WINDOWS', '10'))

@@ -3,7 +3,7 @@ README "+ 加速包" row: 50 hot slots per layer, Engram rows on NVMe with a 4 G
 
 from pathlib import Path
 
-from xtier.console.core import common_options
+from xtier.console.core import common_options, elastic_option
 
 HERE = Path(__file__).resolve().parent
 
@@ -19,6 +19,7 @@ MODEL = {
     'options': common_options('DSpark') + [
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
          'choices': [['4', '4 GiB · 实测'], ['8', '8 GiB'], ['16', '16 GiB']]},
+        elastic_option('on', 'decode 时多 13–15 槽 / 层（至多 68），agent 每步 −4%（10-26）；超过约 66 槽 GPU 一侧成瓶颈'),
         {'key': 'slots', 'label': '热专家槽 / 层', 'default': '50',
          'choices': [['50', '50 · 实测'], ['47', '47'], ['43', '43']]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '22528',
@@ -36,4 +37,11 @@ def build(o, port):
     if o['packs'] == 'off':   # README "官方 main": Triton block FP8 without tuned configs, no prefetch / FP8 draft head
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
                    XTIER_DRAFT_LMHEAD_FP8='0')
+    elif o['elastic'] == 'on':   # past ~66 slots the GPU side of a layer is the slower one (planner, 10-26)
+        env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68')
     return env, [str(HERE / 'run-ds-xtier.sh')]
+
+
+def tags(o):
+    """Extra parts of the server's label."""
+    return ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []

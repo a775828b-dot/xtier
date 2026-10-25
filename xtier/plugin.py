@@ -38,6 +38,9 @@ def install() -> None:
     from xtier.backend import hooks
 
     hooks.install(HookRegistry, HookType)
+    from xtier.cache import elastic
+    if elastic.install(HookRegistry, HookType):
+        logger.info('xtier: elastic expert cache on (XTIER_CACHE_ELASTIC=1)')
     names = packs.install(HookRegistry, HookType)
     fixes = platform.install(HookRegistry, HookType)
     _installed.append(True)
