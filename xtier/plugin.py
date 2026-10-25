@@ -4,7 +4,8 @@ SGLang calls ``load()`` early in every process and then applies the hooks regist
 ``sglang.srt.plugins.hook_registry.HookRegistry``. XTier registers its model hooks only in scheduler processes (the
 ones that build models: importing the hook targets elsewhere would only cost startup time); ``install()`` does it
 unconditionally, for tools that build a ModelRunner in their own process. The other processes, the one that serves
-the API among them, get the few hooks on how prompts are tokenized (``install_serving()``). SGLang logs and swallows exceptions raised
+the API among them, get the few hooks on how prompts are tokenized and the host fixes of serving
+(``install_serving()``). SGLang logs and swallows exceptions raised
 here, so the backend checks after every model load that it took over (``xtier.backend.hooks.check``).
 """
 
@@ -49,12 +50,13 @@ def install_serving() -> None:
         return
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    from xtier import packs
+    from xtier import packs, platform
 
     names = packs.install_serving(HookRegistry, HookType)
+    fixes = platform.install_serving(HookRegistry, HookType)
     _serving.append(True)
-    if names:
-        logger.info('xtier %s: serving hooks of packs %s registered (pid %d)', __version__, names, os.getpid())
+    logger.info('xtier %s: serving hooks of packs %s and host fixes %s registered (pid %d)', __version__, names,
+                fixes, os.getpid())
 
 
 def load() -> None:

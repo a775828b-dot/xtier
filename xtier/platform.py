@@ -28,6 +28,10 @@
   swap). From 256 rows the 128 x 128 tile (tactic 4) is 1.1-5.7x faster on the RTX PRO 5000 (MiniMax-M3.1's
   8192 -> 6144 projection at 16384 rows: 20.5 -> 4.0 ms) with the same output bit for bit (every tile blocks K by
   128); a miss from 256 rows takes it. Tuned shapes, tuning runs and pinned calls (SGLang's skip_ops) are left alone.
+- GC freeze after start (the process that serves the API, ``install_serving``): with ``--skip-server-warmup`` SGLang's
+  warm-up thread posts /freeze_gc at once, before uvicorn has bound the port, so the request is refused (a warning
+  with a traceback in every start) and no process freezes its startup objects. XTier waits until the port accepts
+  connections (``XTIER_FREEZE_GC_WAIT_S``, 120 s at most), then lets SGLang post it.
 """
 
 import ctypes
@@ -41,6 +45,7 @@ TILELANG_TARGET = 'tilelang.backend.target.auto_detect_target'
 DROP_FILE_CACHE = 'sglang.srt.model_loader.weight_utils._drop_file_cache_after_load'
 TOKEN_SYNC = 'sglang.srt.layers.sampler.Sampler._sync_token_ids_across_tp'
 MXFP8_TUNER = 'flashinfer.autotuner.autotuner.AutoTuner.choose_one'
+FREEZE_GC = 'sglang.srt.entrypoints.http_server._freeze_gc_after_server_warmup'
 MXFP8_LARGE_TILE, MXFP8_LARGE_ROWS = 4, 256   # SM120 CUTLASS MXFP8: tactic 4 = 128 x 128 x 128, no A/B swap
 _MADV_PAGEOUT = 21
 READ_AHEAD_FILES, READ_AHEAD_MAX = 2, 16 << 30
@@ -165,6 +170,33 @@ def _choose_one(original, self, custom_op, runners, tuning_config, inputs, *args
                                    len(runner.get_valid_tactics(inputs, None)))):
         return runner, MXFP8_LARGE_TILE
     return runner, tactic
+
+
+def _freeze_gc_when_listening(original, server_args, *args, **kwargs):
+    """In the warm-up thread: wait until the HTTP server accepts connections, then SGLang's POST /freeze_gc."""
+    import socket
+    import time
+    from urllib.parse import urlsplit
+    try:
+        url = urlsplit(server_args.url())
+        address = (url.hostname, url.port or (443 if url.scheme == 'https' else 80)) if url.hostname else None
+    except Exception:   # an address SGLang builds differently: post as it would
+        address = None
+    if address is not None:
+        deadline = time.monotonic() + float(os.environ.get('XTIER_FREEZE_GC_WAIT_S', '120'))
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(address, timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+    return original(server_args, *args, **kwargs)
+
+
+def install_serving(registry, hook_type) -> list[str]:
+    """Fixes of the process that serves the API."""
+    registry.register(FREEZE_GC, _freeze_gc_when_listening, hook_type.AROUND)
+    return ['freeze-gc-after-listen']
 
 
 def install(registry, hook_type) -> list[str]:
