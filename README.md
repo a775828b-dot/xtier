@@ -199,61 +199,28 @@ SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K �
 
 ## 版本更新
 
-- 2026-10-24（晚）：自动规划器第一版（PLAN 第 3 步）：`tools/plan_probe.py` 按层形状用合成权重在本机测 GPU / CPU 每专家
-  耗时（CPU 另按 token-专家对计）和上传带宽，`xtier/planner/cost.py` 按"每层 GPU 和 CPU 同时算、慢的一边决定时间"估 decode，
-  `auto.py` 在显存预算内逐层定热专家槽数（不让 decode 变慢时多放全常驻层），可离线出方案或启动时算（`XTIER_CACHE_PLAN=auto`）；
-  `tools/plan_trace.py` 从路由记录生成档案，`tools/plan_calibrate.py` 校准。Qwen3.8 启动时自动规划（`LAYOUT=auto`，可选，同显存）：29 层全常驻 + 18 层 64–88 槽（手工 26 + 22 × 155），
-  agent 冷 prefill 各会话 +2.4–2.9%、decode 持平；GLM、DeepSeek、MiniMax 各层偏斜接近，同显存下均匀分槽已是最优附近（保留手工布局）。
-  用法见 [docs/planner.md](docs/planner.md)，
-  详见 [reports/2026-10-24-planner.md](docs/reports/2026-10-24-planner.md)。
-- 2026-10-24（下午）：MiniMax 固定 512K 上下文，KV 改存 NVFP4，用的是 SGLang 给 SM100 的 MSA-v1 池：decode 用在寄存器里解码的
-  Triton 内核读；prefill 先反量化成 BF16 临时区，再走官方内核；写入用官方的融合内核（在 SM120 上验证逐字节一致后打开）。512K 的
-  KV 从 42.5 GiB 降到 24 GiB，热专家 8 槽，480K 找数 5/5。DSpark 按置信度截断验证：草稿生存概率低于 0.3 的位置之后判拒绝并跳过
-  CPU 专家，无损，照抄 0 错，agent decode +11%。与之前的 128K FP8 / 16 槽相比，冷 prefill −3%，每步持平（55.4 对 56.2 ms），
-  tok/s −7%。`bench/ppl_eval.py` 加了 `--prefix`。详见 [reports/2026-10-24-minimax-512k.md](docs/reports/2026-10-24-minimax-512k.md)。
-- 2026-10-24（上午，二）：平台修正：SM120 上 MXFP8 GEMM 在 prefill 大小（≥ 256 行）用 128×128 tile（SGLang 只按 decode 的形状
-  调优，prefill 退回 128×32；输出逐位相同）：MiniMax 64K 冷 prefill 1,606 → 1,963 tok/s，decode 不变，照抄 0 错。详见
-  [reports/2026-10-24-ds-woa-minimax.md](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 2026-10-24（上午）：新模型 MiniMax-M3.1-Flash（SGLang 的 M3.1 分支 PR #45925，单独的 venv）：`xtier/packs/minimax_m3` 修了 PR 在
-  SM120 上的四处问题（参数解析选了 SM100 的原生栈、原生栈判定、专家 scheme、CUDA 上没有 DSpark verify），CPU 引擎和 GPU 内核加
-  GPT-OSS SwiGLU；加速包：草稿长度 5、热专家换入照 DeepSeek 的节奏、草稿词表头 FP8，agent 长回复每步 70.6 → 59.5 ms，照抄 0 错；
-  启动台加 MiniMax 卡片，经 WebUI → 8000 用本机 dsh 跑真实编码任务 2.9 分钟做完、7 个测试全过。DeepSeek 的索引器 decode 在 SM120 上
-  走官方给 SM90 的分页路径（索引器内核每步 1.08 → 0.33 ms），agent 长回复每步 33.0 → 32.5 ms（生产 32.0），照抄 0 错。详见 [reports/2026-10-24-ds-woa-minimax.md](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 2026-10-24（清晨）：DeepSeek 加速包把注意力的 wo_a 存成检查点的 FP8、decode 走 Triton 分组 einsum（官方 main 把 32 × 32 块的 wo_a
-  反量化成 BF16，cuBLAS 在 SM120 上用 SM80 的 WMMA 内核）：agent 长回复每步 33.9 → 33.0 ms（生产 32.0），照抄 0 错，显存 −1.25 GiB；
-  DeepSeek 的提示按 deepseek-recipe 分词（消息内容里的控制 token 拼写不再变成控制 token，568K 的对话分词 1.3 → 0.18 s）。Qwen、GLM 改列
-  agent 速度（XTier 与生产各两轮），README 不再放文本速度。修了 TP 1 时带语法约束的请求让 NCCL 现申请 512 MB 显存（GLM 的第一个工具
-  请求在 64K prefill 之后 OOM）。仓库加 agent_bench 副本（生产那份加非法 JSON 工具参数的处理）。本机 dsh 经 8000 对三个模型各跑了一个
-  真实编码任务，都做完并自测通过。详见 [reports/2026-10-24-ds-woa-minimax.md](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 2026-10-24（夜）：README 加启动台介绍；测速分成 agent 速度和文本速度，以后统一用 agent 速度：DeepSeek 改列 agent 速度（与生产
-  同一套 agent_bench，每会话明细见 [reports/2026-10-24-qwen-kv-ds-agent.md](docs/reports/2026-10-24-qwen-kv-ds-agent.md)），Qwen、GLM
-  暂为文本速度。启动参数补上生产的接口参数：三个模型 `--enable-cache-report`，GLM、Qwen 的工具调用解析器（`glm47`、`qwen3_coder`）；
-  按 dsh 的请求（流式 chat completions）实测三个模型：缓存命中正常上报，工具调用正常解析。
-- 2026-10-24：控制台 `xtier/console/`（`python3 -m xtier.console`）：一个网页管所有模型——选模型、调启动参数（默认是实测配置）、
-  启动 / 停止，跟踪加载阶段与 decode 遥测；每个模型在 `configs/*/console.py` 里描述，加模型只要加一个配置目录。
-  见 [docs/console.md](docs/console.md)。
-- 2026-10-24：Qwen 默认改为 NVFP4 KV（与生产同参），省下的 1.8 GB 显存实测三种用法：多放一层常驻（冷 prefill 64K +1.4%、
-  512K +0.5%）、加热专家槽（无效）、32K 分块（64K 慢 3%），decode 都不变（受 GPU 限制），采用第一种；DeepSeek 按生产的 agent_bench 实测：冷 prefill 快 10–25%，decode 每步慢约 6%（CPU 专家侧不慢，差在 GPU 侧）。
-  详见 [reports/2026-10-24-qwen-kv-ds-agent.md](docs/reports/2026-10-24-qwen-kv-ds-agent.md)。
-- 2026-10-23（夜）：通用投机解码包 `xtier/packs/speculative/`：GLM 用上生产的热词表无损拒绝采样、草稿温度 ×0.8 和按草稿置信度
-  截断验证（截掉的验证 token 跳过 CPU 专家，核心加了逐 token 标志），生产的温度 1.0 测法 93.0 → 95.6 tok/s（生产 84.8），README 测法
-  64K / 512K decode 94.7 → 100.0、86.7 → 91.9 tok/s，照抄 0 错；三个加速包按当前代码重测；
-  Qwen 的 QSA 能读 NVFP4 KV（与官方反量化逐位一致，显存多 1.7 GB），测速表仍用 FP8；DeepSeek 剩余差距排查：热专家命中率、CPU
-  每层耗时与生产持平，差别来自测法不同。详见 [reports/2026-10-23-speculative-fp4kv.md](docs/reports/2026-10-23-speculative-fp4kv.md)。
-- 2026-10-23（晚）：512K prefill 追平生产。Qwen：QSA 索引器 prefill 的 logits 内核在长上下文时只开 11 个 CTA，加速包按键分段（逐位一致），
-  PLE 层分段、分块 16K → 24K，512K 冷 prefill 125 → 102 s（生产 106 s）；GLM：启动参数对齐生产（16K 分块、BF16 SSM 状态），
-  224 → 192 s（生产 201 s）。两者 PPL、照抄不变，详见 [reports/2026-10-23-prefill.md](docs/reports/2026-10-23-prefill.md)。
-- 2026-10-23（晚）：DeepSeek 加速包移植生产的 Engram 提前查表和草稿词表头 FP8：decode 每步 −8%（64K 33.7 ms、512K 35.0 ms，
-  生产约 31.5 ms）；冷提示的 prefill 持平，Engram 行缓存热时 64K prefill +16%；照抄 0 错、PPL 持平，详见
-  [reports/2026-10-23-ds-engram-prefetch.md](docs/reports/2026-10-23-ds-engram-prefetch.md)。
-- 2026-10-23：README 测速表（三个模型 64K / 512K 上下文的 prefill 与 decode，官方 main 对加速包）；加载不再换出（专家按检查点顺序
-  拷贝、映射着的检查点页 page-out、提前读），DS 启动 811 → 409 s；全局预算的热专家规划器（只做了离线核对），详见
-  [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md)。
-- 2026-10-23：第 3 步——DeepSeek V4.1 1017 上官方 main（Engram 行放 NVMe）、通用 NVMe 表（Qwen PLE 也可放）、GLM 的 FP8
-  权重、Zen2 / 双卡准备，详见 [reports/2026-10-23-step3-ds-tables.md](docs/reports/2026-10-23-step3-ds-tables.md)。
-- 2026-10-23：第 2 步——后端、热专家缓存、GPU prefill 在官方 main 上跑通 Qwen3.8 与 GLM-5.3，详见
-  [reports/2026-10-23-step2-qwen.md](docs/reports/2026-10-23-step2-qwen.md)。
-- 2026-10-23：第 1 步——CPU 引擎迁入 `csrc/`，三个模型的真实层与 lkqmoe 0.5.6 逐位一致（`bench/results/engine-ab-20261023.json`）。
+- 2026-10-25：测速表改为官方 main 对加速包；Qwen 启动台默认用自动规划布局；热专家池可选用提示的路由预热（`XTIER_CACHE_PROMPT=1`，
+  默认关）；修了 MiniMax 包钩子和 GC 冻结两个启动报错。详见[文档](docs/reports/2026-10-25-prompt-warmup.md)。
+- 2026-10-24（晚）：自动规划器第一版：本机测出各层 GPU / CPU 耗时，在显存预算内逐层定热专家槽数（`XTIER_CACHE_PLAN=auto`）；
+  Qwen 启动时自动布局冷 prefill +2.4–2.9%，其余模型保留手工布局。详见[文档](docs/reports/2026-10-24-planner.md)。
+- 2026-10-24（下午）：MiniMax 固定 512K、KV 存 NVFP4（42.5 → 24 GiB），DSpark 按置信度截断验证（无损，agent decode +11%）。详见[文档](docs/reports/2026-10-24-minimax-512k.md)。
+- 2026-10-24（上午，二）：SM120 上 prefill 大小的 MXFP8 GEMM 改用 128×128 tile（输出逐位相同），MiniMax 64K 冷 prefill
+  1,606 → 1,963 tok/s。详见[文档](docs/reports/2026-10-24-ds-woa-minimax.md)。
+- 2026-10-24（上午）：新模型 MiniMax-M3.1-Flash（SGLang M3.1 分支），加速包 agent 每步 70.6 → 59.5 ms；DeepSeek 索引器 decode
+  走分页路径，每步 33.0 → 32.5 ms。详见[文档](docs/reports/2026-10-24-ds-woa-minimax.md)。
+- 2026-10-24（清晨）：DeepSeek 的 wo_a 保持 FP8（每步 33.9 → 33.0 ms，显存 −1.25 GiB），提示按 deepseek-recipe 分词；修了 TP 1
+  下 NCCL 临时申请显存导致的 OOM。详见[文档](docs/reports/2026-10-24-ds-woa-minimax.md)。
+- 2026-10-24（夜）：测速统一用 agent 速度；启动参数补上生产的接口参数（缓存命中上报、工具调用解析）。详见[文档](docs/reports/2026-10-24-qwen-kv-ds-agent.md)。
+- 2026-10-24：控制台 `xtier/console/`：一个网页选模型、调参数、启动 / 停止，加模型只需加配置目录。详见[文档](docs/console.md)。
+- 2026-10-24：Qwen 默认 NVFP4 KV，省下的显存多放一层常驻（冷 prefill +0.5–1.4%）；DeepSeek 按生产 agent_bench 实测冷 prefill 快
+  10–25%。详见[文档](docs/reports/2026-10-24-qwen-kv-ds-agent.md)。
+- 2026-10-23（夜）：通用投机解码包：GLM 用热词表拒绝采样和置信度截断，decode 93.0 → 95.6 tok/s（生产 84.8）。详见[文档](docs/reports/2026-10-23-speculative-fp4kv.md)。
+- 2026-10-23（晚）：512K prefill 追平生产：Qwen 125 → 102 s（生产 106 s），GLM 224 → 192 s（生产 201 s）。详见[文档](docs/reports/2026-10-23-prefill.md)。
+- 2026-10-23（晚）：DeepSeek 移植 Engram 提前查表和草稿词表头 FP8，decode 每步 −8%。详见[文档](docs/reports/2026-10-23-ds-engram-prefetch.md)。
+- 2026-10-23：README 测速表；加载不再换出，DeepSeek 启动 811 → 409 s。详见[文档](docs/reports/2026-10-23-step3-ds-tables.md)。
+- 2026-10-23：第 3 步：DeepSeek 跑通官方 main，通用 NVMe 表，GLM 的 FP8 权重，双卡准备。详见[文档](docs/reports/2026-10-23-step3-ds-tables.md)。
+- 2026-10-23：第 2 步：后端、热专家缓存、GPU prefill 在官方 main 上跑通 Qwen 与 GLM。详见[文档](docs/reports/2026-10-23-step2-qwen.md)。
+- 2026-10-23：第 1 步：CPU 引擎迁入 `csrc/`，三个模型的真实层与 lkqmoe 0.5.6 逐位一致（`bench/results/engine-ab-20261023.json`）。
 
 ## 许可
 
