@@ -59,10 +59,16 @@ def sm120():
 @functools.lru_cache
 def m31_branch():
     """SGLang's MiniMax M3.1 branch (PR #45925) is installed: its NVFP4 MoE scheme module is there. By file, without
-    importing SGLang (hooks are installed while it starts)."""
-    spec = importlib.util.find_spec('sglang')
+    importing SGLang's modules (hooks are installed while it starts). Found through ``sglang.srt``: started from a
+    directory that holds an SGLang checkout (``python -m`` puts the working directory first on sys.path), ``sglang``
+    itself is a namespace package of that checkout's top directory, while its modules come from the installed SGLang
+    (an editable install's finder)."""
+    try:
+        spec = importlib.util.find_spec('sglang.srt')
+    except (ImportError, ValueError):
+        return False
     roots = list(spec.submodule_search_locations or []) if spec else []
-    return any(os.path.exists(os.path.join(r, 'srt', 'layers', 'quantization', 'minimax_m3_nvfp4.py')) for r in roots)
+    return any(os.path.exists(os.path.join(r, 'layers', 'quantization', 'minimax_m3_nvfp4.py')) for r in roots)
 
 
 def kv_fp4_enabled():
