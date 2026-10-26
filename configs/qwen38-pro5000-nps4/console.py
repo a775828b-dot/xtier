@@ -39,7 +39,8 @@ MODEL = {
          'off_when': [{'packs': 'off'}, {'kv': 'fp8'}]},
         elastic_option('off', 'Qwen 的 decode 受 GPU 限制，多放热专家会使 decode 变慢约 10%（10-26 实测），默认关'),
         {'key': 'ple', 'label': 'PLE 表 (48 GiB)', 'default': 'pinned',
-         'choices': [['pinned', '锁页内存'], ['nvme', '傲腾 NVMe · 省 48 GiB 内存']]},
+         'choices': [['pinned', '锁页内存'], ['nvme', '傲腾 NVMe · 省 48 GiB 内存']],
+         'unavailable': lambda: {} if Path(PLE_OPTANE).is_dir() else {'nvme': f'本机没有 PLE 表的 NVMe 副本（{PLE_OPTANE}）'}},
     ],
     'notes': [
         {'when': {'packs': 'off'}, 'text': '官方 main 基线：FP8 KV、16K 分块、不开 hc_mix / PLE / QSA 分段'},

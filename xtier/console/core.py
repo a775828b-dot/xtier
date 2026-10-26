@@ -314,11 +314,19 @@ class Console:
 
     # --- options ---
 
+    @staticmethod
+    def unavailable(option):
+        """Choice -> why it cannot be chosen on this machine (the option's 'unavailable': a dict, or a callable that
+        returns one, e.g. when a file the choice needs is missing)."""
+        u = option.get('unavailable')
+        return dict((u() if callable(u) else u) or {})
+
     def defaults(self, model):
         return {o['key']: o['default'] for o in self.models[model]['options']}
 
-    def validate(self, model, form):
-        """Option values from a form (dict of str or list of str), the default for missing ones; ValueError otherwise."""
+    def validate(self, model, form, lenient=False):
+        """Option values from a form (dict of str or list of str), the default for missing ones; ValueError otherwise.
+        lenient (saved settings): a choice unavailable on this machine becomes its option's default."""
         if model not in self.models:
             raise ValueError('未知的 XTier 模型')
         values = {}
@@ -329,7 +337,10 @@ class Console:
             raw = str(raw)
             if raw not in {c[0] for c in option['choices']}:
                 raise ValueError(f"{option['label']}：不支持的取值 {raw}")
-            values[option['key']] = raw
+            why = self.unavailable(option).get(raw)
+            if why and not lenient:
+                raise ValueError(f"{option['label']}：{why}")
+            values[option['key']] = option['default'] if why else raw
         return values
 
     def build(self, model, values):
@@ -352,7 +363,8 @@ class Console:
     def console_data(self):
         """What the page renders: the models' card fields, their options and defaults, the saved choices."""
         return {'models': {k: {f: m[f] for f in PUBLIC if f in m} for k, m in self.models.items()},
-                'options': {k: m['options'] for k, m in self.models.items()},
+                'options': {k: [{**{f: v for f, v in o.items() if f != 'unavailable'}, 'unavailable': self.unavailable(o)}
+                                for o in m['options']] for k, m in self.models.items()},
                 'defaults': {k: self.defaults(k) for k in self.models},
                 'saved': self.load_settings()}
 
@@ -363,7 +375,7 @@ class Console:
         out = {'model': saved.get('model') if saved.get('model') in self.models else next(iter(self.models), None)}
         for model in self.models:
             try:
-                out[model] = self.validate(model, saved.get(model) or {})
+                out[model] = self.validate(model, saved.get(model) or {}, lenient=True)
             except ValueError:
                 out[model] = self.defaults(model)
         return out

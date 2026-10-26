@@ -39,7 +39,14 @@ for mid, m in models.items():
     for n in m.get('notes', []):
         assert set(n['when']) <= set(keys), (mid, n)
     for values in itertools.product(*[[c[0] for c in o['choices']] for o in m['options']]):
-        o = console.validate(mid, dict(zip(keys, values)))
+        form = dict(zip(keys, values))
+        if any(console.unavailable(o).get(form[o['key']]) for o in m['options']):   # not on this machine: refused
+            try:
+                console.validate(mid, form)
+                raise AssertionError(f'accepted an unavailable value: {mid} {form}')
+            except ValueError:
+                continue
+        o = console.validate(mid, form)
         env, argv = console.build(mid, o)
         assert env['PORT'] == str(m['port']) and all(isinstance(v, str) for v in env.values()), (mid, o)
         assert Path(argv[0]).is_file() and os.access(argv[0], os.X_OK), argv[0]
@@ -73,6 +80,26 @@ env, argv = console.build('ds41', console.defaults('ds41'))
 assert env['DSPARK'] == '1' and env['BATCH'] == '22528' and env['XTIER_ENGRAM_CACHE_GIB'] == '4'
 assert env['XTIER_CACHE_ELASTIC'] == '1' and env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '68'
 assert 'XTIER_CACHE_ELASTIC' not in console.build('ds41', {**console.defaults('ds41'), 'packs': 'off'})[0]
+
+# a choice unavailable on this machine: refused, a saved one falls back to the default of that option only, listed
+# for the page (greyed out there)
+opt = {'key': 'u', 'label': 'U', 'default': 'a', 'choices': [['a', 'A'], ['b', 'B']], 'unavailable': lambda: {'b': 'no file'}}
+other = {'key': 'w', 'label': 'W', 'default': 'x', 'choices': [['x', 'X'], ['y', 'Y']]}
+test = core.Console({'t': {**models['qwen38'], 'options': [opt, other]}}, tempfile.mkdtemp(prefix='xtier-console-'),
+                    runner='setsid', guard_gib=0)
+try:
+    test.validate('t', {'u': 'b'})
+    raise AssertionError('accepted an unavailable value')
+except ValueError:
+    pass
+assert test.validate('t', {'u': 'b', 'w': 'y'}, lenient=True) == {'u': 'a', 'w': 'y'}
+test.save_settings('t', {'u': 'b', 'w': 'y'})
+assert test.load_settings()['t'] == {'u': 'a', 'w': 'y'}
+listed = test.console_data()['options']['t']
+assert listed[0]['unavailable'] == {'b': 'no file'} and listed[1]['unavailable'] == {}
+json.dumps(test.console_data())
+ple = next(o for o in models['qwen38']['options'] if o['key'] == 'ple')
+assert set(console.unavailable(ple)) <= {'nvme'}   # PLE on NVMe needs its copy on this machine
 
 # the page
 data = {**console.console_data(), 'status': console.status()}

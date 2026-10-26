@@ -287,7 +287,10 @@ JS = r"""
           `<span class=sw><input type=checkbox role=switch name="${esc(o.key)}"${on ? ' checked' : ''}><i></i>` +
           `<em>${esc(o.choices[on ? 0 : 1][1])}</em></span></label>`;
       }
-      const opts = o.choices.map(([v, label]) => `<option value="${esc(v)}"${chosen[model][o.key] === v ? ' selected' : ''}>${esc(label)}</option>`).join('');
+      // a choice unavailable on this machine (o.unavailable: value -> reason) is greyed out, the reason in its tooltip
+      const un = o.unavailable || {};
+      const opts = o.choices.map(([v, label]) => `<option value="${esc(v)}"${chosen[model][o.key] === v ? ' selected' : ''}` +
+        `${un[v] ? ` disabled title="${esc(un[v])}"` : ''}>${esc(label)}${un[v] ? ' · 本机不可用' : ''}</option>`).join('');
       return `<label class=xt-field data-key="${esc(o.key)}" title="${esc(o.hint || '')}">${esc(o.label)}<select name="${esc(o.key)}">${opts}</select></label>`;
     }).join('');
     for (const sel of host.querySelectorAll('select')) sel.addEventListener('change', () => { chosen[model][sel.name] = sel.value; paintOptions(); });
