@@ -14,9 +14,9 @@ MODEL = {
     'name': 'GLM-5.3 Flash', 'code': 'GLM-5.3-F', 'port': 18185, 'served': 'GLM-5.3-Flash-NVFP4',
     'spec': 'EAGLE', 'arch': '42 层 · 288 专家 · DSA 稀疏注意力 · NVFP4 专家 + FP8 稠密层',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2700,
-    # README agent speed (production's agent_bench, two rounds): decode of the long responses (>= 300 tokens),
-    # cold prefill of the 64K / 500K sessions (mean of the rounds)
-    'bench': {'kind': 'agent', 'dec': '95.0', 'pre': '2237 / 2584',
+    # README agent speed (production's agent_bench, two rounds, 2026-10-26 with the elastic expert cache): decode of the
+    # long responses (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the rounds)
+    'bench': {'kind': 'agent', 'dec': '98.8', 'pre': '2607 / 2668',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('EAGLE') + [
         {'key': 'rs', 'label': '无损拒绝采样', 'default': 'on',

@@ -12,9 +12,9 @@ MODEL = {
     'name': 'DeepSeek V4.1 Flash 1017', 'code': 'DSV4.1-1017', 'port': 18190, 'served': 'DeepSeek-V4.1-Flash-1017',
     'spec': 'DSpark', 'arch': '40 层 · 384 专家 · Engram 189 GB 行放 NVMe · MXFP4',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2400,
-    # README agent speed (production's agent_bench, two rounds): decode of the long responses (>= 300 tokens),
-    # cold prefill of the 64K / 500K sessions (mean of the rounds)
-    'bench': {'kind': 'agent', 'dec': '133.2', 'pre': '4109 / 4791',
+    # README agent speed (production's agent_bench, two rounds, 2026-10-26 with the elastic expert cache): decode of the
+    # long responses (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the rounds)
+    'bench': {'kind': 'agent', 'dec': '141.3', 'pre': '4420 / 4806',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('DSpark') + [
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',

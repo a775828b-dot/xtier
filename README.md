@@ -71,8 +71,8 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
 | Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；加速包比官方 main 冷 prefill 快 5% / 24%（64K / 512K）；KV 存 NVFP4（与生产同参，加速包让官方 QSA 能读），省下的显存用来多放常驻层，启动台默认由规划器自动布局；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
-| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包（FP8 权重、热词表拒绝采样、截断验证）比官方 main 每步快 17–21%、冷 prefill 快 5%，PPL 3.987 → 3.998 |
-| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；加速包比官方 main 每步快 31–35%、冷 prefill 快 26–27%，之后又加了 FP8 wo_a 和分页索引器 |
+| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包（FP8 权重、热词表拒绝采样、截断验证、弹性热专家槽）比官方 main 长回复每步快 21%，PPL 3.987 → 3.998 |
+| DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；加速包（含 FP8 wo_a、分页索引器、弹性热专家槽）比官方 main 长回复每步快 39%、冷 prefill 快 33% |
 | MiniMax-M3.1-Flash | `minimax_m3` | SGLang 的 M3.1 分支（PR #45925，还没合入 main）上跑通（含 DSpark）：SM120 上四处必需的修正（PR 把 SM120 当 SM100：原生栈、FP8 KV + TRT-LLM、MegaMoE、CUDA 上的 DSpark verify），CPU 引擎和 GPU 内核加了 GPT-OSS SwiGLU；KV 存 NVFP4，固定 512K 上下文（480K 找数 5/5）；按 agent_bench（64k 会话），加速包后 decode 每步快 34%（55.4 对 84.1 ms），tok/s 快 12%（含无损的 DSpark 按置信度截断验证）；没有生产管线可比 |
 
 ## 测速
@@ -89,55 +89,59 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 | DSpark | 轮 | 冷 prefill 64K 会话 | 冷 prefill 500K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|---:|
-| XTier + 加速包 | 1 | 3,196 | 4,788 | 112.7 | 3.76 | 33.4 ms |
-|  | 2 | 5,022 | 4,793 | 137.6 | 4.46 | 32.4 ms |
+| XTier + 加速包 | 1 | 3,812 | 4,768 | 141.8 | 4.50 | 31.7 ms |
+|  | 2 | 5,027 | 4,844 | 140.8 | 4.30 | 30.6 ms |
 | 官方 main | 1 | 3,318 | 3,627 | 65.5 | 3.25 | 50.9 ms |
 
-- 加速包对官方 main（64K / 512K）：每步 32.6 / 36.0 对 49.9 / 51.8 ms（快 35% / 31%），冷 prefill 4,169 / 4,623 对 3,318 / 3,627
-  （快 26% / 27%）。之后加速包又加了 FP8 wo_a 和分页索引器，agent 长回复每步再从 33.9 降到 32.5 ms。
+- 加速包（2026-10-26 重测，启动台默认，含弹性热专家槽）对官方 main：长回复每步 31.2 对 50.9 ms（快 39%），冷 prefill 64K / 500K
+  4,420 / 4,806 对 3,318 / 3,627（快 33% / 33%）。弹性热专家槽（decode 时把只有 prefill 才用的显存借给热专家，至多 68 槽）把每步
+  从 32.6 降到 31.2 ms，见[报告](docs/reports/2026-10-26-elastic-cache.md)。
 - 官方 main 的 DeepSeek 工具调用解析不逐 token 流式返回参数，工具调用请求量不出 decode（两轮 177 个请求里能计时 13 个），所以只比
   长回复；加速包第 1 轮可计时的长回复只有 3 个，tok/s 偏低。
 - 加速包精度：无损——块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型
   验证）、wo_a 存检查点的 FP8（还原逐位一致，kernel 与 cuBLAS 只差求和顺序）、索引器走分页路径（logits 与非分页路径逐位相同，top-k
   只在同分时可能选到不同位置），PPL 3.319 → 3.317（分页索引器之前测），照抄 0 错。
 - 和生产管线（lsglang_ds4.1）的 agent 对比见[报告](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 原始数据：加速包 `bench/results/agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`（分页索引器之前的两轮：`agent-bench-ds41-xtier-woa-*`），
+- 原始数据：加速包 `bench/results/agent-bench-ds41-elastic-r{1,2}-20261026.json`（不开弹性：`agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`），
   官方 main `bench/results/context-ds41-xtier-base-20261023.json`。
 
 ### Qwen3.8 Flash Next
 
 | MTP | 轮 | 冷 prefill 64K 会话 | 冷 prefill 500K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|---:|
-| XTier + 加速包 | 1 | 5,374 | 5,053 | 180.1 | 2.55 | 14.1 ms |
-|  | 2 | 5,479 | 5,050 | 183.5 | 2.60 | 14.1 ms |
+| XTier + 加速包 | 1 | 5,715 | 5,170 | 181.7 | 2.57 | 14.2 ms |
+|  | 2 | 5,610 | 5,150 | 207.2 | 2.68 | 13.0 ms |
 | 官方 main | 1 | 5,319 | 4,078 | 139.5 | 2.13 | 15.2 ms |
 
-- 加速包对官方 main（64K / 512K）：每步 14.47 / 15.62 对 14.63 / 15.75 ms（快 1%），冷 prefill 5,587 / 5,040 对 5,319 / 4,078
-  （快 5% / 24%，QSA 索引器和 PLE 层分段主要省在长上下文）。官方 main 用 FP8 KV、16K 分块、生产的 25 层常驻（官方 QSA 读不了 NVFP4 KV）。
-  工具调用逐 token 流式，所有请求都能计时。
+- 加速包（2026-10-26 重测，启动台默认：规划器的自动布局，29 层常驻 + 18 × 64–88 槽）对官方 main：长回复每步 13.6 对 15.2 ms
+  （快 11%），冷 prefill 64K / 500K 5,663 / 5,160 对 5,319 / 4,078（快 6% / 27%，QSA 索引器和 PLE 层分段主要省在长上下文）。官方 main
+  用 FP8 KV、16K 分块、生产的 25 层常驻（官方 QSA 读不了 NVFP4 KV）。工具调用逐 token 流式，所有请求都能计时。
+- 不开弹性热专家槽：Qwen 的 decode 受 GPU 限制；多放两层常驻、池化层的槽全部动态补回的布局 prefill 只快约 1%，decode 每步慢 10%，
+  见[报告](docs/reports/2026-10-26-elastic-cache.md)。
 - 加速包精度：轻微——KV 存 NVFP4（与生产相同，每 16 个值一个 E4M3 缩放；读出与官方反量化逐位一致），照抄 0 错、PPL 3.481；hc_mix
   换成重叠的持久内核、PLE 层与 QSA 索引器分段与官方逐位一致。
 - 和生产管线（lsglang_q3.8fn）的 agent 对比见[报告](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 原始数据：加速包 `bench/results/agent-bench-qwen38-xtier-r{1,2}-20261024.json`，官方 main `bench/results/context-qwen38-xtier-base-20261023.json`。
-- 2026-10-25 起启动台的默认热专家布局改为规划器的自动布局（`LAYOUT=auto`，同显存：29 层常驻 + 18 × 64–88 槽，表里是 10-24 的
-  26 层常驻）：同一晚两轮 agent_bench 对 26 层常驻，五个会话的冷 prefill +2.4–2.9%，decode 每步持平，见
+- 原始数据：加速包 `bench/results/agent-bench-qwen38-xtier-r{1,2}-20261026.json`，官方 main `bench/results/context-qwen38-xtier-base-20261023.json`。
+- 自动布局（`LAYOUT=auto`，2026-10-25 起默认）对 26 层常驻：同显存，五个会话的冷 prefill +2.4–2.9%，decode 每步持平，见
   [reports/2026-10-24-planner.md](docs/reports/2026-10-24-planner.md)。
 
 ### GLM-5.3 Flash
 
 | EAGLE | 轮 | 冷 prefill 64K 会话 | 冷 prefill 500K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|---:|
-| XTier + 加速包 | 1 | 1,747 | 2,509 | 94.4 | 2.53 | 26.8 ms |
-|  | 2 | 2,726 | 2,659 | 95.5 | 2.68 | 28.1 ms |
+| XTier + 加速包 | 1 | 2,485 | 2,674 | 95.7 | 2.52 | 26.3 ms |
+|  | 2 | 2,729 | 2,662 | 101.6 | 2.82 | 27.8 ms |
 | 官方 main | 1 | 2,663 | 2,518 | 76.8 | 2.61 | 34.4 ms |
 
-- 加速包对官方 main（64K / 512K）：每步 29.2 / 26.8 对 34.9 / 33.8 ms（快 17% / 21%），decode 100.0 / 91.9 对 78.6 / 75.0 tok/s
-  （+27% / +23%），冷 prefill 2,808 / 2,656 对 2,663 / 2,518（+5%）。官方 main 用 BF16 权重、55 槽（60 槽时 prefill 显存不够）、
-  不开拒绝采样。加速包第 1 轮的 64K 会话是启动后的第一个请求（1,747）。
+- 加速包（2026-10-26 重测，启动台默认，含弹性热专家槽）对官方 main：长回复每步 27.1 对 34.4 ms（快 21%），冷 prefill 500K 2,668 对
+  2,518（+6%）；64K 第 1 轮是启动后的第一个请求（2,485），第 2 轮 2,729 对 2,663。弹性热专家槽（decode 时多 11–13 槽 / 层）把每步
+  从 27.5 降到 27.1 ms，见[报告](docs/reports/2026-10-26-elastic-cache.md)。官方 main 用 BF16 权重、55 槽（60 槽时 prefill 显存不够）、
+  不开拒绝采样。
 - 加速包精度：轻微——BF16 注意力 / 稠密层存成 FP8（每行每 128 列一个 scale），PPL 3.987 → 3.998（+0.3%）；拒绝采样与截断验证无损
   （输出分布与不用投机解码相同），照抄 0 错。
 - 和生产管线（lsglang_glm5.3）的 agent 对比见[报告](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 原始数据：加速包 `bench/results/agent-bench-glm53-xtier-r{1,2}-20261024.json`，官方 main `bench/results/context-glm53-xtier-base55-20261023.json`。
+- 原始数据：加速包 `bench/results/agent-bench-glm53-elastic-r{1,2}-20261026.json`（不开弹性：`agent-bench-glm53-xtier-r{1,2}-20261024.json`），
+  官方 main `bench/results/context-glm53-xtier-base55-20261023.json`。
 
 ### MiniMax-M3.1-Flash
 
@@ -168,6 +172,9 @@ SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K �
   0 错（FP8 都是 0 错）；480K 长文找数 5/5。截断验证无损（照抄 0 错）。MiniMax 的 PPL 不适合衡量精度：裸文本和聊天里用户
   文档的 NLL 都在 4–6，FP8 和 NVFP4 一样，见[报告](docs/reports/2026-10-24-minimax-512k.md)。CPU 引擎的 GPT-OSS SwiGLU
   与 FP32 参考的相对误差是 1e-6；草稿长度、换入节奏、草稿词表头 FP8 都不改变主模型的输出。
+- 2026-10-26 用全部五个会话（64K–500K，两轮）重测加速包：长回复 43.4 tok/s、每步 69.2 ms（长上下文的会话更慢），500K 冷
+  prefill 1,531 tok/s（`bench/results/agent-bench-minimax31-xtier-r{1,2}-20261026.json`）。弹性热专家槽在 MiniMax 上每步持平（一档
+  额外槽 1.69 GiB，只加得上 3 档），启动台默认关，见[报告](docs/reports/2026-10-26-elastic-cache.md)。
 - 原始数据 `bench/results/agent-bench-minimax31-{xtier-512k,base-512k,xtier-fp8kv-128k}-r{1,2}-20261024.json`、
   `needle-minimax31-512k-20261024.json`。
 
@@ -199,6 +206,8 @@ SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K �
 
 ## 版本更新
 
+- 2026-10-26：弹性热专家槽：decode 时把只有 prefill 才用的显存借给热专家，prefill 前还回（DeepSeek 每步 −4.3%、GLM −1.5%，
+  启动台默认开）；启动台报在线前先预热，换模型后的第一个请求 88 → 6–7 s。详见[文档](docs/reports/2026-10-26-elastic-cache.md)。
 - 2026-10-25：测速表改为官方 main 对加速包；Qwen 启动台默认用自动规划布局；热专家池可选用提示的路由预热（`XTIER_CACHE_PROMPT=1`，
   默认关）；修了 MiniMax 包钩子和 GC 冻结两个启动报错。详见[文档](docs/reports/2026-10-25-prompt-warmup.md)。
 - 2026-10-24（晚）：自动规划器第一版：本机测出各层 GPU / CPU 耗时，在显存预算内逐层定热专家槽数（`XTIER_CACHE_PLAN=auto`）；

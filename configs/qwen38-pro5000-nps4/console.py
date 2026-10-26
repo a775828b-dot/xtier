@@ -20,10 +20,10 @@ MODEL = {
     'name': 'Qwen3.8 Flash Next', 'code': 'QWEN-3.8-FN', 'port': 18180, 'served': 'Qwen3.8-Flash-Next',
     'spec': 'MTP', 'arch': '48 层 · 512 专家 top-10 · QSA + GDN 混合注意力 · NVFP4 W4A16',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 1800,
-    # agent speed of the default (planner layout) started from the WebUI, 2026-10-25 (production's agent_bench, two
-    # rounds, bench/results/agent-bench-qwen38-xtier-auto-r{1,2}-20261025.json): decode of the long responses
+    # agent speed of the default (planner layout) launched as the console does, 2026-10-26 (production's agent_bench,
+    # two rounds, bench/results/agent-bench-qwen38-xtier-r{1,2}-20261026.json): decode of the long responses
     # (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the rounds)
-    'bench': {'kind': 'agent', 'dec': '165.5', 'pre': '5541 / 5172',
+    'bench': {'kind': 'agent', 'dec': '192.8', 'pre': '5663 / 5160',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('MTP') + [
         {'key': 'kv', 'label': 'KV 缓存', 'default': 'nvfp4', 'choices': [['nvfp4', 'NVFP4 · 与生产同参'], ['fp8', 'FP8']],
