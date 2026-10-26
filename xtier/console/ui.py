@@ -83,6 +83,18 @@ background:rgba(3,8,20,.9) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.o
 .xt-field select:disabled{opacity:.42}
 .xt-field.changed select{border-color:var(--v);box-shadow:0 0 0 1px rgba(167,139,250,.35)}
 .xt-field.changed::after{content:"已改动 · 非实测默认";font-size:10.5px;color:var(--v)}
+.xt-switch .sw{position:relative;display:flex;align-items:center;gap:10px;min-height:36px;padding:7px 10px;border-radius:9px;border:1px solid rgba(62,230,255,.28);background:rgba(3,8,20,.9);cursor:pointer;transition:border-color .15s,box-shadow .15s}
+.xt-switch .sw:hover{border-color:rgba(62,230,255,.55)}
+.xt-switch input{position:absolute;opacity:0;width:1px;height:1px;margin:0;pointer-events:none}
+.xt-switch i{position:relative;flex:none;width:38px;height:20px;border-radius:999px;background:rgba(127,144,173,.32);box-shadow:inset 0 0 0 1px rgba(127,144,173,.5);transition:background .18s,box-shadow .18s}
+.xt-switch i::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:var(--t);transition:transform .18s}
+.xt-switch input:checked+i{background:linear-gradient(90deg,var(--c),var(--v));box-shadow:0 0 12px rgba(62,230,255,.45)}
+.xt-switch input:checked+i::after{transform:translateX(18px)}
+.xt-switch input:focus-visible+i{outline:2px solid var(--c);outline-offset:2px}
+.xt-switch em{font-style:normal;font-size:13px;line-height:1.3;color:var(--t)}
+.xt-switch input:disabled~i,.xt-switch input:disabled~em{opacity:.42}
+.xt-switch .sw:has(input:disabled){cursor:default}
+.xt-field.changed .sw{border-color:var(--v);box-shadow:0 0 0 1px rgba(167,139,250,.35)}
 .xt-notes{margin-top:10px;min-height:18px;font-size:12px;color:var(--d)}
 .xt-notes b{color:var(--a);font-weight:600}
 .xt-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:14px}
@@ -267,11 +279,24 @@ JS = r"""
     $('xt-sel').innerHTML = `<b>${esc(d.name)}</b><span>${esc(d.arch || '')}</span>` +
       `<span class=hw>${d.hardware ? esc(d.hardware) + ' · ' : ''}:${esc(d.port)}</span>`;
     const host = $('xt-options');
+    // an on / off option with switch set (its first choice is "on") is a toggle switch, the others are lists
     host.innerHTML = data.options[model].map(o => {
+      if (o.switch) {
+        const on = chosen[model][o.key] === o.choices[0][0];
+        return `<label class="xt-field xt-switch" data-key="${esc(o.key)}" title="${esc(o.hint || '')}">${esc(o.label)}` +
+          `<span class=sw><input type=checkbox role=switch name="${esc(o.key)}"${on ? ' checked' : ''}><i></i>` +
+          `<em>${esc(o.choices[on ? 0 : 1][1])}</em></span></label>`;
+      }
       const opts = o.choices.map(([v, label]) => `<option value="${esc(v)}"${chosen[model][o.key] === v ? ' selected' : ''}>${esc(label)}</option>`).join('');
       return `<label class=xt-field data-key="${esc(o.key)}" title="${esc(o.hint || '')}">${esc(o.label)}<select name="${esc(o.key)}">${opts}</select></label>`;
     }).join('');
     for (const sel of host.querySelectorAll('select')) sel.addEventListener('change', () => { chosen[model][sel.name] = sel.value; paintOptions(); });
+    for (const box of host.querySelectorAll('.xt-switch input')) box.addEventListener('change', () => {
+      const c = data.options[model].find(o => o.key === box.name).choices[box.checked ? 0 : 1];
+      chosen[model][box.name] = c[0];
+      box.parentElement.querySelector('em').textContent = c[1];
+      paintOptions();
+    });
     paintOptions();
   }
 
@@ -282,7 +307,7 @@ JS = r"""
     for (const o of data.options[model]) {
       const f = $('xt-options').querySelector(`.xt-field[data-key="${o.key}"]`);
       const off = (o.off_when || []).some(c => matches(c, v));
-      f.querySelector('select').disabled = off;
+      f.querySelector('select, input').disabled = off;
       f.classList.toggle('changed', !off && v[o.key] !== d[o.key]);
       if (!off && v[o.key] !== d[o.key]) changed++;
     }

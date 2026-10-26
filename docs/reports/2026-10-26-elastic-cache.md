@@ -2,7 +2,10 @@
 
 目标：prefill 的激活（和 SGLang 的其他临时缓冲）只在 prefill 时占显存，平时这部分是空的——decode 时的显存占用对 prefill 峰值，
 GLM 约 9.6 GiB、DeepSeek 约 10.6 GiB、MiniMax 约 10 GiB、Qwen 约 7.5 GiB。decode 时把它借给热专家，prefill 要用时先还回来。
-`XTIER_CACHE_ELASTIC=1`（启动台“弹性热专家”选项）。
+`XTIER_CACHE_ELASTIC=1`（启动台每张卡上的“弹性热专家”开关）。
+
+收益看 decode 的瓶颈在哪边：这台机器上 DeepSeek、GLM 受 CPU 内存带宽限制，多放热专家就快；Qwen 受 GPU 限制，多放反而慢约 10%。
+下面的数都是单卡 RTX PRO 5000 + 2× EPYC 9334 上测的，其他硬件配置请自行测试是否开启。
 
 结果（生产的 agent_bench 两轮，同一次启动；每步 = 长回复每个验证步的耗时）：
 

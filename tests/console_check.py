@@ -56,6 +56,9 @@ for mid, m in models.items():
 env, argv = console.build('qwen38', console.defaults('qwen38'))
 assert argv[0].endswith('run-qwen-mtp.sh') and argv[argv.index('--kv-cache-dtype') + 1] == 'nvfp4'
 assert argv[argv.index('--chunked-prefill-size') + 1] == '24576' and ',27' in env['XTIER_CACHE_FULL']
+assert 'XTIER_CACHE_ELASTIC' not in env   # off by default: Qwen's decode is GPU-bound
+assert console.build('qwen38', {**console.defaults('qwen38'), 'elastic': 'on'})[0]['XTIER_CACHE_ELASTIC'] == '1'
+assert all(o.get('switch') for m in console.models.values() for o in m['options'] if o['key'] == 'elastic')
 env, argv = console.build('qwen38', {**console.defaults('qwen38'), 'packs': 'off'})
 assert argv[argv.index('--kv-cache-dtype') + 1] == 'fp8_e4m3' and env['XTIER_QSA_FP4'] == '0'
 env, argv = console.build('qwen38', {**console.defaults('qwen38'), 'kv': 'fp8', 'chunk': '32768'})
@@ -76,6 +79,7 @@ data = {**console.console_data(), 'status': console.status()}
 json.dumps(data)
 page = ui.page_html(data)
 assert 'id=xtier-console' in page and 'xtierConsoleHooks' in page and 'build' not in json.dumps(data['models'])
+assert 'xt-switch' in page and 'role=switch' in page
 
 # the standalone server
 httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.make_handler(console, server.Jobs(console)))

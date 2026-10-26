@@ -1,11 +1,12 @@
 """XTier console entry (xtier/console): Qwen3.8 Flash Next on one RTX PRO 5000, NPS4 host. Option defaults = the README
 "+ 加速包" row (2026-10-24: NVFP4 KV, 24K chunks, MTP) with the planner's layout (2026-10-25): the memory of 26 resident
 layers + 22 x 155 hot slots laid out at startup (XTIER_CACHE_PLAN=auto: 29 resident + 18 x 64-88; agent_bench cold
-prefill +2.4-2.9%, decode unchanged, docs/reports/2026-10-24-planner.md)."""
+prefill +2.4-2.9%, decode unchanged, docs/reports/2026-10-24-planner.md). The elastic expert cache is off: Qwen's decode
+is GPU-bound (2026-10-26, two more resident layers with dynamic slots: decode step +10%)."""
 
 from pathlib import Path
 
-from xtier.console.core import common_options
+from xtier.console.core import common_options, elastic_option
 
 HERE = Path(__file__).resolve().parent
 PLE_OPTANE = '/data/fast/p5800x1/qwen38-flash-next-ple'   # the PLE table's rows on an Optane drive (XTIER_PLE_ROWS=nvme)
@@ -36,6 +37,7 @@ MODEL = {
                      ['prod', '25 层常驻 + 23×155 槽 · 生产布局']],
          'hint': '自动规划：启动时由规划器在 26 层常驻那份显存内重排（agent 冷 prefill +2.4–2.9%，decode 持平）；FP8 KV 时用生产布局',
          'off_when': [{'packs': 'off'}, {'kv': 'fp8'}]},
+        elastic_option('off', 'Qwen 的 decode 受 GPU 限制，多放热专家会使 decode 变慢约 10%（10-26 实测），默认关'),
         {'key': 'ple', 'label': 'PLE 表 (48 GiB)', 'default': 'pinned',
          'choices': [['pinned', '锁页内存'], ['nvme', '傲腾 NVMe · 省 48 GiB 内存']]},
     ],
@@ -44,6 +46,8 @@ MODEL = {
         {'when': {'packs': 'on', 'kv': 'fp8'}, 'text': 'FP8 KV：用生产布局（25 层常驻）', 'warn': True},
         {'when': {'packs': 'on', 'kv': 'fp8', 'chunk': '32768'}, 'text': '分块按 24K 启动', 'warn': True},
         {'when': {'ple': 'nvme'}, 'text': 'PLE 行从傲腾读取，主机内存省 48 GiB'},
+        {'when': {'packs': 'on', 'elastic': 'off'}, 'text': '弹性热专家默认关：Qwen 的 decode 受 GPU 限制，多放热专家会使 decode 变慢约 10%'},
+        {'when': {'packs': 'on', 'elastic': 'on'}, 'text': '弹性热专家：Qwen 的 decode 受 GPU 限制，多放热专家会使 decode 变慢约 10%', 'warn': True},
     ],
 }
 
@@ -60,6 +64,8 @@ def build(o, port):
         env.update(XTIER_HC_MIX_OVERLAP='0', XTIER_PLE_BLOCK='0', XTIER_QSA_KEYS_PER_CTA='0', XTIER_QSA_FP4='0')
     elif kv == 'fp8_e4m3' and chunk == '32768':
         chunk = '24576'   # 32K chunks need the memory NVFP4 KV frees
+    if not base and o['elastic'] == 'on':
+        env['XTIER_CACHE_ELASTIC'] = '1'
     if o['ple'] == 'nvme':
         env.update(XTIER_PLE_ROWS='nvme', XTIER_PLE_MODEL=PLE_OPTANE)
     args = ['--context-length', ctx, '--max-total-tokens', ctx, '--kv-cache-dtype', kv, '--chunked-prefill-size', chunk,
@@ -74,6 +80,7 @@ def tags(o):
     """Extra parts of the server's label."""
     if o['packs'] != 'on':
         return []
+    elastic = ['弹性热专家'] if o['elastic'] == 'on' else []
     if o['kv'] != 'nvfp4':
-        return ['FP8 KV']
-    return ['NVFP4 KV', '自动布局'] if o['layout'] == 'auto' else ['NVFP4 KV']
+        return ['FP8 KV'] + elastic
+    return (['NVFP4 KV', '自动布局'] if o['layout'] == 'auto' else ['NVFP4 KV']) + elastic

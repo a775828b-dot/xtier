@@ -41,8 +41,8 @@ def common_options(spec, threads=('112', '96', '64'), contexts=('524288', '39321
 
 def elastic_option(default='on', hint=''):
     """The elastic expert cache (XTIER_CACHE_ELASTIC, xtier/cache/elastic.py): the memory only a prefill needs holds
-    extra hot experts between prefills; part of the packs."""
-    return {'key': 'elastic', 'label': '弹性热专家', 'default': default,
+    extra hot experts between prefills; part of the packs. A toggle switch on the page."""
+    return {'key': 'elastic', 'label': '弹性热专家', 'default': default, 'switch': True,
             'choices': [['on', '开 · prefill 余量给热专家'], ['off', '关']],
             'hint': hint or 'decode 时把只有 prefill 才用的显存借给热专家，prefill 前先还回；空闲显存不足时自动全部还回',
             'off_when': [{'packs': 'off'}]}

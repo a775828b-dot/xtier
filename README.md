@@ -117,8 +117,8 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 - 加速包（2026-10-26 重测，启动台默认：规划器的自动布局，29 层常驻 + 18 × 64–88 槽）对官方 main：长回复每步 13.6 对 15.2 ms
   （快 11%），冷 prefill 64K / 500K 5,663 / 5,160 对 5,319 / 4,078（快 6% / 27%，QSA 索引器和 PLE 层分段主要省在长上下文）。官方 main
   用 FP8 KV、16K 分块、生产的 25 层常驻（官方 QSA 读不了 NVFP4 KV）。工具调用逐 token 流式，所有请求都能计时。
-- 不开弹性热专家槽：Qwen 的 decode 受 GPU 限制；多放两层常驻、池化层的槽全部动态补回的布局 prefill 只快约 1%，decode 每步慢 10%，
-  见[报告](docs/reports/2026-10-26-elastic-cache.md)。
+- 弹性热专家槽默认关：Qwen 的 decode 受 GPU 限制，多放热专家会使 decode 变慢约 10%（多放两层常驻、池化层的槽全部动态补回：
+  prefill 只快约 1%），见[报告](docs/reports/2026-10-26-elastic-cache.md)。
 - 加速包精度：轻微——KV 存 NVFP4（与生产相同，每 16 个值一个 E4M3 缩放；读出与官方反量化逐位一致），照抄 0 错、PPL 3.481；hc_mix
   换成重叠的持久内核、PLE 层与 QSA 索引器分段与官方逐位一致。
 - 和生产管线（lsglang_q3.8fn）的 agent 对比见[报告](docs/reports/2026-10-24-ds-woa-minimax.md)。
@@ -211,8 +211,9 @@ SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K �
 ## 版本更新
 
 - 2026-10-26：弹性热专家槽：decode 时把只有 prefill 才用的显存借给热专家，prefill 前还回（DeepSeek 每步 −4.3%、GLM −1.5%，
-  启动台默认开）；启动台报在线前先预热，换模型后的第一个请求 88 → 6–7 s；MiniMax-M3.1-Flash 暂停开发（太慢、智力不强）。
-  详见[文档](docs/reports/2026-10-26-elastic-cache.md)。
+  启动台默认开；Qwen 的 decode 受 GPU 限制，多放热专家会慢约 10%，默认关；收益看 decode 的瓶颈在 CPU 还是 GPU，其他硬件配置
+  请自行测试，启动台每张卡都有开关）；启动台报在线前先预热，换模型后的第一个请求 88 → 6–7 s；MiniMax-M3.1-Flash 暂停开发
+  （太慢、智力不强）。详见[文档](docs/reports/2026-10-26-elastic-cache.md)。
 - 2026-10-25：测速表改为官方 main 对加速包；Qwen 启动台默认用自动规划布局；热专家池可选用提示的路由预热（`XTIER_CACHE_PROMPT=1`，
   默认关）；修了 MiniMax 包钩子和 GC 冻结两个启动报错。详见[文档](docs/reports/2026-10-25-prompt-warmup.md)。
 - 2026-10-24（晚）：自动规划器第一版：本机测出各层 GPU / CPU 耗时，在显存预算内逐层定热专家槽数（`XTIER_CACHE_PLAN=auto`）；
