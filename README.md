@@ -72,7 +72,7 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
 | Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；加速包比官方 main 冷 prefill 快 5% / 24%（64K / 512K）；KV 存 NVFP4（与生产同参，加速包让官方 QSA 能读），省下的显存用来多放常驻层，启动台默认由规划器自动布局；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
-| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包（FP8 权重、热词表拒绝采样、截断验证、弹性热专家槽）比官方 main 长回复每步快 21%，PPL 3.987 → 3.998 |
+| GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包（FP8 权重、热词表拒绝采样、截断验证、弹性热专家槽）比官方 main 长回复每步快 22%，PPL 3.987 → 3.998 |
 | DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；加速包（含 FP8 wo_a、分页索引器、弹性热专家槽）比官方 main 长回复每步快 39%、冷 prefill 快 33% |
 | MiniMax-M3.1-Flash | `minimax_m3` | **暂停开发**（2026-10-26）：在本机太慢（agent 长回复 43 tok/s），智力也不强。SGLang 的 M3.1 分支（PR #45925，还没合入 main）上跑通（含 DSpark）：SM120 上四处必需的修正（PR 把 SM120 当 SM100：原生栈、FP8 KV + TRT-LLM、MegaMoE、CUDA 上的 DSpark verify），CPU 引擎和 GPU 内核加了 GPT-OSS SwiGLU；KV 存 NVFP4，固定 512K 上下文（480K 找数 5/5）；按 agent_bench（64k 会话），加速包后 decode 每步快 34%（55.4 对 84.1 ms），tok/s 快 12%（含无损的 DSpark 按置信度截断验证）；没有生产管线可比 |
 
@@ -130,19 +130,20 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 | EAGLE | 轮 | 冷 prefill 64K 会话 | 冷 prefill 500K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|---:|
-| XTier + 加速包 | 1 | 2,485 | 2,674 | 95.7 | 2.52 | 26.3 ms |
-|  | 2 | 2,729 | 2,662 | 101.6 | 2.82 | 27.8 ms |
+| XTier + 加速包 | 1 | 2,648 | 2,640 | 96.3 | 2.54 | 26.4 ms |
+|  | 2 | 2,715 | 2,635 | 98.2 | 2.66 | 27.1 ms |
 | 官方 main | 1 | 2,663 | 2,518 | 76.8 | 2.61 | 34.4 ms |
 
-- 加速包（2026-10-26 重测，启动台默认，含弹性热专家槽）对官方 main：长回复每步 27.1 对 34.4 ms（快 21%），冷 prefill 500K 2,668 对
-  2,518（+6%）；64K 第 1 轮是启动后的第一个请求（2,485），第 2 轮 2,729 对 2,663。弹性热专家槽（decode 时多 11–13 槽 / 层）把每步
-  从 27.5 降到 27.1 ms，见[报告](docs/reports/2026-10-26-elastic-cache.md)。官方 main 用 BF16 权重、55 槽（60 槽时 prefill 显存不够）、
-  不开拒绝采样。
+- 加速包（2026-10-26 重测，启动台默认：常备 58 槽 + 弹性热专家槽）对官方 main：长回复每步 26.9 对 34.4 ms（快 22%），冷 prefill
+  64K / 500K 2,682 / 2,638 对 2,663 / 2,518（+1% / +5%）。常备槽 60 → 58：60 槽时 16K 分块的冷 prefill 贴着显存上限（同一晚两轮
+  agent_bench 里分配器释放缓存重试 18 次，一次 25 万 token 的冷提示服务退出），58 槽只在预热时重试 1 次、每步持平（60 槽 27.6 ms），
+  decode 时弹性槽把显存借回来（每层多约 12–14 槽），见[报告](docs/reports/2026-10-26-elastic-cache.md)。官方 main 用 BF16 权重、
+  55 槽（60 槽时 prefill 显存不够）、不开拒绝采样。
 - 加速包精度：轻微——BF16 注意力 / 稠密层存成 FP8（每行每 128 列一个 scale），PPL 3.987 → 3.998（+0.3%）；拒绝采样与截断验证无损
   （输出分布与不用投机解码相同），照抄 0 错。
 - 和生产管线（lsglang_glm5.3）的 agent 对比见[报告](docs/reports/2026-10-24-ds-woa-minimax.md)。
-- 原始数据：加速包 `bench/results/agent-bench-glm53-elastic-r{1,2}-20261026.json`（不开弹性：`agent-bench-glm53-xtier-r{1,2}-20261024.json`），
-  官方 main `bench/results/context-glm53-xtier-base55-20261023.json`。
+- 原始数据：加速包 `bench/results/agent-bench-glm53-base58-r{1,2}-20261026.json`（60 槽：`agent-bench-glm53-base60-r{1,2}-20261026.json`；
+  不开弹性：`agent-bench-glm53-xtier-r{1,2}-20261024.json`），官方 main `bench/results/context-glm53-xtier-base55-20261023.json`。
 
 ### MiniMax-M3.1-Flash
 
@@ -187,7 +188,7 @@ SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K �
 - **官方 main**（启动台「关加速包」）：XTier 后端加上跑起来必需的修正，不开任何提速项。必需的修正：Qwen 的 PLE 表锁页分配；GLM 的量化排除、DSA
   别名、NextN 草稿量化；DeepSeek 的 SM120 候选索引器、Engram 行放 NVMe、尾部重放不走 CUDA 图；
   MiniMax 的 SM120 通用栈、CUDA 上的 DSpark verify 和 NVFP4 KV（`xtier/packs/minimax_m3`；512K 时 FP8 KV 放不下）。
-- **热专家布局与启动参数与生产相同**：Qwen NVFP4 KV、其余层每层 155 槽；GLM 每层 60 槽、16K 分块、BF16 SSM 状态、拒绝采样；
+- **热专家布局与启动参数与生产相同**：Qwen NVFP4 KV、其余层每层 155 槽；GLM 每层 60 槽（启动台默认 58 槽 + 弹性，见 GLM 一节）、16K 分块、BF16 SSM 状态、拒绝采样；
   DeepSeek 每层 50 槽；MiniMax（没有生产管线）每层 8 槽、512K NVFP4 KV 池、16K 分块。
   不同的地方：Qwen 加速包那行 26 层常驻（比生产多第 27 层，用 NVFP4 KV 省下的显存，prefill +0.5–1.4%；10-25 起启动台默认由规划器
   在这份显存内重排成 29 层常驻 + 18 × 64–88 槽）、
@@ -212,8 +213,8 @@ SGLang 的 M3.1 分支（PR #45925，还没合入 main）+ XTier，固定 512K �
 
 - 2026-10-26：弹性热专家槽：decode 时把只有 prefill 才用的显存借给热专家，prefill 前还回（DeepSeek 每步 −4.3%、GLM −1.5%，
   启动台默认开；Qwen 的 decode 受 GPU 限制，多放热专家会慢约 10%，默认关；收益看 decode 的瓶颈在 CPU 还是 GPU，其他硬件配置
-  请自行测试，启动台每张卡都有开关）；启动台报在线前先预热，换模型后的第一个请求 88 → 6–7 s；MiniMax-M3.1-Flash 暂停开发
-  （太慢、智力不强）。详见[文档](docs/reports/2026-10-26-elastic-cache.md)。
+  请自行测试，启动台每张卡都有开关）；GLM 常备槽 60 → 58（16K 冷 prefill 的显存余量，分配器重试 18 → 1 次，每步持平）；启动台报在线前
+  先预热，换模型后的第一个请求 88 → 6–7 s；MiniMax-M3.1-Flash 暂停开发（太慢、智力不强）。详见[文档](docs/reports/2026-10-26-elastic-cache.md)。
 - 2026-10-25：测速表改为官方 main 对加速包；Qwen 启动台默认用自动规划布局；热专家池可选用提示的路由预热（`XTIER_CACHE_PROMPT=1`，
   默认关）；修了 MiniMax 包钩子和 GC 冻结两个启动报错。详见[文档](docs/reports/2026-10-25-prompt-warmup.md)。
 - 2026-10-24（晚）：自动规划器第一版：本机测出各层 GPU / CPU 耗时，在显存预算内逐层定热专家槽数（`XTIER_CACHE_PLAN=auto`）；

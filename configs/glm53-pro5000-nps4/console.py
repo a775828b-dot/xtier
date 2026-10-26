@@ -1,6 +1,8 @@
 """XTier console entry (xtier/console): GLM-5.3 Flash NVFP4 on one RTX PRO 5000, NPS4 host. Option defaults = the
-README "+ 加速包" row: 60 hot slots, FP8 attention / dense weights, 16K chunks, EAGLE with the speculative pack
-(hot-vocab rejection sampling, verify truncation)."""
+README "+ 加速包" row: 58 hot slots, FP8 attention / dense weights, 16K chunks, EAGLE with the speculative pack
+(hot-vocab rejection sampling, verify truncation), the elastic expert cache. 58, not 60 (2026-10-26): at 60 the cold
+16K prefill chunks ran at the edge of the GPU memory (the allocator retried 18 times in two agent_bench rounds, one
+cold 255K-token prompt failed); the elastic cache gives decode the two slots back."""
 
 from pathlib import Path
 
@@ -14,19 +16,22 @@ MODEL = {
     'name': 'GLM-5.3 Flash', 'code': 'GLM-5.3-F', 'port': 18185, 'served': 'GLM-5.3-Flash-NVFP4',
     'spec': 'EAGLE', 'arch': '42 层 · 288 专家 · DSA 稀疏注意力 · NVFP4 专家 + FP8 稠密层',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2700,
-    # README agent speed (production's agent_bench, two rounds, 2026-10-26 with the elastic expert cache): decode of the
-    # long responses (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the rounds)
-    'bench': {'kind': 'agent', 'dec': '98.8', 'pre': '2607 / 2668',
+    # README agent speed (production's agent_bench, two rounds, 2026-10-26: 58 slots with the elastic expert cache):
+    # decode of the long responses (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the rounds)
+    'bench': {'kind': 'agent', 'dec': '97.6', 'pre': '2682 / 2638',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('EAGLE') + [
         {'key': 'rs', 'label': '无损拒绝采样', 'default': 'on',
          'choices': [['on', '开 · 热词表 + 置信度截断'], ['off', '关']],
          'hint': '需要加速包和投机解码；官方 main 不允许热词表配拒绝采样',
          'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
-        {'key': 'slots', 'label': '热专家槽 / 层', 'default': '60', 'choices': [['60', '60 · 实测'], ['55', '55']],
+        {'key': 'slots', 'label': '热专家槽 / 层', 'default': '58',
+         'choices': [['58', '58 · 实测'], ['60', '60 · 冷 prefill 显存贴边'], ['55', '55']],
+         'hint': '60 槽时 16K 分块的冷 prefill 贴着显存上限（agent_bench 两轮分配器重试 18 次，一次冷提示服务退出）；'
+                 '58 槽重试 1 次、每步持平，decode 时弹性槽补回',
          'off_when': [{'packs': 'off'}]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '16384', 'choices': [['16384', '16K'], ['8192', '8K']]},
-        elastic_option('on', 'decode 时多 11–13 槽 / 层（prefill 余量 6–7 GiB），agent 每步 −1.8%（10-26）'),
+        elastic_option('on', 'decode 时每层多约 12–14 槽（prefill 余量约 6.6 GiB），agent 每步 −1.5%（10-26）'),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：BF16 权重、55 槽、不开拒绝采样'}],
 }

@@ -64,7 +64,7 @@ assert argv[argv.index('--kv-cache-dtype') + 1] == 'fp8_e4m3' and env['XTIER_QSA
 env, argv = console.build('qwen38', {**console.defaults('qwen38'), 'kv': 'fp8', 'chunk': '32768'})
 assert argv[argv.index('--chunked-prefill-size') + 1] == '24576' and ',27' not in env['XTIER_CACHE_FULL']
 env, argv = console.build('glm53', console.defaults('glm53'))
-assert '--speculative-use-rejection-sampling' in argv and env['XTIER_CACHE_SLOTS'] == '60'
+assert '--speculative-use-rejection-sampling' in argv and env['XTIER_CACHE_SLOTS'] == '58'
 assert env['XTIER_CACHE_ELASTIC'] == '1'
 env, argv = console.build('glm53', {**console.defaults('glm53'), 'packs': 'off'})
 assert '--speculative-use-rejection-sampling' not in argv and env['XTIER_FP8_WEIGHTS'] == '0'
