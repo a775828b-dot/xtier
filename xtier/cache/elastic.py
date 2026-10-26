@@ -10,9 +10,13 @@ xtier_mailbox_vmm_*). The arena pointers in the decode graphs never change. Afte
 without such a forward, free memory backs extra slots again, a few at a time from a background thread.
 
 What a forward needs is learnt from the forwards themselves (the larger of its peak allocated and peak reserved memory
-over the amounts before it), interpolated between the sizes seen; a forward larger than every one seen gets every
-extra slot released. Slots are added only up to what leaves the usual small prefill (the 75th percentile of the
-recent needs of forwards up to XTIER_CACHE_ELASTIC_SMALL, 4096 tokens) room on top of the reserve, so a coding agent's
+over the amounts before it), kept by its size and context (the tokens the batch's requests hold: attention and
+indexer workspaces can grow with it, and a long session must not make every later prefill look large). A need seen
+bounds any forward no larger in either; taking the need as growing at most in proportion to the tokens and to the
+context, it bounds a larger one too, scaled by both ratios up to XTIER_CACHE_ELASTIC_EXTRAPOLATE (2) times. The
+tightest bound is the prediction; a forward no need seen bounds gets every extra slot released. Slots are added only
+up to what leaves the usual small prefill (the 75th percentile of the recent needs of forwards up to
+XTIER_CACHE_ELASTIC_SMALL, 4096 tokens) room on top of the reserve, so a coding agent's
 turns do not release and refill them every time; a large prefill takes seconds and releases in a fraction of one. Only the device's
 free memory counts (the allocator's cached blocks can be too fragmented for a forward's large allocations); when it
 is short, the allocator's cache is emptied first.
@@ -28,6 +32,8 @@ Safety, so that a model never runs out of memory because of the extra slots:
 Per layer (layout): address space for XTIER_CACHE_ELASTIC_MAX (2.0) x its configured slots
 (XTIER_CACHE_ELASTIC_MAX_SLOTS: a number), at most every expert; XTIER_CACHE_ELASTIC_BASE (1.0) x them mapped for good.
 XTIER_CACHE_ELASTIC_IDLE (32): decode forwards after an allocating one before slots are added again.
+XTIER_CACHE_ELASTIC_EXTRAPOLATE (2): how far a need seen is scaled up to bound a larger forward.
+XTIER_CACHE_ELASTIC_DEBUG=1: a log line for every need learnt and every prediction made while extra slots are held.
 """
 import ctypes as C
 import logging
@@ -141,7 +147,9 @@ class Governor:
         self.decodes = 0
         self.calm_until = 0.0
         self.off = False
-        self.seen = {}                  # (draft?) -> [(tokens, bytes needed over the allocation before)]
+        self.seen = {}                  # draft? -> {(tokens, context) rounded down: the largest need seen there}
+        self.extrapolate = _env('XTIER_CACHE_ELASTIC_EXTRAPOLATE', 2.0)
+        self.debug = os.environ.get('XTIER_CACHE_ELASTIC_DEBUG', '0') == '1'
         self.recent = []                # the needs of the last small allocating forwards
         self.small = int(_env('XTIER_CACHE_ELASTIC_SMALL', 4096))
         self.released = self.added = 0
@@ -149,40 +157,39 @@ class Governor:
 
     # --- sizes ---
 
-    def predict(self, tokens, draft):
-        """Bytes a forward of `tokens` tokens needs on top of what is in use (None: no forward this large seen yet):
-        interpolated on the running maximum of the needs seen, the smallest size's below it."""
-        seen = self.seen.get(draft, [])
-        if not seen or tokens > seen[-1][0]:
+    def predict(self, tokens, draft, ctx):
+        """Bytes a forward of `tokens` tokens at a context of `ctx` tokens needs on top of what is in use (None: no
+        need seen bounds it): the tightest bound from the needs seen, each scaled by how much larger this forward is
+        in tokens and in context, if at most `extrapolate` times."""
+        if ctx is None or tokens < 1:
             return None
-        top, prev = 0, None
-        for t, n in seen:
-            top = max(top, n)
-            if t >= tokens:
-                if prev is None or t == prev[0]:
-                    return top * self.margin
-                t0, n0 = prev
-                return (n0 + (top - n0) * (tokens - t0) / (t - t0)) * self.margin
-            prev = (t, top)
-        return top * self.margin
+        best = None
+        for (t, c), n in self.seen.get(draft, {}).items():
+            f = max(1.0, tokens / t) * max(1.0, ctx / c)
+            if f <= self.extrapolate and (best is None or n * f < best):
+                best = n * f
+        return None if best is None else best * self.margin
 
-    def learn(self, tokens, draft, need):
+    @staticmethod
+    def _grid(x):
+        """x rounded down to eighths of an octave."""
+        return 2 ** (math.floor(8 * math.log2(x)) / 8)
+
+    def learn(self, tokens, draft, need, ctx):
+        """A forward's need, at its size and context rounded down to eighths of an octave (the largest need seen there;
+        rounding down keeps every bound valid)."""
         if tokens <= self.small:
             self.recent = (self.recent + [need])[-32:]
-        seen = self.seen.setdefault(draft, [])
-        for i, (t, n) in enumerate(seen):
-            if t == tokens:
-                seen[i] = (t, max(n, need))
-                return
-        seen.append((tokens, need))
-        seen.sort()
-        if len(seen) > 64:   # keep the size classes apart: the largest need per power of two
-            kept = {}
-            for t, n in seen:
-                b = t.bit_length()
-                if b not in kept or n >= kept[b][1]:
-                    kept[b] = (t, n)
-            seen[:] = sorted(kept.values())
+        if self.debug:
+            logger.info('xtier elastic cache: learnt %.2f GiB for %d tokens%s at %s', need / GIB, tokens,
+                        ' (draft)' if draft else '', 'an unknown context' if ctx is None else f'a {ctx}-token context')
+        if ctx is None or tokens < 1 or ctx < 1:
+            return
+        seen = self.seen.setdefault(draft, {})
+        key = (self._grid(tokens), self._grid(ctx))
+        seen[key] = max(need, seen.pop(key, 0))   # re-inserted: the most recent last
+        if len(seen) > 1024:   # the oldest goes: a bound lost only makes the predictions more careful
+            del seen[next(iter(seen))]
 
     def bytes(self, k0, k1):
         """Memory between k0 and k1 extra slots."""
@@ -324,22 +331,26 @@ class Governor:
 
     # --- forward hooks ---
 
-    def before_alloc(self, tokens, draft):
+    def before_alloc(self, tokens, draft, ctx):
         """A forward that allocates: release what its predicted need and the reserve do not leave free."""
         self.since = 0
         self._stop_growth()   # before the free memory is read
         if self.extra <= 0:
             return
-        need = self.predict(tokens, draft)
+        what = (f'a forward of {tokens} tokens{" (draft)" if draft else ""} at '
+                f'{"an unknown context" if ctx is None else f"a {ctx}-token context"}')
+        need = self.predict(tokens, draft, ctx)
+        if self.debug:
+            logger.info('xtier elastic cache: %s predicts %s, %.1f GiB free, +%d extra', what,
+                        'nothing' if need is None else f'{need / GIB:.2f} GiB', self.free_bytes() / GIB, self.extra)
         if need is None:
-            self.release(0, f'a forward of {tokens} tokens{" (draft)" if draft else ""}, larger than any seen')
+            self.release(0, f'{what}, no need seen bounds it')
             return
         deficit = need + self.reserve - self.free_bytes()
         if deficit > 0:
             deficit = need + self.reserve - self.free_bytes(empty=True)
         if deficit > 0:
-            self.release(self.keep(deficit),
-                         f'a forward of {tokens} tokens{" (draft)" if draft else ""} (needs {need / GIB:.1f} GiB)')
+            self.release(self.keep(deficit), f'{what} (needs {need / GIB:.1f} GiB)')
 
     def after_decode(self):
         self.since += 1
@@ -382,6 +393,15 @@ def _decode_like(forward_batch):
     return mode.is_decode_or_idle() or mode.is_target_verify()
 
 
+def _context(forward_batch):
+    """The tokens the batch's requests hold, from the host-side lengths (None: not there)."""
+    n = getattr(forward_batch, 'seq_lens_sum', None)
+    if n is None:
+        cpu = getattr(forward_batch, 'seq_lens_cpu', None)
+        n = None if cpu is None else int(cpu.sum())
+    return None if n is None else int(n)
+
+
 def _oom(e):
     return isinstance(e, torch.OutOfMemoryError) or (isinstance(e, RuntimeError) and 'out of memory' in str(e))
 
@@ -412,7 +432,8 @@ def _forward(original, runner, forward_batch, *args, **kwargs):
     ids = getattr(forward_batch, 'input_ids', None)
     tokens = int(ids.shape[0]) if ids is not None and ids.dim() > 0 else 0
     draft = bool(getattr(runner, 'is_draft_worker', False))
-    _guarded(g, g.before_alloc, tokens, draft)
+    ctx = _context(forward_batch)
+    _guarded(g, g.before_alloc, tokens, draft, ctx)
     torch.cuda.reset_peak_memory_stats()
     before, held = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
     retry = False
@@ -427,7 +448,8 @@ def _forward(original, runner, forward_batch, *args, **kwargs):
         g.off = True
         torch.cuda.empty_cache()
         out = original(runner, forward_batch, *args, **kwargs)
-    g.learn(tokens, draft, max(0, torch.cuda.max_memory_allocated() - before, torch.cuda.max_memory_reserved() - held))
+    g.learn(tokens, draft, max(0, torch.cuda.max_memory_allocated() - before, torch.cuda.max_memory_reserved() - held),
+            ctx)
     return out
 
 
