@@ -80,7 +80,8 @@ def worker_cpus(threads: int) -> list[int]:
 class CpuPlan:
     """weight_pointers: addresses of w13 [E, 2I, H/2], w2 [E, H, I/2], s13 [E, 2I, H/g], s2 [E, H, I/g] (uint8; g = 16
     E4M3 for NVFP4, 32 UE8M0 for MXFP4) and g13 [E, 2], g2 [E] (float32; all ones for MXFP4). The engine keeps its own
-    sharded copy: the inputs can be released after construction."""
+    sharded copy: the inputs can be released after construction. With the first four None the shards are allocated
+    and left to the caller to fill (shards / slot_pieces) before the first forward."""
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
                  swiglu_alpha=1.0, swiglu_beta=0.0, resident=None):

@@ -39,6 +39,9 @@ void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int
 // `slots` experts (1..experts), slot j holding resident[j] (distinct experts). A route to an expert that is in no slot
 // fails the forward ("Expert N is not in RAM"); it never runs on another expert's weights. create3 = create4 with
 // slots == experts and resident[j] = j.
+// create3 / create4 with w13, w2, s13 and s2 all null allocate the shards without filling them: the caller writes
+// every slot (xtier_shard / xtier_slot_pieces, e.g. read straight from the checkpoint or the cold store) and checks
+// its block scales, before the first forward.
 void *xtier_create4(int hidden,int inter,int experts,int slots,int threads,float limit,int scale_format,
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                     const float *g13,const float *g2,const int32_t *resident);

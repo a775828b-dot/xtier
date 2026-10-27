@@ -5,7 +5,9 @@ layout: the parameters are created in host memory with the GPU method's names, s
 follows ``layer.weight_load_method``). As soon as the last expert tensor of the layer is loaded, the layer goes to
 the CPU engine (NUMA-sharded copies) and the host parameters are released in place, so host memory peaks at one copy
 of the experts plus the layers still loading, and SGLang's post-load staging (which moves a module's parameters to
-the GPU around ``process_weights_after_loading``) finds nothing left to move.
+the GPU around ``process_weights_after_loading``) finds nothing left to move. With XTIER_FAST_LOAD=1 the loader
+leaves the expert tensors alone and the shards are read from the checkpoint files instead (backend/direct.py); a
+layer whose cold-store records match the checkpoint fills its RAM slots from the store.
 
 Forward, per call of m tokens:
 - m <= XTIER_DECODE_MAX (and always inside CUDA-graph capture): through the mailbox, in slots of up to 8 tokens.
@@ -34,7 +36,7 @@ import torch
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 from xtier import config, platform
-from xtier.backend import formats, kernels
+from xtier.backend import direct, formats, kernels
 from xtier.backend.prefill import Prefill
 from xtier.engine import CpuPlan, Mailbox, placement
 
@@ -68,6 +70,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self.prefill = None
         self.mailbox = None
         self.calls = dict(decode=0, cpu_prefill=0, gpu_prefill=0, hybrid_prefill=0, split_prefill=0)
+        self._source = None     # where the bulk parameters come from: 'copy' (the loader), 'direct', 'store'
+        self._reads = []        # 'direct': the noted reads of the layer's expert tensors (direct.locate)
+        self._cold_plan = None  # 'store': the layer's cold.LayerPlan
 
     # -- construction ---------------------------------------------------------------------------------------------
     def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype,
@@ -111,17 +116,56 @@ class XTierMoEMethod(FusedMoEMethodBase):
     def _tracking_loader(self, layer, original):
         def weight_loader(param, loaded_weight, *args, **kwargs):
             name = self._names.get(id(param))
-            if name is not None and self.plan is not None:
+            if name is None:
+                return original(param, loaded_weight, *args, **kwargs)
+            if self.plan is not None:
                 raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: {name} loaded again after the hand-off')
-            result = original(param, loaded_weight, *args, **kwargs)
-            if name is not None:
-                shard = kwargs.get('shard_id', args[1] if len(args) > 1 else None)
-                expert = kwargs.get('expert_id', args[2] if len(args) > 2 else None)
-                self._record(name, shard, expert)
+            shard = kwargs.get('shard_id', args[1] if len(args) > 1 else None)
+            expert = kwargs.get('expert_id', args[2] if len(args) > 2 else None)
+            result = None
+            if not self._bypass(layer, name, loaded_weight, shard, expert):
+                result = original(param, loaded_weight, *args, **kwargs)
                 platform.bulk_copy()   # this checkpoint file is mostly XTier experts: read the next ones ahead
+            self._record(name, shard, expert)
             return result
         weight_loader.xtier_inline = True   # runs on the loading thread (backend.hooks)
         return weight_loader
+
+    def _bypass(self, layer, name, w, shard, expert):
+        """Whether the loader leaves checkpoint tensor `w` alone: the layer's shards are filled from the checkpoint
+        files (the read noted here for direct.fill) or from the cold store (cold.attach_loaded)."""
+        if name not in self.format.bulk:
+            return False   # global scales: through the loader
+        if self._source is None:
+            self._source = self._choose_source(layer)
+        if self._source == 'store':
+            return True
+        if self._source != 'direct':
+            return False
+        read = direct.locate(self.format.bulk.index(name), shard, expert, w, self.hidden, self.inter, self.experts,
+                             self.format.name)
+        if read is None:
+            if self._reads:   # the reads' [gate; up] rows and a loader's [up; gate] rows must not mix in one layer
+                raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: {name} of expert {expert} ({shard}) cannot be '
+                                   'read as it is after other expert tensors were (XTIER_FAST_LOAD=0 loads them)')
+            self._source = 'copy'
+            return False
+        self._reads.append(read)
+        return True
+
+    def _choose_source(self, layer):
+        from xtier.cache import cold
+        if os.environ.get('XTIER_PREFILL_FROM_SHARDS', '1') != '1':
+            return 'copy'   # the prefill copies the inputs then
+        if cold.enabled() and not self.cfg.draft and 0 < self.cfg.cache_slots < self.experts:
+            lp = cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
+            if cold.load_enabled() and cold.loadable(lp, self.hidden, self.inter, self.format.name, self.cfg.threads):
+                self._cold_plan = lp
+                return 'store'
+            return 'copy'   # attach writes or checks the records from the loaded experts
+        if direct.enabled() and getattr(layer, 'moe_tp_size', 1) == 1:
+            return 'direct'
+        return 'copy'
 
     def _record(self, name, shard, expert):
         kind = self.format.required[name]
@@ -155,23 +199,36 @@ class XTierMoEMethod(FusedMoEMethodBase):
             self._convert(layer)
 
     def _convert(self, layer):
-        up_first = bool(getattr(self.gpu_method, 'load_up_proj_weight_first', False))
-        inputs = self.format.engine_inputs(layer, up_first)
-        if any(t.device.type != 'cpu' for t in inputs):
-            inputs = [t.cpu() for t in inputs]
+        source = self._source or 'copy'
+        if source == 'copy':
+            up_first = bool(getattr(self.gpu_method, 'load_up_proj_weight_first', False))
+            inputs = self.format.engine_inputs(layer, up_first)
+        else:   # the bulk parameters were never filled: the shards are, below
+            inputs = (None,) * 4 + self.format.globals(layer)
+        if any(t is not None and t.device.type != 'cpu' for t in inputs):
+            inputs = [t if t is None else t.cpu() for t in inputs]
         # TP: this rank holds the I / tp slice of every expert; SGLang all-reduces the partial outputs
         placement.apply(self.cfg.threads, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
         t0 = time.perf_counter()
-        pointers = [t.data_ptr() for t in inputs]
+        pointers = [None if t is None else t.data_ptr() for t in inputs]
         from xtier.cache import cold
         lp = None   # cold experts (XTIER_COLD=1): partly cached layers of the model keep part of the experts in RAM
         if cold.enabled() and not self.cfg.draft and 0 < self.cfg.cache_slots < self.experts:
-            lp = cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
+            lp = self._cold_plan or cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
         self.plan = CpuPlan(self.experts, self.cfg.threads, pointers, hidden=self.hidden, inter=self.inter,
                             swiglu_limit=self.swiglu_limit, scale_format=self.format.name,
                             swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
                             resident=lp.resident if lp else None)
-        prefill_cold = cold.attach(self.plan, lp, inputs, self.format.name) if lp else None
+        how = ''
+        if source == 'direct':   # read while the loader goes on; done and checked at the end of loading (direct.finish)
+            nbytes = direct.start(self.plan, self._reads, self.format.name, self.cfg.layer_id)
+            how = f', {nbytes / 1e9:.1f} GB being read from the checkpoint'
+            self._reads = []
+        if source == 'store':   # read while the loader goes on, as a direct layer's
+            prefill_cold = cold.attach_loaded(self.plan, lp, self.format.name)
+            how = ', being read from the cold store'
+        else:
+            prefill_cold = cold.attach(self.plan, lp, inputs, self.format.name) if lp else None
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
@@ -194,8 +251,10 @@ class XTierMoEMethod(FusedMoEMethodBase):
             p = getattr(layer, name, None)
             if p is not None:
                 p.data = torch.empty(0, dtype=p.dtype)   # the model's parameter dict may still hold p
-        logger.info('xtier: layer %d: %d experts (H %d, I %d, %s) on the CPU engine in %.2f s', self.cfg.layer_id,
-                    self.experts, self.hidden, self.inter, self.format.name, time.perf_counter() - t0)
+        logger.info('xtier: layer %d: %d experts (H %d, I %d, %s) on the CPU engine in %.2f s%s', self.cfg.layer_id,
+                    self.experts, self.hidden, self.inter, self.format.name, time.perf_counter() - t0, how)
+        if direct.digest_enabled() and source == 'copy':   # the others' once their reads are done (direct.finish)
+            logger.info('xtier: layer %d: shards digest %s', self.cfg.layer_id, direct.digest(self.plan))
 
     def process_weights_after_loading(self, layer):
         if self.plan is None:   # some expert tensor never came through the loader

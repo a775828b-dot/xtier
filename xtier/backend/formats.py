@@ -9,10 +9,15 @@ import torch
 class Format:
     name = ''          # engine scale format
     required = {}      # parameter -> 'w13' (needs the w1 and w3 shards, or the fused w13) or 'w2', per expert
+    bulk = ()          # the parameters behind w13, w2, s13, s2: bytes as the checkpoint stores them (direct.py)
     derived = ()       # parameters the method derives from the empty tensors at creation (dropped)
     # The required parameters are released once the engine has its copy; small ones (input scales) stay.
 
     def engine_inputs(self, layer, up_first: bool):
+        raise NotImplementedError
+
+    def globals(self, layer):
+        """g13 [E, 2] and g2 [E] (float32), without touching the bulk parameters."""
         raise NotImplementedError
 
 
@@ -33,16 +38,19 @@ class ModelOptNvFp4(Format):
     name = 'nvfp4'
     required = {'w13_weight': 'w13', 'w2_weight': 'w2', 'w13_weight_scale': 'w13', 'w2_weight_scale': 'w2',
                 'w13_weight_scale_2': 'w13', 'w2_weight_scale_2': 'w2'}
+    bulk = ('w13_weight', 'w2_weight', 'w13_weight_scale', 'w2_weight_scale')
     derived = ('w13_blockscale_swizzled', 'w2_blockscale_swizzled')
 
     def engine_inputs(self, layer, up_first):
+        return (_gate_up(layer.w13_weight.data, up_first), layer.w2_weight.data.contiguous(),
+                _gate_up(layer.w13_weight_scale.data.view(torch.uint8), up_first),
+                layer.w2_weight_scale.data.view(torch.uint8).contiguous()) + self.globals(layer)
+
+    def globals(self, layer):
         g13 = layer.w13_weight_scale_2.data.float()   # per-tensor scales always stay [gate, up]
         if g13.dim() == 1:
             g13 = g13[:, None].expand(-1, 2)
-        return (_gate_up(layer.w13_weight.data, up_first), layer.w2_weight.data.contiguous(),
-                _gate_up(layer.w13_weight_scale.data.view(torch.uint8), up_first),
-                layer.w2_weight_scale.data.view(torch.uint8).contiguous(), g13.contiguous(),
-                layer.w2_weight_scale_2.data.float().contiguous())
+        return g13.contiguous(), layer.w2_weight_scale_2.data.float().contiguous()
 
 
 class CompressedTensorsNvFp4(Format):
@@ -52,15 +60,18 @@ class CompressedTensorsNvFp4(Format):
     name = 'nvfp4'
     required = {'w13_weight_packed': 'w13', 'w2_weight_packed': 'w2', 'w13_weight_scale': 'w13', 'w2_weight_scale': 'w2',
                 'w13_weight_global_scale': 'w13', 'w2_weight_global_scale': 'w2'}
+    bulk = ('w13_weight_packed', 'w2_weight_packed', 'w13_weight_scale', 'w2_weight_scale')
 
     def engine_inputs(self, layer, up_first):
+        return (_gate_up(layer.w13_weight_packed.data, up_first), layer.w2_weight_packed.data.contiguous(),
+                _gate_up(layer.w13_weight_scale.data.view(torch.uint8), up_first),
+                layer.w2_weight_scale.data.view(torch.uint8).contiguous()) + self.globals(layer)
+
+    def globals(self, layer):
         g13 = layer.w13_weight_global_scale.data.float().reciprocal()   # per-tensor scales always stay [gate, up]
         if g13.dim() == 1:
             g13 = g13[:, None].expand(-1, 2)
-        return (_gate_up(layer.w13_weight_packed.data, up_first), layer.w2_weight_packed.data.contiguous(),
-                _gate_up(layer.w13_weight_scale.data.view(torch.uint8), up_first),
-                layer.w2_weight_scale.data.view(torch.uint8).contiguous(), g13.contiguous(),
-                layer.w2_weight_global_scale.data.float().reciprocal().contiguous())
+        return g13.contiguous(), layer.w2_weight_global_scale.data.float().reciprocal().contiguous()
 
 
 def _ue8m0_bytes(t: torch.Tensor) -> torch.Tensor:
@@ -83,13 +94,16 @@ class Fp8Fp4Experts(Format):
     global scales."""
     name = 'mxfp4'
     required = {'w13_weight': 'w13', 'w2_weight': 'w2', 'w13_weight_scale_inv': 'w13', 'w2_weight_scale_inv': 'w2'}
+    bulk = ('w13_weight', 'w2_weight', 'w13_weight_scale_inv', 'w2_weight_scale_inv')
 
     def engine_inputs(self, layer, up_first):
-        E = layer.w13_weight.data.shape[0]
         return (_gate_up(layer.w13_weight.data.view(torch.uint8), up_first), layer.w2_weight.data.view(torch.uint8).contiguous(),
                 _gate_up(_ue8m0_bytes(layer.w13_weight_scale_inv.data), up_first),
-                _ue8m0_bytes(layer.w2_weight_scale_inv.data), torch.ones((E, 2), dtype=torch.float32),
-                torch.ones((E,), dtype=torch.float32))
+                _ue8m0_bytes(layer.w2_weight_scale_inv.data)) + self.globals(layer)
+
+    def globals(self, layer):
+        E = layer.w13_weight.data.shape[0]
+        return torch.ones((E, 2), dtype=torch.float32), torch.ones((E,), dtype=torch.float32)
 
 
 def detect(gpu_method) -> Format:

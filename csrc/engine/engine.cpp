@@ -1042,7 +1042,7 @@ template<bool MX> class Plan: public PlanBase {
 #endif
     }
     void task(int node,int lane,int lanes) {
-        if(phase==0) {if(lane==0)initialize_shard(node);return;}
+        if(phase==0) {if(lane==0&&source13)initialize_shard(node);return;}   // no sources: the caller fills them
         if(read_only){read_rows(node,lane,lanes);return;}
         if(hidden==2560&&inter==640)run<2560,640>(node,lane,lanes);        // Qwen3.8 Flash Next
         else if(hidden==5120&&inter==2304)run<5120,2304>(node,lane,lanes); // DeepSeek V4.1 Flash
@@ -1094,8 +1094,10 @@ public:
         for(float g:globals13)if(!std::isfinite(g)||g<=0)throw std::runtime_error("Invalid global scale");
         for(float g:globals2)if(!std::isfinite(g)||g<=0)throw std::runtime_error("Invalid global scale");
         const size_t E=e,H=h,I=i;
-        for(size_t j=0;j<E*2*I*H/(format?32:16);j++)if(s13[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
-        for(size_t j=0;j<E*H*I/(format?32:16);j++)if(s2[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
+        if(s13) {   // without sources the caller writes the shards and checks their scales (xtier/backend/direct.py)
+            for(size_t j=0;j<E*2*I*H/(format?32:16);j++)if(s13[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
+            for(size_t j=0;j<E*H*I/(format?32:16);j++)if(s2[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
+        }
         const size_t IN=I/nodes,HN=H/nodes,S=slots;
         for(int node=0;node<nodes;node++) {
             auto &s=shards[node];const int mem=topology().memory[node];
@@ -1389,7 +1391,8 @@ void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,floa
         if(!__builtin_cpu_supports("avx2")||!__builtin_cpu_supports("fma"))
             throw std::runtime_error("AVX2/FMA required");
 #endif
-        if(experts<10||experts>MAX_EXPERTS||threads<1||threads>128||!w13||!w2||!s13||!s2||!g13||!g2)
+        const bool empty=!w13&&!w2&&!s13&&!s2;   // all four null: shards allocated, not filled
+        if(experts<10||experts>MAX_EXPERTS||threads<1||threads>128||(!empty&&(!w13||!w2||!s13||!s2))||!g13||!g2)
             throw std::runtime_error("Invalid create arguments");
         if(scale_format==1)return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1)};
         if(scale_format!=0)throw std::runtime_error("Unknown scale format");
@@ -1407,8 +1410,9 @@ void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int th
         if(!__builtin_cpu_supports("avx2")||!__builtin_cpu_supports("fma"))
             throw std::runtime_error("AVX2/FMA required");
 #endif
-        if(experts<10||experts>MAX_EXPERTS||slots<1||slots>experts||threads<1||threads>128||!w13||!w2||!s13||!s2||!g13||!g2
-           ||!resident)
+        const bool empty=!w13&&!w2&&!s13&&!s2;   // all four null: slots allocated, not filled
+        if(experts<10||experts>MAX_EXPERTS||slots<1||slots>experts||threads<1||threads>128
+           ||(!empty&&(!w13||!w2||!s13||!s2))||!g13||!g2||!resident)
             throw std::runtime_error("Invalid create arguments");
         if(scale_format==1)
             return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1,

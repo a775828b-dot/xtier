@@ -43,6 +43,8 @@ def install(registry, hook_type):
         return cfg if cfg is not None else original_fn(server_args, layer_idx, *args, **kwargs)
 
     def after_load(result, model_runner, *args, **kwargs):
+        from xtier.backend import direct
+        direct.close()   # XTIER_FAST_LOAD: every layer's reads done and checked, then the readers go
         check(model_runner)
         return result
 

@@ -18,10 +18,16 @@ the layer it routes to, the next layer's ahead (X x the experts' bytes / the dri
   XTIER_COLD_HALF_LIFE=50        forwards over which a use count halves (decode steps)
   XTIER_COLD_THREADS=8           readers per drive
   XTIER_COLD_KEY                 store name (default: the model directory's name and the layer shape)
+  XTIER_FAST_LOAD=1              fast load (backend/direct.py): a layer whose records were written from (or checked
+                                 against) this checkpoint skips its expert tensors, its RAM slots are read from the
+                                 store (loadable, attach_loaded)
 The ranking is XTIER_CACHE_PROFILE's (the hot-expert pool's), then expert order. The store is reused across
 restarts: the manifest (first directory, KEY.json) names every layer's records, which are checked by two 4 KiB
-samples each; a layer whose records are missing or differ is written again (a few seconds per layer).
+samples each; a layer whose records are missing or differ is written again (a few seconds per layer). Each layer
+also notes the checkpoint its records match (source: the model files' names, sizes and modification times), saved
+only after its records are flushed to the drives.
 """
+import hashlib
 import json
 import logging
 import os
@@ -48,12 +54,35 @@ def _float(name, default):
     return float(os.environ.get(name, default))
 
 
-def _model_name():
+def _model_dir():
     try:
         from sglang.srt.runtime_context import get_model
-        return Path(get_model().model_path.rstrip('/')).name
-    except Exception:   # noqa: BLE001 - outside a server (tests)
-        return 'model'
+        return Path(get_model().model_path.rstrip('/'))
+    except Exception:   # noqa: BLE001 - outside a server (tests: XTIER_COLD_SOURCE)
+        return Path(os.environ.get('XTIER_COLD_SOURCE', 'model'))
+
+
+def _model_name():
+    return _model_dir().name
+
+
+def load_enabled():
+    return os.environ.get('XTIER_FAST_LOAD', '0') == '1'
+
+
+_source = []
+
+
+def source():
+    """The checkpoint a layer's records match: its .safetensors and .json files' names, sizes and modification times."""
+    if not _source:
+        h = hashlib.sha1()
+        d = _model_dir()
+        for p in sorted(list(d.glob('*.safetensors')) + list(d.glob('*.json'))):
+            s = p.stat()
+            h.update(f'{p.name} {s.st_size} {s.st_mtime_ns}\n'.encode())
+        _source.append(h.hexdigest()[:16])
+    return _source[0]
 
 
 class Store:
@@ -91,9 +120,28 @@ class Store:
         self.written = self.reused = 0
 
     def save(self):
+        """The manifest replaced on the drive before the records it drops are overwritten (fsync, then the rename)."""
         tmp = self.manifest_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(self.manifest))
+        with open(tmp, 'w') as f:
+            f.write(json.dumps(self.manifest))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.manifest_path)
+        _fsync(self.manifest_path.parent, os.fsync)
+
+    def sync(self):
+        """The records written so far on the drives themselves (their write caches flushed): only then may a manifest
+        entry vouch for them, XTIER_FAST_LOAD reads them without checking against the checkpoint."""
+        for p in self.paths:
+            _fsync(p, os.fdatasync)
+
+
+def _fsync(path, how):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        how(fd)
+    finally:
+        os.close(fd)
 
 
 def store(key):
@@ -158,27 +206,95 @@ def _sample(inputs, e, nodes, H, I, group):
     return zlib.crc32(b, zlib.crc32(a))
 
 
+def _layout(H, I, nodes, scale_format):
+    """The six pieces of one node part of a record (xtier_slot_pieces order), the part's and the record's bytes."""
+    group = 32 if scale_format == 'mxfp4' else 16
+    IN, HN = I // nodes, H // nodes
+    sizes = [IN * H // 2, IN * H // 2, IN * H // group, IN * H // group, HN * I // 2, HN * I // group]
+    part = sum(sizes)
+    if part % 512 or min(sizes) < 4096:
+        raise RuntimeError(f'xtier cold: record pieces {sizes} are not whole 512-byte blocks')
+    return sizes, part, nodes * part
+
+
+def _key(E, H, I, scale_format, nodes):
+    return os.environ.get('XTIER_COLD_KEY') or f'{_model_name()}-E{E}-H{H}-I{I}-{scale_format}-n{nodes}'
+
+
+def _where(drive_of, counts, part):
+    share = [c * part for c in counts]   # a record's bytes on each drive
+    rank_in = [drive_of[:n].count(drive_of[n]) for n in range(len(drive_of))]   # a part's place among its drive's parts
+
+    def where(starts, i, n):   # (drive, offset) of node part n of the layer's i-th stored record
+        d = drive_of[n]
+        return d, starts[d] + i * share[d] + rank_in[n] * part
+    return where
+
+
+def _nodes(threads):
+    """The NUMA nodes of the engine's workers for `threads`: the node count of a plan of this process."""
+    from xtier.engine import worker_cpus
+    found = set()
+    for c in worker_cpus(threads):
+        found.update(n for n in os.listdir(f'/sys/devices/system/cpu/cpu{c}') if n.startswith('node') and n[4:].isdigit())
+    return len(found)
+
+
+def loadable(lp, hidden, inter, scale_format, threads):
+    """Whether the store holds layer lp's records as attach wrote or checked them from this checkpoint: the layer can
+    leave its expert tensors unread and fill its RAM slots from the store (attach_loaded)."""
+    nodes = _nodes(threads)
+    _, _, record = _layout(hidden, inter, nodes, scale_format)
+    st = store(_key(lp.experts, hidden, inter, scale_format, nodes))
+    counts, _ = _drive_parts(nodes, len(st.paths))
+    with st.lock:
+        entry = st.manifest['layers'].get(str(lp.layer_id))
+        return (entry is not None and entry.get('source') == source() and entry.get('record') == record
+                and entry.get('stored') == lp.stored and len(entry.get('starts', [])) == len(st.paths)
+                and entry.get('parts', counts) == counts)
+
+
+class _Ticket:
+    """A store read as a future: direct.finish waits for it at the end of loading."""
+
+    def __init__(self, native, ticket):
+        self.native, self.ticket = native, ticket
+
+    def result(self):
+        self.native.finish(self.ticket)
+
+
+def attach_loaded(plan, lp, scale_format):
+    """After the plan is created from lp.resident without sources (loadable was true, the layer's expert tensors were
+    not read): its RAM slots read from the store while the loader goes on (done and their scales checked at the end of
+    loading: direct.finish), the cold experts attached as attach does. Returns the layer's PrefillCold."""
+    from xtier.backend import direct
+    nodes, H, I, E = plan.nodes(), plan.hidden, plan.inter, plan.experts
+    sizes, part, record = _layout(H, I, nodes, scale_format)
+    st = store(_key(E, H, I, scale_format, nodes))
+    counts, drive_of = _drive_parts(nodes, len(st.paths))
+    where = _where(drive_of, counts, part)
+    t0 = time.time()
+    with st.lock:
+        starts = st.manifest['layers'][str(lp.layer_id)]['starts']
+    index = {e: i for i, e in enumerate(lp.stored)}
+    jobs = [(*where(starts, index[e], n), plan.slot_pieces(j, n)) for j, e in enumerate(lp.resident) for n in range(nodes)]
+    direct.defer(plan, _Ticket(st.native, st.native.submit(jobs, [0] * len(jobs), 1)), scale_format, lp.layer_id)
+    return _attach(plan, lp, st, starts, where, sizes, part, nodes, record,
+                   f'matching this checkpoint, {plan.slots * record / 1e9:.1f} GB being read into the RAM slots', t0)
+
+
 def attach(plan, lp, inputs, scale_format):
     """After the plan is created from lp.resident: the records of the layer's stored experts (written, or checked and
     reused), then the plan's forwards handle the cold experts (xtier_cold_attach). Returns the layer's PrefillCold."""
     group = 32 if scale_format == 'mxfp4' else 16
     nodes, H, I, E = plan.nodes(), plan.hidden, plan.inter, plan.experts
-    IN, HN = I // nodes, H // nodes
-    sizes = [IN * H // 2, IN * H // 2, IN * H // group, IN * H // group, HN * I // 2, HN * I // group]
-    part = sum(sizes)
-    record = nodes * part
-    if part % 512 or min(sizes) < 4096:
-        raise RuntimeError(f'xtier cold: record pieces {sizes} are not whole 512-byte blocks')
-    st = store(os.environ.get('XTIER_COLD_KEY') or f'{_model_name()}-E{E}-H{H}-I{I}-{scale_format}-n{nodes}')
+    sizes, part, record = _layout(H, I, nodes, scale_format)
+    st = store(_key(E, H, I, scale_format, nodes))
     D = len(st.paths)
     counts, drive_of = _drive_parts(nodes, D)
     share = [c * part for c in counts]   # a record's bytes on each drive
-    rank_in = [drive_of[:n].count(drive_of[n]) for n in range(nodes)]   # a part's place among its drive's parts
-
-    def where(starts, i, n):   # (drive, offset) of node part n of the layer's i-th stored record
-        d = drive_of[n]
-        return d, starts[d] + i * share[d] + rank_in[n] * part
-
+    where = _where(drive_of, counts, part)
     key = str(lp.layer_id)
     t0 = time.time()
     with st.lock:
@@ -201,6 +317,10 @@ def attach(plan, lp, inputs, scale_format):
         if reuse:
             starts = entry['starts']
             st.reused += 1
+            if entry.get('source') != source():   # checked against this checkpoint: the next start may read them
+                st.sync()
+                entry['source'] = source()
+                st.save()
         else:
             size = [len(lp.stored) * b for b in share]   # on each drive
             if layout_ok or (entry is not None and entry.get('record') == record and len(entry.get('starts', [])) == D
@@ -223,10 +343,17 @@ def attach(plan, lp, inputs, scale_format):
                 t.start()
             for t in threads:
                 t.join()
+            st.sync()
             st.manifest['layers'][key] = dict(record=record, stored=lp.stored, starts=starts, parts=counts,
-                                              ends=[s + z for s, z in zip(starts, size)])
+                                              ends=[s + z for s, z in zip(starts, size)], source=source())
             st.save()
             st.written += 1
+    return _attach(plan, lp, st, starts, where, sizes, part, nodes, record, 'reused' if reuse else 'written', t0)
+
+
+def _attach(plan, lp, st, starts, where, sizes, part, nodes, record, how, t0):
+    """The cold experts handled by the plan's forwards, the layer's PrefillCold linked to the previous layer's."""
+    E = plan.experts
     files, offsets = [-1] * (E * nodes), [0] * (E * nodes)   # per expert and node part
     for i, e in enumerate(lp.stored):
         for n in range(nodes):
@@ -242,8 +369,8 @@ def attach(plan, lp, inputs, scale_format):
     _layers.append((lp.layer_id, plan, pc, record))
     _start_reporter()
     logger.info('xtier cold: layer %d: %d of %d experts in RAM, %d records (%.1f GB) on %d drives %s in %.1f s',
-                lp.layer_id, plan.slots, E, len(lp.stored), len(lp.stored) * record / 1e9, D,
-                'reused' if reuse else 'written', time.time() - t0)
+                lp.layer_id, plan.slots, E, len(lp.stored), len(lp.stored) * record / 1e9, len(st.paths), how,
+                time.time() - t0)
     return pc
 
 

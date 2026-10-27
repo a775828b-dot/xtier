@@ -9,7 +9,10 @@
   XTIER_MAIN_CPUS=auto|list  CPUs of every other thread of the process (auto: all but the expert workers and the
                              mailbox dispatcher); unset: unchanged
   XTIER_PROBE_DISPATCH_CPU   CPU of the mailbox dispatcher thread (default: a free CPU, see engine/placement.py)
-  XTIER_DECODE_MAX=64        calls of up to this many tokens use the mailbox (CUDA-graph capturable); larger ones
+  XTIER_FAST_LOAD=0          1: fast load, the experts read straight into the CPU engine from the checkpoint files
+                             (with cold experts a layer's RAM slots from the cold store), all of them read and checked
+                             before the server comes up (backend/direct.py; XTIER_LOAD_DIGEST=1 logs each layer's digest)
+  XTIER_DECODE_MAX=64       calls of up to this many tokens use the mailbox (CUDA-graph capturable); larger ones
                              are prefill
   XTIER_CPU_PREFILL_BATCH=1024  tokens per synchronous CPU engine call in prefill
   XTIER_GPU_PREFILL_MIN=1024 prefill calls of at least this many tokens upload the experts and run on the GPU
