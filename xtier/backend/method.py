@@ -163,14 +163,21 @@ class XTierMoEMethod(FusedMoEMethodBase):
         placement.apply(self.cfg.threads, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
         t0 = time.perf_counter()
         pointers = [t.data_ptr() for t in inputs]
+        from xtier.cache import cold
+        lp = None   # cold experts (XTIER_COLD=1): partly cached layers of the model keep part of the experts in RAM
+        if cold.enabled() and not self.cfg.draft and 0 < self.cfg.cache_slots < self.experts:
+            lp = cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
         self.plan = CpuPlan(self.experts, self.cfg.threads, pointers, hidden=self.hidden, inter=self.inter,
                             swiglu_limit=self.swiglu_limit, scale_format=self.format.name,
-                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta)
+                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
+                            resident=lp.resident if lp else None)
+        prefill_cold = cold.attach(self.plan, lp, inputs, self.format.name) if lp else None
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
                                swiglu_beta=self.swiglu_beta)
         self.prefill.order = self.cfg.layer_id   # the cross-layer prefetch links layers in this order
+        self.prefill.cold = prefill_cold
         del inputs, pointers
         self.mailbox = Mailbox(self.plan)
         self.pool = None
@@ -181,6 +188,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
             if self.pool.full:   # a staged prefill reads the experts from the slots instead of host memory
                 self.prefill._upload_chunk = self._upload_from_cache
         self.plan.pool = self.pool   # read by the prefill (residency of the FP4 path)
+        if prefill_cold is not None:   # cold experts the pool holds are copied from it, not read
+            prefill_cold.pool = self.pool
         for name in self.format.required:
             p = getattr(layer, name, None)
             if p is not None:
@@ -342,7 +351,23 @@ class XTierMoEMethod(FusedMoEMethodBase):
             out = torch.empty_like(x)
             self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream)
             return out
-        gpu = ids < g
+        table = None
+        cold = self.prefill.cold
+        if cold is None:
+            gpu = ids < g
+        else:   # cold experts: the CPU takes RAM slots [lo, hi), whole upload chunks below the cold staging; its
+            # experts are in RAM, so its forward reads nothing and moves no slot while the GPU part uploads
+            CH = self.prefill.chunk
+            hi = cold.C // CH * CH
+            lo = max(0, hi - (E - g) // CH * CH)
+            if lo >= hi:
+                out = torch.empty_like(x)
+                self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream)
+                return out
+            table = self.plan.slot_table()   # before the CPU part runs (slot_table refuses during a forward)
+            slot = torch.tensor(table, dtype=torch.int64, device=ids.device)[ids.clamp(min=0).long()]
+            gpu = (slot < lo) | (slot >= hi)
+            g = E - (hi - lo)   # for the cost model: the CPU's experts
         ids_g = torch.where(gpu, ids, -1).to(torch.int32).contiguous()
         w_g = torch.where(gpu, weights, 0.0).contiguous()
         x_h = torch.empty((m, H), dtype=torch.bfloat16, pin_memory=True)
@@ -371,7 +396,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         t0 = time.perf_counter()
         try:
             self.prefill.run(x.data_ptr(), out_g.data_ptr(), ids_g.data_ptr(), w_g.data_ptr(), m, k, stream,
-                             output_dtype=torch.float32)
+                             output_dtype=torch.float32, cold_table=table)
             gpu_s = time.perf_counter() - t0   # the GPU part only; the join may wait for the CPU
         finally:
             worker.join()

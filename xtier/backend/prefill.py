@@ -309,7 +309,9 @@ class Prefill:
         # XTIER_PREFILL_PREFETCH=1: while this layer computes, the copy engine uploads
         # the next layer's first weight chunk into a free staging slot. The successor is
         # learned from the observed call order (a mismatch only costs a normal upload).
-        self.learned_ring = os.environ.get('XTIER_PREFILL_PREFETCH') == '1'
+        # no cross-layer prefetch with cold experts (xtier/cache/cold.py): a layer's virtual expert order exists only
+        # during its own call
+        self.learned_ring = os.environ.get('XTIER_PREFILL_PREFETCH') == '1' and os.environ.get('XTIER_COLD', '0') != '1'
         self.prefetch_enabled = self.learned_ring or os.environ.get('XTIER_EXPERIMENTAL_PREFILL_PREFETCH') == '1'
         # Keeping all unpacked expert weights alive across layers adds ~6 GiB
         # to the next attention call. Return them to the allocator by default.
@@ -342,6 +344,8 @@ class Prefill:
         self.weights = []
         self.shards = None
         self.native = native
+        self.cold = None          # cold experts (cold.PrefillCold): this call's virtual expert order
+        self._cold_globals = None
         self.registered = False
         if native is not None and os.environ.get('XTIER_PREFILL_FROM_SHARDS', '1') == '1':
             # Upload straight from the NUMA-bound CPU shards instead of keeping a second
@@ -389,13 +393,21 @@ class Prefill:
     def _globals(self):
         # Per-projection global scales stay on the device (a few KiB per layer), so a
         # prefetch into the shared staging never races with this layer's kernels.
+        # Per expert: the hot pool and the hybrid / fully cached prefill index them by expert.
         if self.device_globals is None:
             self.device_globals = tuple(w.cuda() for w in self.weights[-2:])
         return self.device_globals
 
-    def _upload_chunk(self, slot, e0, e1, stream, up_first=False):
+    def _call_globals(self):
+        # The global scales this call's prefill kernels index: with cold experts in the
+        # call's virtual order (run), which no other caller may see.
+        return self._cold_globals if self._cold_globals is not None else self._globals()
+
+    def _upload_chunk(self, slot, e0, e1, stream, up_first=False, virtual=True):
         """Copy experts [e0, e1) into a staging slot on `stream` (bytes unchanged). up_first: W13 and
-        its scales as [up; gate] (FlashInfer CUTLASS) instead of the engine's [gate; up]."""
+        its scales as [up; gate] (FlashInfer CUTLASS) instead of the engine's [gate; up]. With cold experts
+        (virtual) e0..e1 are this call's virtual experts: the RAM slots first, then the cold staging; without
+        (virtual=False: the hot pool's fill) they are RAM slots."""
         self.ensure_registered()
         n = e1 - e0
         I = self.inter
@@ -414,13 +426,22 @@ class Prefill:
             layout = [(index, (I - first) if index in (0, 2) else first, rows, total, width)
                       for index, first, rows, total, width in self.layout]
         cudart = _runtime()
-        for node, row in enumerate(self.shards):
-            for (address, size), (index, first, rows, total, width) in zip(row, layout):
-                dst = slot[index].data_ptr() + (first + node * rows) * width
-                _check(cudart.cudaMemcpy2DAsync(dst, total * width, address + e0 * rows * width, rows * width,
-                                                rows * width, n, 1, stream), 'cudaMemcpy2DAsync')
+        parts = [(self.shards, e0, e1, 0)]   # (shards, first and end row block, first expert of the staging)
+        if virtual and self.cold is not None and self.cold.vexpert is not None:
+            C = self.cold.C
+            parts = [(self.shards, e0, min(e1, C), 0), (self.cold.shards, max(e0, C) - C, e1 - C, max(C - e0, 0))]
+        for shards, s0, s1, d0 in parts:
+            if s1 <= s0:
+                continue
+            if shards is not self.shards:   # the cold staging: read from NVMe while the RAM slots upload
+                self.cold.wait(s0, s1)
+            for node, row in enumerate(shards):
+                for (address, size), (index, first, rows, total, width) in zip(row, layout):
+                    dst = slot[index].data_ptr() + d0 * total * width + (first + node * rows) * width
+                    _check(cudart.cudaMemcpy2DAsync(dst, total * width, address + s0 * rows * width, rows * width,
+                                                    rows * width, s1 - s0, 1, stream), 'cudaMemcpy2DAsync')
 
-    def run(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16):
+    def run(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16, cold_table=None):
         global _last_plan
         if self.learned_ring:
             previous = _last_plan() if _last_plan is not None else None
@@ -429,6 +450,15 @@ class Prefill:
             if previous is not None and previous is not self and previous.order < self.order:
                 previous.next_prefill = weakref.ref(self)
             _last_plan = weakref.ref(self)
+        vids = None
+        if self.cold is not None:   # this call's virtual order, its cold experts read from NVMe
+            self._cold_globals = None
+            with torch.cuda.stream(torch.cuda.ExternalStream(stream)):
+                ids_t = _device_tensor(ids, (m, k), torch.int32)
+                self._cold_globals = self.cold.prepare(self._globals(), ids_t, cold_table)
+                vids = torch.where(ids_t >= 0, self.cold.vmap[ids_t.clamp(min=0).long()].int(), ids_t)
+            self._cold_ids = vids   # alive until the next call (the allocator reuses it in stream order)
+            ids = vids.data_ptr()
         retired = self._run(x, out, ids, routing, m, k, stream, output_dtype)
         if retired:
             self.workspace_releases += 1
@@ -488,7 +518,7 @@ class Prefill:
                 self.prefetch_hits += 1
             else:
                 self.prefetch_uploads += 1
-            g13, g2 = self._globals()
+            g13, g2 = self._call_globals()
             freed = [None] * n_slots  # event: slot contents no longer needed by compute
 
             def upload(j, slot):
@@ -817,6 +847,8 @@ class Prefill:
             for p, pool in zip((self, target), pools):
                 if pool is not None:
                     p._fp4_residency, rows = rows[:E], rows[E:]
+                    if p.cold is not None and p.cold.vexpert is not None:   # by this call's virtual experts
+                        p._fp4_residency = [p._fp4_residency[e] for e in p.cold.vexpert]
             has_skipped = host[n_chunks + 1] > 0
             rows_all = keys % m
             offsets = [0]
@@ -950,7 +982,7 @@ class Prefill:
             if _unpacked2 is None or tuple(_unpacked2[0][0].shape) != shape13:
                 _unpacked2 = [[torch.empty(shape13, dtype=torch.bfloat16, device='cuda'),
                                torch.empty(shape2, dtype=torch.bfloat16, device='cuda')] for _ in range(2)]
-            g13, g2 = self._globals()
+            g13, g2 = self._call_globals()
             slot_free = [None] * n_slots   # event on the unpack stream: slot contents consumed
             buf_free = [None, None]    # event on the compute stream: BF16 buffer no longer read
             unpacked_done = {}

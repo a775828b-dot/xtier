@@ -231,7 +231,8 @@ public:
         }
         if(any){warm_left.store(warm_rounds,std::memory_order_relaxed);prompts++;}
     }
-    void upload(PoolLayer &L,int expert,int slot) {
+    // ram: the RAM slot holding the expert (xtier_slot_pin; the expert itself without cold experts)
+    void upload(PoolLayer &L,int ram,int slot) {
         const size_t H=L.H,I=L.I,IN=I/L.nodes,HN=H/L.nodes;
         // (arena, first row, rows per node, total rows, bytes per row) of each shard tensor, as prefill._shard_layout
         const size_t lay[6][5]={{0,0,IN,2*I,H/2},{0,I,IN,2*I,H/2},{2,0,IN,2*I,H/L.group},{2,I,IN,2*I,H/L.group},
@@ -239,11 +240,22 @@ public:
         for(int node=0;node<L.nodes;node++)for(int j=0;j<6;j++) {
             const size_t *q=lay[j];
             char *dst=L.arena[q[0]]+size_t(slot)*q[3]*q[4]+(q[1]+node*q[2])*q[4];
-            const char *src=L.shard[node][j]+size_t(expert)*q[2]*q[4];
+            const char *src=L.shard[node][j]+size_t(ram)*q[2]*q[4];
             check(cudaMemcpyAsync(dst,src,q[2]*q[4],cudaMemcpyHostToDevice,copy));
         }
     }
-    struct Copy {PoolLayer *L;int in,slot;uint32_t seq;};
+    struct Copy {PoolLayer *L;int in,slot,ram;uint32_t seq;};
+    // RAM slots pinned for the copies in flight (cold experts): (seq, plan, RAM slot), released once landed
+    struct Pin {uint32_t seq;void *plan;int ram;};
+    std::vector<Pin> pins;
+    void release_pins(uint32_t done) {
+        size_t kept=0;
+        for(auto &p:pins) {
+            if(int32_t(done-p.seq)>=0)xtier_slot_unpin(p.plan,p.ram);
+            else pins[kept++]=p;
+        }
+        pins.resize(kept);
+    }
     uint32_t post(PoolLayer &L,int in,int slot) {
         int out=L.resident[slot];
         uint32_t seq=++next_seq;
@@ -262,7 +274,7 @@ public:
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         for(auto &c:todo) {
-            upload(*c.L,c.in,c.slot);
+            upload(*c.L,c.ram,c.slot);
             driver(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy),dev_seqs+32*4,c.seq,0));
         }
     }
@@ -272,6 +284,7 @@ public:
         std::vector<std::vector<float>> u;
         {std::lock_guard<std::mutex> lock(mu);for(auto &L:layers)u.push_back(L?L->usage:std::vector<float>());}
         const uint32_t done=__atomic_load_n(landed(),__ATOMIC_ACQUIRE);
+        release_pins(done);
         std::vector<std::pair<float,int>> cand,vict;
         for(size_t l=0;l<layers.size();l++) {
             auto *L=layers[l].get();if(!L)continue;
@@ -302,7 +315,15 @@ public:
         limit=std::min(limit,room);
         if(swaps_round.size()>limit)swaps_round.resize(limit);
         std::vector<Copy> todo;
-        for(auto &s:swaps_round){auto *L=layers[s.layer].get();todo.push_back({L,s.in,s.slot,post(*L,s.in,s.slot)});}
+        for(auto &s:swaps_round) {
+            auto *L=layers[s.layer].get();
+            // the RAM slot the copy reads, kept until it lands; an expert not in RAM (cold experts) is not swapped in
+            const int ram=xtier_slot_pin(L->bridge->plan,s.in);
+            if(ram<0)continue;
+            const uint32_t seq=post(*L,s.in,s.slot);
+            todo.push_back({L,s.in,s.slot,ram,seq});
+            pins.push_back({seq,L->bridge->plan,ram});
+        }
         {std::lock_guard<std::mutex> lock(mu);for(auto &L:layers)if(L)for(auto &v:L->usage)v*=decay;}
         swaps+=long(swaps_round.size());rounds++;
         copy_after_applied(todo);
@@ -666,10 +687,14 @@ int xtier_mailbox_pool_attach(void *bridge,int layer,int slots,int active,int ex
         for(int j=0;j<4;j++)L->arena[j]=static_cast<char*>(arena[j]);
         L->nodes=xtier_nodes(b->plan);
         if(L->nodes<1||L->nodes>16)throw std::runtime_error("Pool attach: invalid worker node count");
+        // the shards hold the RAM slots of the plan (fewer than its experts with cold experts)
+        std::vector<int32_t> table;table.resize(size_t(experts));
+        const int ram_slots=xtier_slot_table(b->plan,table.data());
+        if(ram_slots<1)throw std::runtime_error(xtier_last_error());
         for(int node=0;node<L->nodes;node++) {
             void *ptr[6];size_t bytes[6];
             if(xtier_shard(b->plan,node,ptr,bytes)<0)throw std::runtime_error(xtier_last_error());
-            const size_t scale_width=bytes[2]/(size_t(L->E)*(L->I/L->nodes));
+            const size_t scale_width=bytes[2]/(size_t(ram_slots)*(L->I/L->nodes));
             if(!scale_width || size_t(L->H)%scale_width)throw std::runtime_error("Invalid scale shard width");
             const int group=L->H/scale_width;
             if((group!=16&&group!=32)||(node&&group!=L->group))throw std::runtime_error("Invalid scale group");

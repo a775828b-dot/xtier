@@ -96,7 +96,8 @@ def split_prefill_max() -> int:
     split the experts: the GPU takes the first g (whole chunks) and the CPU engine the others at the same time, g
     balancing the measured upload time per expert against the CPU time per expert and token (lkqmoe 0.5.6's hybrid
     prefill; DeepSeek V4.1 production: 6144). XTIER_SPLIT_CPU_US=0.285: the first CPU estimate in microseconds per
-    expert and token at H 5120 x I 2304 (scaled by H x I)."""
+    expert and token at H 5120 x I 2304 (scaled by H x I). With cold experts (XTIER_COLD=1) the CPU takes a block of
+    RAM slots instead (method.py _split_prefill)."""
     return _int('XTIER_SPLIT_PREFILL_MAX', 0)
 
 

@@ -342,8 +342,8 @@ Bytes alloc(size_t n,int node) {
     return memory; // Pages are committed by their owning workers during initialization.
 }
 struct Shard {Bytes gate,up,down,sg,su,sd;};
-// row: first intermediate row of this group (prefix sum of counts; compact layout).
-struct Group {int expert=0,count=0,row=0;int token[MAX_M]{};float route[MAX_M]{};};
+// row: first intermediate row of this group (prefix sum of counts; compact layout); slot: the RAM slot of the expert's weights.
+struct Group {int expert=0,slot=0,count=0,row=0;int token[MAX_M]{};float route[MAX_M]{};};
 struct alignas(64) Done {std::atomic<uint64_t> epoch{0};};
 
 class Executor {
@@ -525,6 +525,12 @@ const MxTables& mx_tables(){static const MxTables tables;return tables;}
 
 // One generic implementation, specialised once at plan construction. No format branch
 // or variable scale stride remains in an NVFP4 weight loop.
+// cold/store.cpp's reads, handed over by the dispatch library (it owns the store): xtier_cold_read (synchronous) and
+// xtier_cold_submit / xtier_cold_finish (a ticket; finish waits for every job). dispatch.cpp has the same table.
+using ColdRead=int(*)(void*,int,const int*,const long long*,void*const*,const size_t*,int);
+using ColdSubmit=void*(*)(void*,int,const int*,const long long*,void*const*,const size_t*,int,const int*,int);
+using ColdFinish=int(*)(void*,void*);
+struct ColdIO {ColdRead read;ColdSubmit submit;ColdFinish finish;};
 struct PlanBase {
     virtual ~PlanBase()=default;
     virtual int forward(int,int,const uint16_t*,const int32_t*,const float*,float*)=0;
@@ -535,6 +541,14 @@ struct PlanBase {
     virtual int node_count() const=0;
     virtual void shard(int,void**,size_t*) const=0;
     virtual void set_swiglu(float alpha,float beta)=0;
+    virtual int place(int expert,int slot)=0;
+    virtual int slot_table(int32_t *table)=0;
+    virtual int slot_pieces(int slot,int node,void **pointers,size_t *bytes) const=0;
+    virtual int attach_cold(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,const float *scores,
+                            float half_life)=0;
+    virtual int pin(int expert)=0;
+    virtual void unpin(int slot)=0;
+    virtual void cold_stats(double *out)=0;
 };
 template<bool MX> class Plan: public PlanBase {
     static constexpr int scale_format=MX?1:0,scale_shift=MX?5:4;
@@ -557,6 +571,30 @@ template<bool MX> class Plan: public PlanBase {
     void set_swiglu(float alpha,float beta) override {swiglu_alpha=alpha;swiglu_beta=beta;}
     std::shared_ptr<Executor> pool;
     std::vector<Shard> shards;  // one per worker node
+    // RAM slots (xtier_create4, cold experts on NVMe): the shards hold `slots` experts' weights; slot_of[e] is expert
+    // e's slot, -1 while it is only on NVMe. Without them slots == experts and slot e holds expert e.
+    int slots=0;
+    std::vector<int32_t> slot_of,expert_of;
+    // Cold experts (xtier_cold_attach): every expert's record on NVMe (file, offset; file -1: it never leaves RAM). A
+    // forward first reads the experts it routes to that are not in RAM (ensure_resident). resident_lock guards the
+    // tables against the pins of readers on other threads; the forward itself is the only writer.
+    void *cold_store=nullptr;
+    ColdIO cold_io{};
+    bool cold_overlap=true;           // XTIER_COLD_OVERLAP: a forward computes the experts in RAM while it reads the others
+    std::vector<int> cold_taken;      // the slots the reads in flight land in
+    std::vector<int32_t> cold_split;  // the routes of the two passes
+    std::vector<float> cold_late;     // the second pass's output
+    std::vector<int32_t> cold_file,pins;   // cold_file, cold_offset: per expert and node part
+    bool stored(int e) const {return cold_file[size_t(e)*nodes]>=0;}
+    std::vector<long long> cold_offset,cold_mark,cold_stamp;
+    std::vector<double> cold_score;
+    std::vector<int> cold_used,cold_miss;
+    double cold_log=0;                       // log of the per-forward decay
+    long long cold_forwards=0,cold_loads=0;
+    double cold_seconds=0;
+    long long cold_small_forwards=0,cold_small_loads=0;   // the forwards of at most 8 tokens (decode steps)
+    double cold_small_seconds=0;
+    std::mutex resident_lock;
     int nodes=4;
     std::vector<float> globals13,globals2;
     int phase=0,m=0,groups_n=0;
@@ -602,8 +640,8 @@ template<bool MX> class Plan: public PlanBase {
 
     void initialize_shard(int node) {
         const size_t H=hidden,I=inter,IN=I/nodes,HN=H/nodes;auto &s=shards[node];
-        for(size_t e=0;e<size_t(experts);e++) {
-            size_t gi=e*IN,di=e*HN;
+        for(size_t slot=0;slot<size_t(slots);slot++) {
+            const size_t e=size_t(expert_of[slot]),gi=slot*IN,di=slot*HN;
             size_t srcg=e*2*I+node*IN,srcu=srcg+I;
             size_t srcd=e*H+node*HN;
             std::memcpy(s.gate.get()+gi*(H/2),source13+srcg*(H/2),IN*(H/2));
@@ -624,7 +662,7 @@ template<bool MX> class Plan: public PlanBase {
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;
         const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
         const float scale_gate=globals13[2*group_expert(g)],scale_up=globals13[2*group_expert(g)+1];
-        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;
+        const auto &s=shards[node];const auto &group=groups[g];const size_t slot=size_t(group.slot);
         const uint16_t *xs[M];for(int t=0;t<M;t++)xs[t]=input+size_t(group.token[t])*H;
         // Rows per iteration: 2 up to M=4 (and M<=XTIER_WIDE_ROWS_M with 2x2xM accumulators
         // still in registers), 1 beyond. Row results do not depend on R.
@@ -635,7 +673,7 @@ template<bool MX> class Plan: public PlanBase {
             for(int c=0;c<H;c+=32) {
                 __m512bh x[M];for(int t=0;t<M;t++)x[t]=(__m512bh)_mm512_loadu_si512(xs[t]+c);
                 for(int j=0;j<R;j++) {
-                    size_t base=size_t(e)*IN+r+j;
+                    size_t base=slot*IN+r+j;
                     __m512bh a=unpack(s.gate.get()+base*(H/2)+c/2,s.sg.get()+base*(H>>scale_shift)+(c>>scale_shift));
                     __m512bh b=unpack(s.up.get()+base*(H/2)+c/2,s.su.get()+base*(H>>scale_shift)+(c>>scale_shift));
                     for(int t=0;t<M;t++) {
@@ -661,7 +699,7 @@ template<bool MX> class Plan: public PlanBase {
 
     template<int M,int HC,int IC> void down_rows_bf16(int node,int g,int begin,int end,float *destination) {
         const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
-        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;
+        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;const size_t slot=size_t(group.slot);
         const uint16_t *__restrict const in_mid=reinterpret_cast<const uint16_t*>(mid);const float scale=globals2[e];
         float *__restrict const out=destination?destination:output;
         float route[M];int token[M];for(int t=0;t<M;t++){route[t]=group.route[t];token[t]=group.token[t];}
@@ -672,7 +710,7 @@ template<bool MX> class Plan: public PlanBase {
                 __m512bh x[M];
                 for(int t=0;t<M;t++)x[t]=(__m512bh)_mm512_loadu_si512(in_mid+(size_t(group.row)+t)*I+c);
                 for(int j=0;j<R;j++) {
-                    size_t base=size_t(e)*HN+r+j;
+                    size_t base=slot*HN+r+j;
                     __m512bh w=unpack(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift));
                     for(int t=0;t<M;t++)acc[j][t]=_mm512_dpbf16_ps(acc[j][t],w,x[t]);
                 }
@@ -687,7 +725,7 @@ template<bool MX> class Plan: public PlanBase {
     template<int M,int HC,int IC> void down_rows(int node,int g,int begin,int end,float *destination=nullptr) {
         if(down_bf16){down_rows_bf16<M,HC,IC>(node,g,begin,end,destination);return;}
         const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
-        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;
+        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;const size_t slot=size_t(group.slot);
         const float *__restrict const in_mid=mid;const float scale=globals2[e];
         float *__restrict const out=destination?destination:output;
         float route[M];int token[M];for(int t=0;t<M;t++){route[t]=group.route[t];token[t]=group.token[t];}
@@ -700,7 +738,7 @@ template<bool MX> class Plan: public PlanBase {
                     xl[t]=_mm512_loadu_ps(row+c);xh[t]=_mm512_loadu_ps(row+c+16);
                 }
                 for(int j=0;j<R;j++) {
-                    size_t base=size_t(e)*HN+r+j;
+                    size_t base=slot*HN+r+j;
                     __m512 lo,hi;
 #if XTIER_DOWN_F32_LUT
                     unpack_f32(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift),lo,hi);
@@ -731,7 +769,7 @@ template<bool MX> class Plan: public PlanBase {
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;const bool round=down_bf16;
         const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
         const float scale_gate=globals13[2*group_expert(g)],scale_up=globals13[2*group_expert(g)+1];
-        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;
+        const auto &s=shards[node];const auto &group=groups[g];const size_t slot=size_t(group.slot);
         const uint16_t *x1=input+size_t(group.token[t0])*H;
         // Several tokens: FP32 inputs once per call (thread-local), read by the FMAs from cache,
         // so the registers hold one row's weights and the accumulators only.
@@ -750,7 +788,7 @@ template<bool MX> class Plan: public PlanBase {
             for(int q=0;q<R*MT*S;q++){ag[q]=_mm256_setzero_ps();au[q]=_mm256_setzero_ps();}
             const uint8_t *gw[R],*uw[R],*gs[R],*us[R];
             for(int j=0;j<R;j++) {
-                size_t base=size_t(e)*IN+r+j;
+                size_t base=slot*IN+r+j;
                 gw[j]=s.gate.get()+base*(H/2);uw[j]=s.up.get()+base*(H/2);
                 gs[j]=s.sg.get()+base*(H>>scale_shift);us[j]=s.su.get()+base*(H>>scale_shift);
             }
@@ -801,14 +839,14 @@ template<bool MX> class Plan: public PlanBase {
     }
     template<int R,int MT,int S,int HC,int IC> void down_core(int node,int g,int begin,int end,float *__restrict out,int t0) {
         const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
-        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;
+        const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;const size_t slot=size_t(group.slot);
         const float scale=globals2[e];
         float route[MT];int token[MT];const float *rows[MT];
         for(int t=0;t<MT;t++){route[t]=group.route[t0+t];token[t]=group.token[t0+t];rows[t]=mid+(size_t(group.row)+t0+t)*I;}
         for(int r=begin;r<end;r+=R) {
             __m256 acc[R*MT*S];for(int q=0;q<R*MT*S;q++)acc[q]=_mm256_setzero_ps();
             const uint8_t *dw[R],*ds[R];
-            for(int j=0;j<R;j++){size_t base=size_t(e)*HN+r+j;dw[j]=s.down.get()+base*(I/2);ds[j]=s.sd.get()+base*(I>>scale_shift);}
+            for(int j=0;j<R;j++){size_t base=slot*HN+r+j;dw[j]=s.down.get()+base*(I/2);ds[j]=s.sd.get()+base*(I>>scale_shift);}
             for(int c=0;c<I;c+=32) {
                 for(int j=0;j<R;j++) {
                     __m256 w[4];unpack32(dw[j]+c/2,ds[j]+(c>>scale_shift),w);
@@ -986,7 +1024,7 @@ template<bool MX> class Plan: public PlanBase {
 #endif
         size_t rows=phase==1?I/nodes:H/nodes,begin=rows*lane/lanes,end=rows*(lane+1)/lanes;
         for(int g=0;g<groups_n;g++) {
-            size_t e=groups[g].expert;
+            size_t e=groups[g].slot;
             if(phase==1) {
                 stream(s.gate.get()+(e*rows+begin)*(H/2),(end-begin)*(H/2));
                 stream(s.up.get()+(e*rows+begin)*(H/2),(end-begin)*(H/2));
@@ -1024,7 +1062,7 @@ template<bool MX> class Plan: public PlanBase {
 
 public:
     Plan(int h,int i,int e,int n,float limit,const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,
-         const uint8_t *s2,const float *g13,const float *g2,int format=0)
+         const uint8_t *s2,const float *g13,const float *g2,int format=0,int slot_count=0,const int32_t *resident=nullptr)
         :hidden(h),inter(i),experts(e),swiglu_limit(limit),pool(get_executor(n)),globals13(g13,g13+e*2),
          globals2(g2,g2+e),source13(w13),source2(w2),scale13(s13),scale2(s2),groups(MAX_ROUTES) {
         if(format<0||format>1)throw std::runtime_error("Unknown scale format");
@@ -1037,6 +1075,14 @@ public:
 #endif
         }
         if(e<10 || e>MAX_EXPERTS)throw std::runtime_error("E=10..512");
+        slots=slot_count>0?slot_count:e;
+        if(slots>e)throw std::runtime_error("More RAM slots than experts");
+        slot_of.assign(e,-1);expert_of.assign(slots,-1);
+        for(int j=0;j<slots;j++) {
+            const int x=resident?resident[j]:j;
+            if(x<0||x>=e||slot_of[x]>=0)throw std::runtime_error("Invalid resident experts");
+            slot_of[x]=j;expert_of[j]=x;
+        }
         if(h<64 || h>32768 || h%64 || i<64 || i>32768 || i%64)throw std::runtime_error("hidden and intermediate must be multiples of 64");
         nodes=pool->node_count();
         // Every node's share of the I and H rows must stay a multiple of the 16-row grains.
@@ -1050,12 +1096,12 @@ public:
         const size_t E=e,H=h,I=i;
         for(size_t j=0;j<E*2*I*H/(format?32:16);j++)if(s13[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
         for(size_t j=0;j<E*H*I/(format?32:16);j++)if(s2[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
-        const size_t IN=I/nodes,HN=H/nodes;
+        const size_t IN=I/nodes,HN=H/nodes,S=slots;
         for(int node=0;node<nodes;node++) {
             auto &s=shards[node];const int mem=topology().memory[node];
-            s.gate=alloc(E*IN*(H/2),mem);s.up=alloc(E*IN*(H/2),mem);
-            s.sg=alloc(E*IN*(H>>scale_shift),mem);s.su=alloc(E*IN*(H>>scale_shift),mem);
-            s.down=alloc(E*HN*(I/2),mem);s.sd=alloc(E*HN*(I>>scale_shift),mem);
+            s.gate=alloc(S*IN*(H/2),mem);s.up=alloc(S*IN*(H/2),mem);
+            s.sg=alloc(S*IN*(H>>scale_shift),mem);s.su=alloc(S*IN*(H>>scale_shift),mem);
+            s.down=alloc(S*HN*(I/2),mem);s.sd=alloc(S*HN*(I>>scale_shift),mem);
         }
         if(const char *v=std::getenv("XTIER_DOWN_BF16"))down_bf16=std::string(v)=="1";
         if(const char *v=std::getenv("XTIER_DYNAMIC"))dynamic=std::stoi(v);
@@ -1074,6 +1120,32 @@ public:
         std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
         if(!guard.owns_lock())throw std::runtime_error("Plan does not permit concurrent callers");
         if(tokens<1||tokens>MAX_BATCH||k<1||k>MAX_K||!x||!ids||!rw||!y)throw std::runtime_error("Invalid input");
+        void *reads=cold_store?ensure_resident(tokens,k,ids):nullptr;
+        if(!reads)return compute(tokens,k,x,ids,rw,y);
+        // Experts being read (overlap): first the routes to the experts in RAM, then the others once their reads
+        // landed, into a second buffer added to the first (two FP32 sums: not bitwise the one-pass order)
+        const size_t n=size_t(tokens)*k,rows=size_t(tokens)*hidden;
+        cold_split.resize(2*n);
+        int32_t *early=cold_split.data(),*late=early+n;
+        bool any=false;
+        for(size_t j=0;j<n;j++) {
+            const int e=ids[j];const bool wait=e>=0&&e<experts&&slot_of[e]<0;
+            early[j]=wait?-1:e;late[j]=wait?e:-1;any|=!wait&&e>=0;
+        }
+        if(!any){finish_reads(reads,tokens);return compute(tokens,k,x,late,rw,y);}
+        int first=0;
+        try{first=compute(tokens,k,x,early,rw,y);}
+        catch(...){try{finish_reads(reads,tokens);}catch(...){}throw;}
+        const double phases[2]={last_times[0],last_times[1]};
+        finish_reads(reads,tokens);
+        cold_late.resize(rows);
+        const int second=compute(tokens,k,x,late,rw,cold_late.data());
+        for(size_t j=0;j<rows;j++)y[j]+=cold_late[j];
+        last_times[0]+=phases[0];last_times[1]+=phases[1];
+        return first+second;
+    }
+    // One pass over the routes (-1: skipped) into y.
+    int compute(int tokens,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) {
         m=tokens;input=x;output=y;groups_n=0;
         std::array<int,MAX_EXPERTS> last_group;
         if(m>4)last_group.fill(-1);
@@ -1088,7 +1160,10 @@ public:
                 g=last_group[e];
                 if(g<0 || (groups[g].count==MAX_M && groups[g].token[MAX_M-1]!=t))g=groups_n;
             }
-            if(g==groups_n){groups[g]=Group{};groups[g].expert=e;groups_n++;}
+            if(g==groups_n) {
+                if(slot_of[e]<0)throw std::runtime_error("Expert "+std::to_string(e)+" is not in RAM");
+                groups[g]=Group{};groups[g].expert=e;groups[g].slot=slot_of[e];groups_n++;
+            }
             if(m>4)last_group[e]=g;
             auto &group=groups[g];int j=0;for(;j<group.count;j++)if(group.token[j]==t)break;
             if(j==group.count){group.token[j]=t;group.route[j]=weight;group.count++;}
@@ -1133,8 +1208,154 @@ public:
         return failed;
     }
     int node_count() const {return nodes;}
+    // Cold experts: the experts this call routes to that are not in RAM are read (one job per node part, all at once)
+    // into the slots of the experts with the lowest decayed use counts that this call does not use, nobody pinned and
+    // that have a record on NVMe. A reserved slot (expert_of -2) belongs to no expert until its read lands: it can be
+    // neither pinned nor chosen again for another expert of the same call. With cold_overlap the reads are only
+    // started: returns their ticket (finish_reads); else returns nullptr once they landed.
+    void *ensure_resident(int tokens,int k,const int32_t *ids) {
+        const long long now=++cold_forwards;
+        if(tokens<=8)cold_small_forwards++;
+        cold_used.clear();
+        for(int j=0;j<tokens*k;j++) {
+            const int e=ids[j];
+            if(e<0||e>=experts||cold_mark[e]==now)continue;   // invalid routes fail in the grouping below
+            cold_mark[e]=now;cold_used.push_back(e);
+        }
+        for(int e:cold_used){cold_score[e]=cold_score[e]*std::exp(cold_log*double(now-cold_stamp[e]))+1;cold_stamp[e]=now;}
+        cold_miss.clear();
+        for(int e:cold_used)if(slot_of[e]<0)cold_miss.push_back(e);
+        if(cold_miss.empty())return nullptr;
+        const auto t0=std::chrono::steady_clock::now();
+        std::vector<int> taken;
+        {
+            std::lock_guard<std::mutex> g(resident_lock);
+            for(int e:cold_miss) {
+                if(!stored(e))throw std::runtime_error("Expert "+std::to_string(e)+" is neither in RAM nor on NVMe");
+                int best=-1;double low=0;
+                for(int s=0;s<slots;s++) {
+                    if(pins[s])continue;
+                    const int v=expert_of[s];double u=-1;   // a free slot first
+                    if(v==-2)continue;                      // reserved for another expert of this call
+                    if(v>=0) {
+                        if(cold_mark[v]==now||!stored(v))continue;
+                        u=cold_score[v]*std::exp(cold_log*double(now-cold_stamp[v]));
+                    }
+                    if(best<0||u<low){best=s;low=u;}
+                }
+                if(best<0)throw std::runtime_error("No RAM slot for expert "+std::to_string(e));
+                if(expert_of[best]>=0)slot_of[expert_of[best]]=-1;
+                expert_of[best]=-2;
+                taken.push_back(best);
+            }
+        }
+        const size_t H=hidden,I=inter,IN=I/nodes,HN=H/nodes;
+        const size_t sizes[6]={IN*(H/2),IN*(H/2),IN*(H>>scale_shift),IN*(H>>scale_shift),HN*(I/2),HN*(I>>scale_shift)};
+        const int jobs=int(cold_miss.size())*nodes;
+        std::vector<int> files(jobs);std::vector<long long> offsets(jobs);
+        std::vector<void*> dst(size_t(jobs)*6);std::vector<size_t> len(size_t(jobs)*6);
+        for(size_t q=0;q<cold_miss.size();q++)for(int node=0;node<nodes;node++) {
+            const size_t j=q*nodes+node,s=size_t(taken[q]);const int e=cold_miss[q];const auto &sh=shards[node];
+            uint8_t *base[6]={sh.gate.get(),sh.up.get(),sh.sg.get(),sh.su.get(),sh.down.get(),sh.sd.get()};
+            files[j]=cold_file[size_t(e)*nodes+node];offsets[j]=cold_offset[size_t(e)*nodes+node];
+            for(int p=0;p<6;p++){dst[j*6+p]=base[p]+s*sizes[p];len[j*6+p]=sizes[p];}
+        }
+        cold_taken=taken;
+        if(cold_overlap) {
+            std::vector<int> group(size_t(jobs),0);
+            void *ticket=cold_io.submit(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),6,group.data(),1);
+            if(!ticket){release_taken();throw std::runtime_error("Reading cold experts from NVMe failed");}
+            return ticket;
+        }
+        if(cold_io.read(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),6)) {
+            release_taken();
+            throw std::runtime_error("Reading cold experts from NVMe failed");
+        }
+        land(tokens,t0);
+        return nullptr;
+    }
+    // The reads ensure_resident started (overlap) end: their experts are in RAM. Counted: the time the forward waited.
+    void finish_reads(void *ticket,int tokens) {
+        const auto t0=std::chrono::steady_clock::now();
+        if(cold_io.finish(cold_store,ticket)){release_taken();throw std::runtime_error("Reading cold experts from NVMe failed");}
+        land(tokens,t0);
+    }
+    void release_taken() {   // the reserved slots are free again; the experts they held are still on NVMe
+        std::lock_guard<std::mutex> g(resident_lock);
+        for(int s:cold_taken)expert_of[s]=-1;
+    }
+    void land(int tokens,std::chrono::steady_clock::time_point t0) {
+        {
+            std::lock_guard<std::mutex> g(resident_lock);
+            for(size_t q=0;q<cold_miss.size();q++){slot_of[cold_miss[q]]=cold_taken[q];expert_of[cold_taken[q]]=cold_miss[q];}
+        }
+        const double spent=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+        cold_loads+=(long long)cold_miss.size();cold_seconds+=spent;
+        if(tokens<=8){cold_small_loads+=(long long)cold_miss.size();cold_small_seconds+=spent;}
+    }
+    int attach_cold(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,const float *scores,
+                    float half_life) override {
+        std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
+        if(!guard.owns_lock()||!store||!io||!io->read||!io->submit||!io->finish||!files||!offsets||!(half_life>0))return -1;
+        // per expert and node part ([e*nodes+n]): where the part's six pieces are in the store
+        cold_file.assign(files,files+size_t(experts)*nodes);cold_offset.assign(offsets,offsets+size_t(experts)*nodes);
+        for(int e=0;e<experts;e++)if(slot_of[e]<0&&!stored(e))return -1;   // in neither RAM nor the store
+        cold_score.assign(experts,0.0);
+        if(scores)for(int e=0;e<experts;e++)cold_score[e]=scores[e];
+        cold_stamp.assign(experts,0);cold_mark.assign(experts,0);pins.assign(slots,0);
+        cold_log=std::log(0.5)/double(half_life);
+        cold_io=*io;cold_store=store;
+        const char *overlap=std::getenv("XTIER_COLD_OVERLAP");
+        cold_overlap=!overlap||std::string(overlap)!="0";
+        return 0;
+    }
+    // A slot another thread reads (the GPU pool's copy of an expert): its expert stays until unpin. -1: not in RAM.
+    int pin(int expert) override {
+        std::lock_guard<std::mutex> g(resident_lock);
+        if(expert<0||expert>=experts)return -1;
+        const int s=slot_of[expert];
+        if(s>=0&&!pins.empty())pins[s]++;
+        return s;
+    }
+    void unpin(int slot) override {
+        std::lock_guard<std::mutex> g(resident_lock);
+        if(slot>=0&&slot<int(pins.size())&&pins[slot]>0)pins[slot]--;
+    }
+    // forwards, experts read from NVMe, seconds spent reading; the same for the forwards of at most 8 tokens
+    void cold_stats(double *out) override {
+        out[0]=double(cold_forwards);out[1]=double(cold_loads);out[2]=cold_seconds;
+        out[3]=double(cold_small_forwards);out[4]=double(cold_small_loads);out[5]=cold_small_seconds;
+    }
+    // Placement, from the plan's one caller between forwards (the call lock guards it): expert into slot; the expert
+    // the slot held, -1 if none; -2 invalid, -3 a forward in progress.
+    int place(int expert,int slot) override {
+        if(expert<0||expert>=experts||slot<0||slot>=slots)return -2;
+        std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
+        if(!guard.owns_lock())return -3;
+        std::lock_guard<std::mutex> g(resident_lock);
+        if(!pins.empty()&&pins[slot])return -3;
+        const int previous=expert_of[slot];
+        if(previous>=0)slot_of[previous]=-1;
+        if(slot_of[expert]>=0)expert_of[slot_of[expert]]=-1;
+        slot_of[expert]=slot;expert_of[slot]=expert;
+        return previous;
+    }
+    int slot_table(int32_t *table) override {
+        std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
+        if(!guard.owns_lock())return -3;
+        std::copy(slot_of.begin(),slot_of.end(),table);return slots;
+    }
+    // One slot's six pieces on one node (gate, up, gate scales, up scales, down, down scales), as in xtier_shard.
+    int slot_pieces(int slot,int node,void **pointers,size_t *bytes) const override {
+        if(slot<0||slot>=slots||node<0||node>=nodes)return -1;
+        const size_t H=hidden,I=inter,IN=I/nodes,HN=H/nodes,S=size_t(slot);const auto &s=shards[node];
+        uint8_t *base[6]={s.gate.get(),s.up.get(),s.sg.get(),s.su.get(),s.down.get(),s.sd.get()};
+        const size_t sizes[6]={IN*(H/2),IN*(H/2),IN*(H>>scale_shift),IN*(H>>scale_shift),HN*(I/2),HN*(I>>scale_shift)};
+        for(int j=0;j<6;j++){pointers[j]=base[j]+S*sizes[j];bytes[j]=sizes[j];}
+        return 0;
+    }
     void shard(int node,void **pointers,size_t *bytes) const {
-        const size_t E=experts,H=hidden,I=inter,IN=I/nodes,HN=H/nodes;const auto &s=shards[node];
+        const size_t E=slots,H=hidden,I=inter,IN=I/nodes,HN=H/nodes;const auto &s=shards[node];
         const Bytes *all[6]={&s.gate,&s.up,&s.sg,&s.su,&s.down,&s.sd};
         size_t sizes[6]={E*IN*(H/2),E*IN*(H/2),E*IN*(H>>scale_shift),E*IN*(H>>scale_shift),E*HN*(I/2),E*HN*(I>>scale_shift)};
         for(int j=0;j<6;j++){pointers[j]=all[j]->get();bytes[j]=sizes[j];}
@@ -1174,6 +1395,56 @@ void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,floa
         if(scale_format!=0)throw std::runtime_error("Unknown scale format");
         return new Handle{std::make_shared<Plan<false>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0)};
     }catch(const std::exception &e){last_error=e.what();return nullptr;}
+}
+void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int threads,float swiglu_limit,int scale_format,
+                    const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
+                    const float *g13,const float *g2,const int32_t *resident) {
+    try {
+#if XTIER_AVX512
+        if(!__builtin_cpu_supports("avx512bf16")||!__builtin_cpu_supports("avx512bw"))
+            throw std::runtime_error("AVX512 BF16/BW required");
+#else
+        if(!__builtin_cpu_supports("avx2")||!__builtin_cpu_supports("fma"))
+            throw std::runtime_error("AVX2/FMA required");
+#endif
+        if(experts<10||experts>MAX_EXPERTS||slots<1||slots>experts||threads<1||threads>128||!w13||!w2||!s13||!s2||!g13||!g2
+           ||!resident)
+            throw std::runtime_error("Invalid create arguments");
+        if(scale_format==1)
+            return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1,
+                                                           slots,resident)};
+        if(scale_format!=0)throw std::runtime_error("Unknown scale format");
+        return new Handle{std::make_shared<Plan<false>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0,
+                                                        slots,resident)};
+    }catch(const std::exception &e){last_error=e.what();return nullptr;}
+}
+int XTIER_API(xtier_cold_attach)(void *plan,void *store,void *io,const int32_t *files,const long long *offsets,
+                                  const float *scores,float half_life) {
+    if(!plan){last_error="Null plan";return -1;}
+    int rc=static_cast<Handle*>(plan)->plan->attach_cold(store,static_cast<const ColdIO*>(io),files,offsets,scores,half_life);
+    if(rc)last_error="Invalid cold attach (an expert in neither RAM nor the store, or a forward in progress)";
+    return rc;
+}
+int XTIER_API(xtier_slot_pin)(void *plan,int expert) {return plan?static_cast<Handle*>(plan)->plan->pin(expert):-1;}
+void XTIER_API(xtier_slot_unpin)(void *plan,int slot) {if(plan)static_cast<Handle*>(plan)->plan->unpin(slot);}
+void XTIER_API(xtier_cold_plan_stats)(void *plan,double *out) {if(plan&&out)static_cast<Handle*>(plan)->plan->cold_stats(out);}
+int XTIER_API(xtier_place)(void *plan,int expert,int slot) {
+    if(!plan){last_error="Null plan";return -2;}
+    int rc=static_cast<Handle*>(plan)->plan->place(expert,slot);
+    if(rc<-1)last_error=rc==-3?"Placement during a forward":"Invalid placement";
+    return rc;
+}
+int XTIER_API(xtier_slot_table)(void *plan,int32_t *table) {
+    if(!plan||!table){last_error="Invalid slot table query";return -1;}
+    int rc=static_cast<Handle*>(plan)->plan->slot_table(table);
+    if(rc<0)last_error="Slot table query during a forward";
+    return rc;
+}
+int XTIER_API(xtier_slot_pieces)(void *plan,int slot,int node,void **pointers,size_t *bytes) {
+    if(!plan||!pointers||!bytes){last_error="Invalid slot query";return -1;}
+    int rc=static_cast<Handle*>(plan)->plan->slot_pieces(slot,node,pointers,bytes);
+    if(rc<0)last_error="Invalid slot or node";
+    return rc;
 }
 void *XTIER_API(xtier_create2)(int hidden,int inter,int experts,int threads,float limit,
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,

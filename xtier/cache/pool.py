@@ -338,11 +338,16 @@ class LayerPool:
         Call outside graph capture, with no decode in flight (startup)."""
         experts = list(range(self.E)) if self.full else [e for e in experts if 0 <= e < self.E][:self.active]
         upload = type(self.prefill)._upload_chunk   # from host memory (a fully cached layer's prefill reads the slots)
+        ram = None
+        if getattr(self.plan, 'slots', self.E) < self.E:   # cold experts: from the experts' RAM slots, only those in RAM
+            ram = self.plan.slot_table()
+            experts = [e for e in experts if ram[e] >= 0]
         with torch.cuda.stream(stream):
             if self.full:
                 upload(self.prefill, self.arena, 0, self.E, stream.cuda_stream)
             for j, e in enumerate(experts if not self.full else ()):
-                upload(self.prefill, [a[j:j + 1] for a in self.arena], e, e + 1, stream.cuda_stream)
+                s = e if ram is None else ram[e]
+                upload(self.prefill, [a[j:j + 1] for a in self.arena], s, s + 1, stream.cuda_stream, virtual=False)
             table = torch.full((self.E,), -1, dtype=torch.int32)
             owner = torch.zeros((self.E,), dtype=torch.int32)
             for j, e in enumerate(experts):
