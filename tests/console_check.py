@@ -80,6 +80,12 @@ env, argv = console.build('ds41', console.defaults('ds41'))
 assert env['DSPARK'] == '1' and env['BATCH'] == '22528' and env['XTIER_ENGRAM_CACHE_GIB'] == '4'
 assert env['XTIER_CACHE_ELASTIC'] == '1' and env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '68'
 assert 'XTIER_CACHE_ELASTIC' not in console.build('ds41', {**console.defaults('ds41'), 'packs': 'off'})[0]
+assert 'XTIER_COLD' not in env   # cold experts off by default
+cold = next(o for o in models['ds41']['options'] if o['key'] == 'cold')
+if not console.unavailable(cold):
+    env, argv = console.build('ds41', console.validate('ds41', {'cold': '30'}))
+    assert env['XTIER_COLD'] == '1' and env['XTIER_COLD_FRACTION'] == '0.30' and len(env['XTIER_COLD_PATHS'].split(':')) == 4
+    assert console.describe('ds41', console.validate('ds41', {'cold': '30'})).endswith('冷专家 30%')
 
 # a choice unavailable on this machine: refused, a saved one falls back to the default of that option only, listed
 # for the page (greyed out there)

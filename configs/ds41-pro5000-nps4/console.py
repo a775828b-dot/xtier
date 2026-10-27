@@ -6,6 +6,9 @@ from pathlib import Path
 from xtier.console.core import common_options, elastic_option
 
 HERE = Path(__file__).resolve().parent
+# the cold-expert store (XTIER_COLD): Optane x2, 990 PRO, FX700, in this order (the manifest is in the first)
+COLD_PATHS = ['/data/fast/p5800x1/xtier-cold', '/data/fast/p5800x2/xtier-cold', '/data/fast/nvme1/xtier-cold',
+              '/data/fast/ds41/xtier-cold']
 
 MODEL = {
     'id': 'ds41', 'order': 30,
@@ -24,8 +27,19 @@ MODEL = {
          'choices': [['50', '50 · 实测'], ['47', '47'], ['43', '43']]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '22528',
          'choices': [['22528', '22K'], ['20480', '20K'], ['16384', '16K']]},
+        {'key': 'cold', 'label': '冷专家卸载', 'default': 'off',
+         'choices': [['off', '关'], ['10', '10% · 29 GB 放硬盘'], ['20', '20% · 58 GB 放硬盘'], ['30', '30% · 87 GB 放硬盘']],
+         'hint': '内存只放 70–90% 的专家，其余放在 4 块 NVMe 上、用到时读回（模拟内存不够；10-26 实测见 docs/reports）',
+         'unavailable': lambda: {} if all(Path(p).is_dir() for p in COLD_PATHS)
+         else {c: '本机没有冷专家盘目录' for c in ('10', '20', '30')}},
     ],
-    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'}],
+    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'},
+              {'when': {'cold': '10'}, 'warn': True,
+               'text': '冷专家 10%：29 GB 专家放 4 块 NVMe；实测 decode 每步约 −7%，长 prefill 约 −2%，增量 prefill 持平'},
+              {'when': {'cold': '20'}, 'warn': True,
+               'text': '冷专家 20%：58 GB 专家放 4 块 NVMe；实测 decode 约 −19%，长 prefill 约 −3%，增量 prefill 约 −14%'},
+              {'when': {'cold': '30'}, 'warn': True,
+               'text': '冷专家 30%：87 GB 专家放 4 块 NVMe；实测 decode 约 −31%，长 prefill 约 −10%，增量 prefill 约 −27%'}],
 }
 
 
@@ -39,9 +53,14 @@ def build(o, port):
                    XTIER_DRAFT_LMHEAD_FP8='0')
     elif o['elastic'] == 'on':   # past ~66 slots the GPU side of a layer is the slower one (planner, 10-26)
         env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68')
+    if o['cold'] != 'off':   # the store holds every expert: written at the first start, reused after
+        env.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(COLD_PATHS), XTIER_COLD_FRACTION=f"0.{o['cold']}")
     return env, [str(HERE / 'run-ds-xtier.sh')]
 
 
 def tags(o):
     """Extra parts of the server's label."""
-    return ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []
+    out = ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []
+    if o['cold'] != 'off':
+        out.append(f"冷专家 {o['cold']}%")
+    return out
