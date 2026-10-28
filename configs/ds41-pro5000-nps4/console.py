@@ -3,7 +3,7 @@ README "+ 加速包" row: 50 hot slots per layer, Engram rows on NVMe with a 4 G
 
 from pathlib import Path
 
-from xtier.console.core import common_options, elastic_option
+from xtier.console.core import common_options, elastic_option, miss_env, miss_option
 
 HERE = Path(__file__).resolve().parent
 # the cold-expert store (XTIER_COLD): Optane x2, 990 PRO, FX700, in this order (the manifest is in the first)
@@ -32,6 +32,7 @@ MODEL = {
          'hint': '内存只放 70–90% 的专家，其余放在 4 块 NVMe 上、用到时读回（模拟内存不够；10-26 实测见 docs/reports）',
          'unavailable': lambda: {} if all(Path(p).is_dir() for p in COLD_PATHS)
          else {c: '本机没有冷专家盘目录' for c in ('10', '20', '30')}},
+        miss_option([{'cold': c} for c in ('10', '20', '30')]),   # not on layers with cold experts
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'},
               {'when': {'cold': '10'}, 'warn': True,
@@ -55,6 +56,8 @@ def build(o, port):
         env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68')
     if o['cold'] != 'off':   # the store holds every expert: written at the first start, reused after
         env.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(COLD_PATHS), XTIER_COLD_FRACTION=f"0.{o['cold']}")
+    else:
+        env.update(miss_env(o))
     return env, [str(HERE / 'run-ds-xtier.sh')]
 
 
@@ -63,4 +66,6 @@ def tags(o):
     out = ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []
     if o['cold'] != 'off':
         out.append(f"冷专家 {o['cold']}%")
+    elif miss_env(o):
+        out.append(f"未命中 {o['missgpu']}% GPU 代算")
     return out

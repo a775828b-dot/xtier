@@ -6,7 +6,7 @@ is GPU-bound (2026-10-26, two more resident layers with dynamic slots: decode st
 
 from pathlib import Path
 
-from xtier.console.core import common_options, elastic_option
+from xtier.console.core import common_options, elastic_option, miss_env, miss_option
 
 HERE = Path(__file__).resolve().parent
 PLE_OPTANE = '/data/fast/p5800x1/qwen38-flash-next-ple'   # the PLE table's rows on an Optane drive (XTIER_PLE_ROWS=nvme)
@@ -41,6 +41,7 @@ MODEL = {
         {'key': 'ple', 'label': 'PLE 表 (48 GiB)', 'default': 'pinned',
          'choices': [['pinned', '锁页内存'], ['nvme', '傲腾 NVMe · 省 48 GiB 内存']],
          'unavailable': lambda: {} if Path(PLE_OPTANE).is_dir() else {'nvme': f'本机没有 PLE 表的 NVMe 副本（{PLE_OPTANE}）'}},
+        miss_option(),
     ],
     'notes': [
         {'when': {'packs': 'off'}, 'text': '官方 main 基线：FP8 KV、16K 分块、不开 hc_mix / PLE / QSA 分段'},
@@ -67,6 +68,7 @@ def build(o, port):
         chunk = '24576'   # 32K chunks need the memory NVFP4 KV frees
     if not base and o['elastic'] == 'on':
         env['XTIER_CACHE_ELASTIC'] = '1'
+    env.update(miss_env(o))
     if o['ple'] == 'nvme':
         env.update(XTIER_PLE_ROWS='nvme', XTIER_PLE_MODEL=PLE_OPTANE)
     args = ['--context-length', ctx, '--max-total-tokens', ctx, '--kv-cache-dtype', kv, '--chunked-prefill-size', chunk,
@@ -81,7 +83,7 @@ def tags(o):
     """Extra parts of the server's label."""
     if o['packs'] != 'on':
         return []
-    elastic = ['弹性热专家'] if o['elastic'] == 'on' else []
+    extra = (['弹性热专家'] if o['elastic'] == 'on' else []) + ([f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else [])
     if o['kv'] != 'nvfp4':
-        return ['FP8 KV'] + elastic
-    return (['NVFP4 KV', '自动布局'] if o['layout'] == 'auto' else ['NVFP4 KV']) + elastic
+        return ['FP8 KV'] + extra
+    return (['NVFP4 KV', '自动布局'] if o['layout'] == 'auto' else ['NVFP4 KV']) + extra

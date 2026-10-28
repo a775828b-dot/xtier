@@ -48,6 +48,23 @@ def elastic_option(default='on', hint=''):
             'off_when': [{'packs': 'off'}]}
 
 
+def miss_option(off_when=()):
+    """Missed experts on the GPU in decode (XTIER_DECODE_MISS_GPU, xtier/cache/pool.py): the GPU also computes a share
+    of each decode call's missed experts, copied from host memory over PCIe, while the CPU computes the others. For
+    CPUs that compute an expert slower than PCIe moves it; off by default. Part of the packs; off_when: more
+    combinations without effect (cold experts)."""
+    return {'key': 'missgpu', 'label': '未命中专家 GPU 代算', 'default': 'off',
+            'choices': [['off', '关'], ['10', '10%'], ['20', '20%'], ['30', '30%'], ['50', '50%']],
+            'hint': 'decode 时每次未命中的专家按这个比例交给 GPU（经 PCIe 拷进显存再算），CPU 同时算其余的；'
+                    'CPU 弱（核少、只有 AVX2、内存带宽有富余）时才可能更快，结果与命中的专家相同',
+            'off_when': [{'packs': 'off'}, *off_when]}
+
+
+def miss_env(o):
+    """The environment of the miss option (with the packs)."""
+    return {} if o['packs'] == 'off' or o['missgpu'] == 'off' else {'XTIER_DECODE_MISS_GPU': f"0.{o['missgpu']}"}
+
+
 def load_models(names=None, configs=CONFIGS, ports=None):
     """{id: model} from configs/<name>/console.py (every one, or the directories in names) in MODEL['order'];
     ports overrides the listening port by model id."""
