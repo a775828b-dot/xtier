@@ -37,7 +37,7 @@ xtier/
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
 configs/       每个"模型 × 硬件"的启动配置，console.py 是它在启动台里的条目（选项、默认值、启动命令）
-tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4、GPT-OSS SwiGLU、wo_a、MiniMax NVFP4 KV、快速加载）、启动台与规划器检查
+tests/         单层测试（引擎、信箱、缓存、prefill、格式适配、hc_mix、投机截断、QSA NVFP4、GPT-OSS SwiGLU、wo_a、MiniMax NVFP4 KV、快速加载、未命中代算）、启动台与规划器检查
 tools/         构建、内存看门狗、规划器（plan_probe 探测、plan_trace 路由档案、plan_auto 出方案、plan_calibrate 校准，见 docs/planner.md）
 bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟）与结果
 ```
@@ -263,6 +263,8 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
+  给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](docs/reports/2026-10-28-decode-miss-gpu.md)。
 - 2026-10-27（下午）：快速加载（可选，`XTIER_FAST_LOAD=1`，默认关）：专家直接从模型文件或冷存储读进 CPU 引擎，仍是全部装好
   才报在线；DeepSeek 启动 472 → 186 s，卸载 30% 409 → 124 s。详见[文档](docs/reports/2026-10-27-fast-load.md)。
 - 2026-10-27：启动台新卡片「DeepSeek V4.1 Flash 1017 · 最小化」：32 GB 显存 + 128 GB 内存（模拟 RTX 5090），70% 的专家放硬盘，
