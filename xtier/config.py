@@ -29,6 +29,10 @@
                              (cache/elastic.py; XTIER_CACHE_ELASTIC_RESERVE_GIB=2, _CRITICAL_GIB=1, _MARGIN=1.25,
                              _MAX=2.0 / _MAX_SLOTS, _BASE=1.0, _IDLE=32, _SMALL=4096, _CHECK=16,
                              _COOLDOWN_S=600)
+  XTIER_DECODE_MISS_GPU=0    share of a decode call's missed experts (not in the cache) the GPU computes too, their
+                             weights copied over PCIe while the CPU computes the others (cache/pool.py; 0: off,
+                             0.1: 10 %; at most XTIER_DECODE_MISS_GPU_MAX=8 per call). For CPUs that compute an
+                             expert slower than PCIe moves it; results as for cached experts
 Engine switches (XTIER_DYNAMIC, XTIER_DOWN_BF16, XTIER_SPIN_COUNT, ...) are read by the engine itself, see csrc/.
 """
 

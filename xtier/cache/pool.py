@@ -25,6 +25,13 @@ once per prompt and start a few large rounds at the first decode window.
 Elastic slots (XTIER_CACHE_ELASTIC=1, default off; cache/elastic.py): a partly cached layer reserves address space for
 S slots and maps `base` of them for good; the memory a prefill needs only while it runs backs the others (`active`
 usable) between prefills.
+Missed experts on the GPU (XTIER_DECODE_MISS_GPU=share, default 0: off): after the packing, the GPU takes round(share
+x n) of a call's n missed experts (at most XTIER_DECODE_MISS_GPU_MAX=8, the most routed first; _miss_select): their
+routes get -1 for the CPU like cached ones, their weights are copied from the engine's pinned NUMA shards into staging
+slots (_miss_copy: read over PCIe by the SMs, since copy-engine copies in a CUDA graph cannot follow experts chosen on
+the GPU) and computed with the cached ones while the CPU computes the others. Pays off only where PCIe moves an expert
+about as fast as the CPU computes one (few cores, no AVX-512, memory bandwidth to spare). Not on layers with cold
+experts (their RAM slots change during a forward). The cache log's hit counts these experts too.
 
 Numerics: GPU routes are W4A16 (hardware FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
 CPU routes unchanged. Without cached experts the result equals the plain mailbox path except for the FP32 addition of
@@ -33,6 +40,7 @@ a zero GPU part.
 import ctypes as C
 import json
 import logging
+import math
 import os
 import time
 
@@ -47,6 +55,7 @@ MAX_M = 16             # token tile of the GPU kernels (decode slots hold <= 8 t
 MAX_LAYERS = 128       # rows of the global residency table
 RING = 4096            # command ring entries (csrc/mailbox POOL_RING)
 MAX_ROUTES = 128       # m*k per call (8 tokens x top-k <= 10)
+MISS_CHUNK = 8192      # words (8 bytes) per program of _miss_copy
 BLOCK = 1024
 CONFIG = dict(gbn=32, dbn=64, bk=256, gw=4, gs=2, dw=4, ds=2)
 
@@ -151,11 +160,15 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
 @triton.jit
 def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
+             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
         return
+    row = p
+    if STAGED:   # missed experts the GPU took (_miss_select): SLOT_LIST holds the ranks, Q13 / S13 the staging slots
+        row = slot
+        slot = p
     slot = slot.to(tl.int64)
     e = tl.load(SLOT_EXP + p).to(tl.int64)
     tok = tl.arange(0, BM)
@@ -181,16 +194,20 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
-    tl.store(MID + (p * BM + tok[:, None]) * I + n[None, :], val.to(tl.bfloat16), mask=tok[:, None] < M)
+    tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(tl.bfloat16), mask=tok[:, None] < M)
 
 
 @triton.jit
 def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.constexpr,
-          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False):
+          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False, STAGED: tl.constexpr = False):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
         return
+    row = p
+    if STAGED:   # as in _gate_up
+        row = slot
+        slot = p
     slot = slot.to(tl.int64)
     e = tl.load(SLOT_EXP + p).to(tl.int64)
     tok = tl.arange(0, BM)
@@ -198,13 +215,13 @@ def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, I, BK):
         ke = k0 + 2 * tl.arange(0, BK // 2)
-        ae = tl.load(MID + (p * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        ao = tl.load(MID + (p * BM + tok[:, None]) * I + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+        ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
         wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX)
         acc = tl.dot(ae, tl.trans(wl), acc)
         acc = tl.dot(ao, tl.trans(wh), acc)
     acc = acc * tl.load(G2 + e)
-    tl.store(PART + (p * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
+    tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
 
 
 @triton.jit
@@ -229,6 +246,59 @@ def _unpack(SOUT, GOUT, OUT, N, B: tl.constexpr):
     tl.store(OUT + i, c + tl.load(GOUT + i, i < N), i < N)
 
 
+@triton.jit
+def _miss_select(SIDS, RSLOT, MISS_E, MISS_R, NK, SHARE, CAP, NP: tl.constexpr, CP: tl.constexpr):
+    """XTIER_DECODE_MISS_GPU, after _pack: the GPU takes round(SHARE x n) of the call's n missed experts (at most CAP;
+    the most routed first, then the lowest id). Their routes get -1 for the CPU and ranks after the used slots' for
+    the GPU part; MISS_E / MISS_R[q]: expert and rank of staging slot q, -1 past the last."""
+    j = tl.arange(0, NP)
+    mk = j < NK
+    ids = tl.load(SIDS + j, mk, other=-1)   # the CPU's routes (-1: cached or skipped)
+    rs = tl.load(RSLOT + j, mk, other=-1)
+    used = tl.max(rs, 0) + 1                # ranks 0..used-1 are the cached experts'
+    v = ids >= 0
+    same = (ids[:, None] == ids[None, :]) & v[:, None] & v[None, :]
+    first = v & (tl.sum((same & (j[None, :] < j[:, None])).to(tl.int32), 1) == 0)   # one route per missed expert
+    count = tl.sum(same.to(tl.int32), 1)
+    take = tl.minimum((tl.sum(first.to(tl.int32), 0) * SHARE + 0.5).to(tl.int32), CAP)
+    ahead = first[None, :] & ((count[None, :] > count[:, None]) |
+                              ((count[None, :] == count[:, None]) & (ids[None, :] < ids[:, None])))
+    order = tl.sum(ahead.to(tl.int32), 1)   # of a first route: its expert's place
+    place = tl.sum(tl.where(same & first[None, :], order[None, :], 0), 1)   # of every route
+    gpu = v & (place < take)
+    tl.store(SIDS + j, tl.where(gpu, -1, ids), mk)
+    tl.store(RSLOT + j, tl.where(gpu, used + place, rs), mk)
+    q = tl.arange(0, CP)
+    tl.store(MISS_E + q, -1)
+    tl.store(MISS_R + q, -1)
+    tl.debug_barrier()
+    taken = first & (order < take)
+    tl.store(MISS_E + order, ids, mask=taken)
+    tl.store(MISS_R + order, used + order, mask=taken)
+
+
+@triton.jit
+def _miss_copy(SRC, DST, PIECES, MISS_E, NP, CHUNK: tl.constexpr, B: tl.constexpr):
+    """The missed experts the GPU took into the staging slots, in 8-byte words. Program (q * NP + i, c): words
+    [c * CHUNK, (c + 1) * CHUNK) of piece i (one NUMA node's rows of one tensor: contiguous per expert in its pinned
+    shard) of expert MISS_E[q]. PIECES[i]: source offset from SRC, words per expert, offset in staging slot 0 from
+    DST, words per staging slot."""
+    q = tl.program_id(0) // NP
+    i = tl.program_id(0) % NP
+    e = tl.load(MISS_E + q)
+    if e < 0:
+        return
+    n = tl.load(PIECES + i * 4 + 1)
+    start = tl.program_id(1) * CHUNK
+    if start >= n:
+        return
+    src = SRC + tl.load(PIECES + i * 4) + e.to(tl.int64) * n
+    dst = DST + tl.load(PIECES + i * 4 + 2) + q * tl.load(PIECES + i * 4 + 3)
+    for w in range(0, CHUNK, B):
+        o = start + w + tl.arange(0, B)
+        tl.store(dst + o, tl.load(src + o, o < n), o < n)
+
+
 def _scratch(H, I, dev):
     """Buffers shared by every cached layer (calls run one after another on the decode stream)."""
     key = (H, I)
@@ -247,6 +317,71 @@ def _scratch(H, I, dev):
             sorig=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
         )
     return _shared[key]
+
+
+_miss = {}   # XTIER_DECODE_MISS_GPU: share, cap, expert / rank lists, staging slots per (H, I); shared by every layer
+
+
+def _miss_stage(pool):
+    """XTIER_DECODE_MISS_GPU on a partly cached layer: the staging slots shared by the layers of its shape, allocated
+    with the layer's slots (before the KV cache is sized); None when off, every expert is cached, the layer has cold
+    experts or no engine shards."""
+    share = float(os.environ.get('XTIER_DECODE_MISS_GPU', '0') or 0)
+    if share <= 0 or pool.full:
+        return None
+    prefill = pool.prefill
+    if prefill.shards is None or getattr(pool.plan, 'slots', pool.E) < pool.E:
+        if not _miss.get('warned'):
+            _miss['warned'] = True
+            logger.warning('xtier cache: XTIER_DECODE_MISS_GPU is off on layers with cold experts or without engine '
+                           'shards (XTIER_PREFILL_FROM_SHARDS=0)')
+        return None
+    cap = int(os.environ.get('XTIER_DECODE_MISS_GPU_MAX', '8') or 8)
+    if not share <= 1 or not 1 <= cap <= MAX_ROUTES:
+        raise ValueError(f'xtier cache: XTIER_DECODE_MISS_GPU={share} (0..1), XTIER_DECODE_MISS_GPU_MAX={cap} '
+                         f'(1..{MAX_ROUTES})')
+    dev = pool.arena[0].device
+    if 'e' not in _miss:
+        cp = triton.next_power_of_2(cap)
+        _miss.update(share=share, cap=cap, cp=cp, e=torch.full((cp,), -1, dtype=torch.int32, device=dev),
+                     r=torch.full((cp,), -1, dtype=torch.int32, device=dev))
+    key = (pool.H, pool.I)
+    if key not in _miss:   # in the pool's slot layout: w13, w2, s13, s2 one after the other
+        shapes = [(cap,) + tuple(s[1:]) for s in prefill.shapes[:4]]
+        sizes = [math.prod(s) for s in shapes]
+        buf = torch.empty(sum(sizes), dtype=torch.uint8, device=dev)
+        offsets = [sum(sizes[:i]) for i in range(4)]
+        _miss[key] = (buf, [buf[o:o + n].view(s) for o, n, s in zip(offsets, sizes, shapes)], offsets)
+        logger.info('xtier cache: decode: %g of a call\'s missed experts (at most %d) on the GPU, copied from the '
+                    'pinned shards over PCIe (%.0f MiB staging for H %d, I %d)', share, cap, buf.numel() / 2**20,
+                    pool.H, pool.I)
+    return _miss[key]
+
+
+def _miss_layer(pool):
+    """XTIER_DECODE_MISS_GPU at the fill of a partly cached layer (outside capture, its shards pinned): the copy table
+    of its shard pieces (_miss_copy) with the staging slots, or None."""
+    staged = _miss_stage(pool)
+    if staged is None:
+        return None
+    buf, stage, offsets = staged
+    prefill = pool.prefill
+    dev = pool.arena[0].device
+    from xtier.backend.prefill import _check, _runtime
+    prefill.ensure_registered()
+    cudart = _runtime()
+    pieces = []   # device address, bytes per expert, offset in staging slot 0, bytes per staging slot
+    for node, shard in enumerate(prefill.shards):
+        for (address, _), (index, first, rows, total, width) in zip(shard, prefill.layout):
+            d = C.c_void_p()
+            _check(cudart.cudaHostGetDevicePointer(C.byref(d), C.c_void_p(address), 0), 'cudaHostGetDevicePointer')
+            pieces.append((d.value, rows * width, offsets[index] + (first + node * rows) * width, total * width))
+    src = min(p[0] for p in pieces)
+    table = [(a - src, n, o, s) for a, n, o, s in pieces]
+    if any(x % 8 for p in table for x in p):
+        raise ValueError('xtier cache: shard pieces not in 8-byte words')
+    return dict(src=src, dst=buf.data_ptr(), stage=stage, n=len(table), words=max(p[1] for p in table) // 8,
+                pieces=torch.tensor([[x // 8 for x in p] for p in table], dtype=torch.int64, device=dev))
 
 
 class Profile:
@@ -327,6 +462,8 @@ class LayerPool:
         self.filled = False
         self.scratch = _scratch(H, I, dev)
         self.globals = None
+        self.miss = None   # XTIER_DECODE_MISS_GPU: _miss_layer at the fill (the staging slots now)
+        _miss_stage(self)
         self._pool_on = False
         LayerPool.layers.append(self)
 
@@ -356,6 +493,7 @@ class LayerPool:
         stream.synchronize()
         self.resident = experts + [-1] * (self.S - len(experts))
         self.filled = True
+        self.miss = _miss_layer(self)
         return len(experts)
 
     def _kernels(self, m, k, x, routing, gout):
@@ -373,6 +511,18 @@ class LayerPool:
         _down[(nk, H // cfg['dbn'])](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
                                      sc['part'], m, H, I, MAX_M, cfg['dbn'], self.bk_i,
                                      MX=self.prefill.mxfp4, num_warps=cfg['dw'], num_stages=cfg['ds'])
+        if self.miss is not None:   # the missed experts _miss_select gave the GPU: into the staging slots, then as above
+            mi, cap, stage = self.miss, _miss['cap'], self.miss['stage']
+            _miss_copy[(cap * mi['n'], triton.cdiv(mi['words'], MISS_CHUNK))](
+                Pointer(mi['src'], torch.int64), Pointer(mi['dst'], torch.int64), mi['pieces'], _miss['e'], mi['n'],
+                MISS_CHUNK, 1024)
+            _gate_up[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], stage[0], stage[2], g13, sc['mid'], m, H, I,
+                                             self.limit, MAX_M, cfg['gbn'], self.bk_h, MX=self.prefill.mxfp4,
+                                             ALPHA=self.alpha, BETA=self.beta, STAGED=True, num_warps=cfg['gw'],
+                                             num_stages=cfg['gs'])
+            _down[(cap, H // cfg['dbn'])](sc['mid'], _miss['r'], _miss['e'], stage[1], stage[3], g2, sc['part'], m, H,
+                                          I, MAX_M, cfg['dbn'], self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
+                                          num_warps=cfg['dw'], num_stages=cfg['ds'])
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout,
                                             H, k, MAX_M, 1024)
 
@@ -411,6 +561,9 @@ class LayerPool:
             self._pool_on = True
         sx, sids, sroute, sout, sorig = self.mailbox.slot(stream, m, k, with_routes=True)
         self._route(m, k, x, ids, routing, act, (sx, sids, sroute, sorig))
+        if self.miss is not None:   # before the CPU reads the routes
+            _miss_select[(1,)](Pointer(sids, torch.int32), sc['rslot'], _miss['e'], _miss['r'], m * k, _miss['share'],
+                               _miss['cap'], triton.next_power_of_2(m * k), _miss['cp'])
         self.mailbox.signal(stream, m, k, 1)
         self._kernels(m, k, x, routing, sc['gout'])
         self.mailbox.signal(stream, m, k, 2)

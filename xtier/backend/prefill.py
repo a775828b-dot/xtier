@@ -254,6 +254,7 @@ def _runtime():
         lib = C.CDLL('libcudart.so.13')
         lib.cudaHostRegister.argtypes = [C.c_void_p, C.c_size_t, C.c_uint]
         lib.cudaHostUnregister.argtypes = [C.c_void_p]
+        lib.cudaHostGetDevicePointer.argtypes = [C.POINTER(C.c_void_p), C.c_void_p, C.c_uint]
         lib.cudaMemcpy2DAsync.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t,
                                           C.c_size_t, C.c_size_t, C.c_int, C.c_void_p]
         _cudart = lib
