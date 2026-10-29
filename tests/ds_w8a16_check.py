@@ -1,6 +1,7 @@
 """DeepSeek V4.1's 32 x 32 block FP8 projections weight-only below SM89 (xtier/packs/deepseek_v4/w8a16.py) on real
 layers against FP64 x @ dequant(W)^T: the decode-sized FP8 einsum and the dequantize + cuBLAS path for larger calls,
-with the FP8 decoded in hardware and in software (XTIER_FP8_DECODE=soft, the RTX 30 series path, child process).
+with the FP8 decoded in hardware (SM89 and newer) and in software (XTIER_FP8_DECODE=soft, the RTX 30 series path), each
+in a child process.
 
   python tests/ds_w8a16_check.py [--layers 3,20]
 """
@@ -56,6 +57,9 @@ def main():
         return
     ok = True
     for mode in ('hw', 'soft'):
+        if mode == 'hw' and torch.cuda.get_device_capability() < (8, 9):
+            print('XTIER_FP8_DECODE=hw: skipped (no FP8 conversion instructions below SM89)')
+            continue
         env = dict(os.environ, XTIER_FP8_DECODE=mode)
         r = subprocess.run([sys.executable, __file__, '--child', '--model', A.model, '--layers', A.layers], env=env,
                            capture_output=True, text=True)
