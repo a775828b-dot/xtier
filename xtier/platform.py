@@ -36,6 +36,13 @@
   stores through float8e4nv, which Triton has only from SM89 on, so it does not compile; its TileLang version (the
   ROCm path; CUDA's cuda_fp8.h converts in software there) gives the same bytes and scales: bitwise on the RTX PRO
   5000 against the Triton kernel, both scale formats, and again built for sm_86 (tools/arch_check.py --emulate sm86).
+- JIT build cache behind a symlinked cache directory: SGLang's content-addressed JIT cache keeps a build's own
+  generated sources out of its dependency list by ``path.is_relative_to(build_dir)``, with ``path`` resolved but
+  ``build_dir`` (the staging directory under ``~/.cache/sglang/jit``) not. When ``~/.cache`` is a symlink (moved to a
+  data disk on a rented machine), the generated wrapper is recorded by its absolute staging path
+  (``.staging-<uuid>/cuda.cu``), no published build ever matches again, and every start compiles every JIT kernel
+  anew: on an RTX 3090 the Marlin W8A16 GEMM takes about 5 minutes, once per TP rank (the second rank finds no usable
+  build either). XTier resolves ``build_dir`` first.
 """
 
 import ctypes
@@ -51,6 +58,7 @@ TOKEN_SYNC = 'sglang.srt.layers.sampler.Sampler._sync_token_ids_across_tp'
 MXFP8_TUNER = 'flashinfer.autotuner.autotuner.AutoTuner.choose_one'
 FREEZE_GC = 'sglang.srt.entrypoints.http_server._freeze_gc_after_server_warmup'
 ACT_QUANT = 'sglang.kernels.ops.quantization.act_quant_triton.act_quant'
+JIT_DEPS = 'sglang.kernels.jit.utils.compile.cache._to_entries'
 MXFP8_LARGE_TILE, MXFP8_LARGE_ROWS = 4, 256   # SM120 CUTLASS MXFP8: tactic 4 = 128 x 128 x 128, no A/B swap
 _MADV_PAGEOUT = 21
 READ_AHEAD_FILES, READ_AHEAD_MAX = 2, 16 << 30
@@ -206,6 +214,12 @@ def _act_quant(original, *args, **kwargs):
     return act_quant(*args, **kwargs)
 
 
+def _jit_deps_resolved(original, *args, **kwargs):
+    if 'build_dir' in kwargs:
+        kwargs['build_dir'] = kwargs['build_dir'].resolve()
+    return original(*args, **kwargs)
+
+
 def install_serving(registry, hook_type) -> list[str]:
     """Fixes of the process that serves the API."""
     registry.register(FREEZE_GC, _freeze_gc_when_listening, hook_type.AROUND)
@@ -229,4 +243,7 @@ def install(registry, hook_type) -> list[str]:
     if importlib.util.find_spec('flashinfer') is not None and os.environ.get('XTIER_MXFP8_PREFILL_TILE', '1') != '0':
         registry.register(MXFP8_TUNER, _choose_one, hook_type.AROUND)
         fixes.append('sm120-mxfp8-prefill-tile')
+    if importlib.util.find_spec('sglang.kernels.jit.utils.compile') is not None:
+        registry.register(JIT_DEPS, _jit_deps_resolved, hook_type.AROUND)
+        fixes.append('jit-cache-symlinked-dir')
     return fixes
