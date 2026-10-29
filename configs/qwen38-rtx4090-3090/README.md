@@ -27,8 +27,13 @@ of host memory): copy test 0/8 at one and two requests, with MTP as well; PPL ov
 from the RTX PRO 5000 emulating SM89; a 120K-token prompt without running out of memory. Single requests there: 32K
 context 19.3 s to the first token and 36.3 tok/s decode, 120K 60.9 s and 36.5 tok/s, bound by that host's CPU (14
 engine threads; MTP does not help there). Details in
-[docs/reports/2026-10-29-rtx40.md](../../docs/reports/2026-10-29-rtx40.md). The RTX 3090 paths pass the same checks on
-the RTX PRO 5000 under `tools/arch_check.py --emulate sm86`, not yet on a real card.
+[docs/reports/2026-10-29-rtx40.md](../../docs/reports/2026-10-29-rtx40.md).
+
+Checked on a rented RTX 3090 as well (24 GB; a Xeon Platinum 8358P without AVX-512 BF16, 28 engine threads; 180 GB of
+host memory): copy test 0/8 at one and two requests, with MTP as well; PPL over 1K-token segments on
+average -0.006 from the RTX PRO 5000 emulating SM86 with the same limits; a 120K-token prompt without running out of memory.
+Single requests there: 32K context 22.6 s to the first token and 42.1 tok/s decode, 120K 72.6 s and 41.8 tok/s.
+Details in [docs/reports/2026-10-29-rtx30.md](../../docs/reports/2026-10-29-rtx30.md).
 
 A prompt-logprob request of a 4096-token text needs 1.9 GiB of logits in one piece: with 24 GB keep PPL segments at
 1024 tokens (`bench/ppl_eval.py --tokens 1024`).

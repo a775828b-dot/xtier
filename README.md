@@ -10,8 +10,8 @@ that uses the standard layer can run in hybrid mode without model-specific code;
 model-specific optimizations. **Status: early development** — Qwen3.8 Flash Next, GLM-5.3 Flash and DeepSeek V4.1 Flash 1017
 run on SGLang main; MiniMax-M3.1-Flash runs on SGLang's M3.1 branch (PR #45925), its development is paused (too slow here,
 and not smart enough); see [docs/PLAN.md](docs/PLAN.md). GPUs: developed and benchmarked on Blackwell
-(SM120); the RTX 40 series (SM89) is supported and was tested on an RTX 4090
-([report](docs/reports/2026-10-29-rtx40.md)).
+(SM120); the RTX 40 (SM89) and RTX 30 (SM86) series are supported, tested on an RTX 4090 and an RTX 3090
+([RTX 40 report](docs/reports/2026-10-29-rtx40.md), [RTX 30 report](docs/reports/2026-10-29-rtx30.md)).
 
 ---
 
@@ -89,6 +89,7 @@ CPU 引擎，全部读完、检查完才报在线，DeepSeek V4.1 Flash 1017 启
 |---|---|
 | Blackwell（SM120） | 开发和测速平台（RTX PRO 5000），下面的测速都在这上面测 |
 | RTX 40 系（SM89） | 支持。RTX 4090 实测：Qwen3.8 整模型在单卡 24 GB + 120 GB 内存上照抄 0 错、120K 上下文（[配置](configs/qwen38-rtx4090-3090/README.md)）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证；GLM 要关投机解码。详见[报告](docs/reports/2026-10-29-rtx40.md) |
+| RTX 30 系（SM86） | 支持。RTX 3090 实测：Qwen3.8 整模型在单卡 24 GB 上照抄 0 错、120K 上下文，decode 约 42 tok/s（云主机 28 个 CPU 线程）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证。FP8 全部软件解码（与硬件逐位相同），GLM 用 BF16 KV、要关投机解码。详见[报告](docs/reports/2026-10-29-rtx30.md) |
 
 ## 测速
 
@@ -207,6 +208,8 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-10-29（晚）：支持 RTX 30 系（SM86）：没有 FP8 硬件，FP8 一律读时软件解码（与硬件逐位相同），DeepSeek 的 FP8
+  投影只量化权重；RTX 3090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](docs/reports/2026-10-29-rtx30.md)。
 - 2026-10-29：支持 RTX 40 系（SM89）：FP4 读时软件解码（与硬件逐位相同，不增加精度损失），三个模型的加速包补上 SM90
   以下的内核；RTX 4090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](docs/reports/2026-10-29-rtx40.md)。
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
@@ -215,8 +218,6 @@ decode 约慢 10%），主要受限于硬盘速度。
   才报在线；DeepSeek 启动 472 → 186 s，卸载 30% 409 → 124 s。详见[文档](docs/reports/2026-10-27-fast-load.md)。
 - 2026-10-27：启动台新卡片「DeepSeek V4.1 Flash 1017 · 最小化」：32 GB 显存 + 128 GB 内存（模拟 RTX 5090），70% 的专家放硬盘，
   prefill 约 1,160、decode 约 30 tok/s。详见[文档](docs/reports/2026-10-27-ds41-minimal.md)。
-- 2026-10-26（晚）：冷专家卸载到硬盘（可选，`XTIER_COLD=1`），四个模型都能用；DeepSeek 卸载 30% 时 decode 每步 +44%。
-  详见[文档](docs/reports/2026-10-26-cold-experts.md)。
 
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
