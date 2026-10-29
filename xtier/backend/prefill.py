@@ -15,6 +15,8 @@ import torch
 import triton as tr
 import triton.language as tl
 
+from xtier.arch import e4m3_f32
+
 
 class Pointer:
     def __init__(self, address, dtype):
@@ -43,7 +45,7 @@ def _weight(W, S, e, row, col, ROWS: tl.constexpr, COLS: tl.constexpr, MX: tl.co
         # UE8M0 byte 0 represents 2^-127 (a float32 subnormal).
         scale = tl.where(s == 0, 2.0 ** -127, (s.to(tl.uint32) << 23).to(tl.float32, bitcast=True))
     else:
-        scale = s.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        scale = e4m3_f32(s)
     return v * scale
 
 
@@ -693,11 +695,13 @@ class Prefill:
 
     def _fp4_ready(self, output_dtype):
         """XTIER_PREFILL_FP4 applies to MXFP4 layers split into several equal expert chunks whose
-        global scales are all 1 (CUTLASS takes one fc1 global per expert); BF16 output only."""
+        global scales are all 1 (CUTLASS takes one fc1 global per expert); BF16 output only; GPUs with FP4 tensor
+        cores (SM100 and newer)."""
         ok = getattr(self, '_fp4_ok', None)
         if ok is None:
             g13, g2 = self.weights[-2], self.weights[-1]
-            ok = (self.mxfp4 and self.experts % self.chunk == 0 and self.experts // self.chunk > 1
+            ok = (torch.cuda.get_device_capability()[0] >= 10 and self.mxfp4
+                  and self.experts % self.chunk == 0 and self.experts // self.chunk > 1
                   and bool((g13 == 1).all()) and bool((g2 == 1).all()))
             self._fp4_ok = ok
         return ok and output_dtype == torch.bfloat16

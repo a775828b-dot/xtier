@@ -33,9 +33,10 @@ the GPU) and computed with the cached ones while the CPU computes the others. Pa
 about as fast as the CPU computes one (few cores, no AVX-512, memory bandwidth to spare). Not on layers with cold
 experts (their RAM slots change during a forward). The cache log's hit counts these experts too.
 
-Numerics: GPU routes are W4A16 (hardware FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
+Numerics: GPU routes are W4A16 (FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
 CPU routes unchanged. Without cached experts the result equals the plain mailbox path except for the FP32 addition of
-a zero GPU part.
+a zero GPU part. The FP4 decode uses the hardware conversion where it exists (SM100 and newer) and integer arithmetic
+elsewhere, e.g. on RTX 30 / 40 series GPUs (XTIER_FP4_DECODE=hw|soft|auto); both give the same FP16 bits.
 """
 import ctypes as C
 import json
@@ -48,6 +49,7 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier.arch import HW_FP4, e2m1_f16, e4m3_f32
 from xtier.backend.kernels import Pointer
 
 logger = logging.getLogger(__name__)
@@ -141,15 +143,19 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
     """Two FP16 tiles [BN, BK/2] of a pool slot: columns k0+2j (low nibbles) and k0+2j+1 (high nibbles).
     QE/QR: slot and row strides of the packed weights; SE/SR: of the linear E4M3 block scales."""
     pb = tl.load(Q + slot * QE + rows[:, None] * QR + (k0 // 2 + tl.arange(0, BK // 2))[None, :]).to(tl.uint32)
-    r = tl.inline_asm_elementwise(
-        asm="{ .reg .b8 t; cvt.u8.u32 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
-        constraints="=r,r", args=[pb], dtype=tl.uint32, is_pure=True, pack=1)
-    lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
-    hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    if HW_FP4:
+        r = tl.inline_asm_elementwise(
+            asm="{ .reg .b8 t; cvt.u8.u32 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
+            constraints="=r,r", args=[pb], dtype=tl.uint32, is_pure=True, pack=1)
+        lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+        hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    else:
+        lo = e2m1_f16(pb & 15)
+        hi = e2m1_f16(pb >> 4)
     GROUP: tl.constexpr = 32 if MX else 16
     c = k0 // GROUP + tl.arange(0, BK // GROUP)
     sb = tl.load(S + slot * SE + rows[:, None] * SR + c[None, :])
-    sc = (tl.where(sb == 0, 2.0 ** -127, (sb.to(tl.uint32) << 23).to(tl.float32, bitcast=True)) if MX else sb.to(tl.float8e4nv, bitcast=True).to(tl.float32).to(tl.float16))
+    sc = (tl.where(sb == 0, 2.0 ** -127, (sb.to(tl.uint32) << 23).to(tl.float32, bitcast=True)) if MX else e4m3_f32(sb).to(tl.float16))
     sc = tl.reshape(tl.broadcast_to(sc[:, :, None], (BN, BK // GROUP, GROUP // 2)), (BN, BK // 2))
     if MX:
         return (lo.to(tl.float32) * sc).to(tl.bfloat16), (hi.to(tl.float32) * sc).to(tl.bfloat16)

@@ -1,5 +1,6 @@
 """One real MoE layer of each production model, as the CPU engine's inputs (shared by the engine tests)."""
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -24,8 +25,12 @@ SWIGLU = {'minimax_m31': (1.702, 1.0)}
 
 
 def load(preset, layer=None):
-    """(w13, w2, s13, s2, g13, g2) host tensors of one layer, in the engine's layout."""
+    """(w13, w2, s13, s2, g13, g2) host tensors of one layer, in the engine's layout. XTIER_LAYERS_<PRESET>=DIR[:LAYER]
+    (e.g. XTIER_LAYERS_DS41_1017) reads another copy of the checkpoint, and its default layer, instead of the preset's:
+    a machine that downloaded only some shards."""
     MODEL, KEY, NAMES, H, I, E, K, LIMIT, LAYER, VM, FMT, SWITCHES = PRESETS[preset]
+    MODEL, _, alt = os.environ.get(f'XTIER_LAYERS_{preset.upper()}', MODEL).partition(':')
+    LAYER = int(alt) if alt else LAYER
     layer = LAYER if layer is None else layer
     G = 32 if FMT == 'mxfp4' else 16
     root = Path(MODEL)
