@@ -17,6 +17,8 @@ BF16 form 57 us; within 1e-4 of cuBLAS, 99.99% of outputs bitwise equal.
   same values into the same kind of dot, so the output differs from cuBLAS's by the summation order only. Larger
   calls (prefill) dequantize an FP8 layer into a reused BF16 buffer and keep SGLang's path.
 * The DSpark draft (its own class, BF16 weights) calls the same function and gets the BF16 form of the kernel.
+* FP8 weights are read as bytes and decoded by xtier.arch.e4m3_f32: the hardware conversion from SM89 on, the same
+  values in software on RTX 30 series.
 """
 
 import logging
@@ -26,6 +28,8 @@ import re
 import torch
 import triton
 import triton.language as tl
+
+from xtier.arch import e4m3_f32
 
 logger = logging.getLogger(__name__)
 MODELS = 'sglang.srt.models.deepseek_v4'
@@ -68,7 +72,7 @@ def _einsum_kernel(o_ptr, w_ptr, s_ptr, out_ptr, T, o_st, o_sg, o_sh, w_sg, w_sr
             k = h0 // SCALE_BK + tl.arange(0, BLOCK_H // SCALE_BK)
             s = tl.load(s_ptr + ((g * R + r) // SCALE_BN)[:, None] * s_stride + k[None, :],
                         mask=r_mask[:, None] & (k * SCALE_BK < D)[None, :], other=0.0)
-            w = tl.reshape(tl.reshape(w.to(tl.float32), (BLOCK_R, BLOCK_H // SCALE_BK, SCALE_BK)) * s[:, :, None],
+            w = tl.reshape(tl.reshape(e4m3_f32(w), (BLOCK_R, BLOCK_H // SCALE_BK, SCALE_BK)) * s[:, :, None],
                            (BLOCK_R, BLOCK_H)).to(tl.bfloat16)
         acc = tl.dot(a, tl.trans(w), acc=acc)
     tl.store(out_ptr + t[:, None] * out_st + g * out_sg + r[None, :] * out_sr, acc.to(out_ptr.dtype.element_ty),
@@ -83,7 +87,7 @@ def _dequant_kernel(w_ptr, s_ptr, out_ptr, rows, cols, s_stride, SCALE_BN: tl.co
     mask = (r < rows)[:, None] & (c < cols)[None, :]
     w = tl.load(w_ptr + r[:, None] * cols + c[None, :], mask=mask, other=0.0)
     s = tl.load(s_ptr + (r // SCALE_BN)[:, None] * s_stride + (c // SCALE_BK)[None, :], mask=mask, other=0.0)
-    tl.store(out_ptr + r[:, None] * cols + c[None, :], (w.to(tl.float32) * s).to(tl.bfloat16), mask=mask)
+    tl.store(out_ptr + r[:, None] * cols + c[None, :], (e4m3_f32(w) * s).to(tl.bfloat16), mask=mask)
 
 
 def einsum(o, w, scale=None):
@@ -94,7 +98,8 @@ def einsum(o, w, scale=None):
     fp8 = scale is not None
     s = scale if fp8 else w
     grid = (triton.cdiv(T, BLOCK_T), triton.cdiv(R, BLOCK_R), G)
-    _einsum_kernel[grid](o, w, s, out, T, *o.stride(), *w.stride(), s.stride(0), *out.stride(), R=R, D=D, FP8=fp8,
+    _einsum_kernel[grid](o, w.view(torch.uint8) if fp8 else w, s, out, T, *o.stride(), *w.stride(), s.stride(0),
+                         *out.stride(), R=R, D=D, FP8=fp8,
                          SCALE_BN=G * R // scale.shape[0] if fp8 else 1, SCALE_BK=D // scale.shape[1] if fp8 else 1,
                          BLOCK_T=BLOCK_T, BLOCK_R=BLOCK_R, BLOCK_H=BLOCK_H, num_warps=4, num_stages=3)
     return out
@@ -104,7 +109,7 @@ def dequantize(w, scale, out):
     """FP8 w [rows, cols] x FP32 block scales -> BF16 out [rows, cols]."""
     rows, cols = w.shape
     _dequant_kernel[(triton.cdiv(rows, 64), triton.cdiv(cols, 128))](
-        w, scale, out, rows, cols, scale.stride(0), SCALE_BN=rows // scale.shape[0], SCALE_BK=cols // scale.shape[1],
+        w.view(torch.uint8), scale, out, rows, cols, scale.stride(0), SCALE_BN=rows // scale.shape[0], SCALE_BK=cols // scale.shape[1],
         BLOCK_M=64, BLOCK_N=128, num_warps=4)
     return out
 

@@ -43,6 +43,16 @@
   DS41_PLAIN_CONTENT_TOKENS): added-token spellings in message content stay plain text, only the template's control
   tokens are special, and the prompt is encoded in regions instead of one string (a 568K-token prompt 1.3 -> 0.18 s,
   every turn). Hooks of the serving process, not the schedulers; see recipe_tokens.py.
+- Attention below SM90 (sparse_mla.py; RTX 30 / 40 series): off SM120 SGLang serves every DeepSeek V4 attention call
+  through FlashMLA, built for SM90 / SM100 only; a Triton sparse MLA over the same FP8 pages takes the backend's calls,
+  prefill included (it stays on the paged caches, as on SM120).
+- mHC pre-mix below SM90 (mhc_splitk.py): SGLang's TileLang split-K GEMM, which serves it without DeepGEMM, has no
+  hidden block for V4.1 Flash's 20480 in its table; the same kernel with V4 Pro's block.
+- FP8 below SM89 (RTX 30 series), where Triton has no float8e4nv: the 32 x 32 block FP8 projections weight-only
+  (w8a16.py; Marlin, SGLang's choice there, has no 32-wide groups), Engram rows (engram_gather.py; SGLang's gather
+  with the payload's bytes decoded in software) and the E4M3 rounding of the compressed KV's FP4 block scales
+  (fake_quant_fp8.py; SGLang's kernel rebuilt with the round trip in software). The DSpark draft's FP8 LM head
+  (torch._scaled_mm, SM89 and newer) stays BF16 there.
 - Decoder replay tail without graphs: with --enable-decoder-swa-bounded-replay SGLang runs the late layers of a
   prefill from row-bucket CUDA graphs captured while serving (up to SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = 2048
   rows). Their MoE calls of hundreds to thousands of rows cannot go through XTier's capturable decode path (mailbox
@@ -67,6 +77,8 @@ INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
 REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
 MXFP8_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_blockscaled_linear'
+FLASH_MLA = 'sgl_kernel.flash_mla.flash_mla_with_kvcache'
+SPARSE_PREFILL = 'sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend._use_sparse_prefill'
 FP8_CONFIG_DIR = Path(__file__).with_name('fp8_configs')
 ENGRAM_LAYERS = 2   # DeepSeek V4.1 Flash has two Engram layers (1 and 14); the cache budget is split over them
 ROW_BYTES, SCALE_BYTES, BLOCK = 256, 8, 32   # an FP8 E4M3 row of 256 with one E8M0 scale per 32
@@ -305,13 +317,25 @@ def install(registry, hook_type):
     if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
+    if torch.cuda.get_device_capability()[0] < 9:
+        from xtier.packs.deepseek_v4 import mhc_splitk, sparse_mla
+        registry.register(FLASH_MLA, sparse_mla.flash_mla_with_kvcache, hook_type.AROUND)
+        registry.register(SPARSE_PREFILL, sparse_mla.no_sparse_prefill, hook_type.AROUND)
+        registry.register(mhc_splitk.MHC_PRE, mhc_splitk.mhc_pre, hook_type.AROUND)
+    from xtier.arch import HW_FP8
+    if not HW_FP8:
+        from xtier.packs.deepseek_v4 import engram_gather, fake_quant_fp8, w8a16
+        registry.register(f'{w8a16.FP8_METHOD}.__init__', w8a16.no_marlin, hook_type.AFTER)
+        registry.register(w8a16.BLOCK_LINEAR, w8a16.linear, hook_type.AROUND)
+        registry.register(engram_gather.ENGRAM_GATHER, engram_gather.replace, hook_type.AROUND)
+        registry.register(fake_quant_fp8.LAUNCHER, fake_quant_fp8.launcher, hook_type.AROUND)
     if os.environ.get('XTIER_ENGRAM_ROWS', '') == 'nvme':
         registry.register(f'{ENGRAM}.__init__', _init, hook_type.AROUND)
         registry.register(f'{ENGRAM}._owned_rows', _owned_rows, hook_type.REPLACE)
         if os.environ.get('XTIER_ENGRAM_PREFETCH', '1') != '0':
             registry.register(f'{ENGRAM_LAYER}.__init__', _engram_layer_init, hook_type.AFTER)
             registry.register(f'{HASHER}.forward', _prefetch, hook_type.AFTER)
-    if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0':
+    if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0' and torch.cuda.get_device_capability() >= (8, 9):
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)
 
