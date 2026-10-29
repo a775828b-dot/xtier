@@ -4,7 +4,8 @@
 # host memory for the CPU engine (63 GiB); the PLE n-gram table (48 GiB) stays in the checkpoint on the data disk and
 # is read by rows. Extra server arguments are appended ("$@"); settings come from the environment:
 #   DATA (data disk), XTIER_ENV (Python environment), MODEL (checkpoint), TOKENIZER (converted tokenizer, see README),
-#   XTIER_FILES (cache ranking profile, MTP draft token map), PORT, CONTEXT (tokens), MTP=1 (speculative decoding)
+#   XTIER_FILES (cache ranking profile, MTP draft token map), PORT, CONTEXT (tokens), MTP=1 (speculative decoding),
+#   TP=2 (tensor parallel over two GPUs: each holds half of every hot expert and of the KV cache, see README)
 set -eo pipefail
 DATA=${DATA:-/root/autodl-tmp}
 E=${XTIER_ENV:-$DATA/xtier-env}
@@ -14,10 +15,14 @@ F=${XTIER_FILES:-$DATA/xtier-files}
 export CUDA_HOME=${CUDA_HOME:-$E/lib/python3.12/site-packages/nvidia/cu13}
 export PATH=$CUDA_HOME/bin:$E/bin:$PATH PYTHONUNBUFFERED=1   # $E/bin: ninja for SGLang's JIT kernels
 # CPU engine threads: the CPUs this container may use (affinity, cgroup v2 / v1 quota) less one for the scheduler, a
-# multiple of the NUMA nodes the engine spreads them over (the nodes with CPUs of ours)
+# multiple of the NUMA nodes the engine spreads them over (the nodes with CPUs of ours). With TP the number is per rank:
+# one scheduler per rank, each rank's engine on its own group of NUMA nodes (XTIER_TP_NODES=auto, set here so the
+# plugin leaves the placement to the first MoE layer, where the rank is known)
+TP=${TP:-1}
 if [ -z "${XTIER_THREADS:-}" ]; then
-  XTIER_THREADS=$($E/bin/python "$(dirname "$0")/../../tools/cpu_budget.py")
+  XTIER_THREADS=$($E/bin/python "$(dirname "$0")/../../tools/cpu_budget.py" --tp $TP)
 fi
+if [ "$TP" -gt 1 ]; then export XTIER_TP_NODES=${XTIER_TP_NODES:-auto}; fi
 export XTIER=${XTIER:-1} XTIER_THREADS XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
 export XTIER_SPIN_COUNT=${XTIER_SPIN_COUNT:-1048576}
 # GPU prefill as on the RTX PRO 5000 (configs/qwen38-pro5000-nps4)
@@ -29,8 +34,12 @@ export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFIL
 export XTIER_PLE_ROWS=${XTIER_PLE_ROWS:-nvme} XTIER_PLE_CACHE_GIB=${XTIER_PLE_CACHE_GIB:-4}
 # hot experts: N slots per layer, filled from the production ranking profile, swapped by use; 48 leave ~3.6 GB of GPU
 # memory free after start (a 4K-token prompt-logprob request needs 1.9 GiB of logits alone), with MTP 40 (its
-# draft holds all 512 experts of its MoE layer on the GPU)
-SLOTS=48; if [ "${MTP:-0}" = 1 ]; then SLOTS=40; fi
+# draft holds all 512 experts of its MoE layer on the GPU). With TP=2 a slot holds half an expert and each GPU half the
+# KV cache, and the SSM state cache is capped at 16 entries as in production's long-context config (SGLang would give
+# it what is left, ~2.4 GB per GPU, far more than two requests' prefixes use): 180 slots leave ~4.4 GB per GPU (MTP 160)
+if [ "$TP" -gt 1 ]; then SLOTS=180; MTP_SLOTS=160; MAMBA=(--max-mamba-cache-size 16)
+else SLOTS=48; MTP_SLOTS=40; MAMBA=(); fi
+if [ "${MTP:-0}" = 1 ]; then SLOTS=$MTP_SLOTS; fi
 export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-$SLOTS} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-32} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
 if [ -f "$F/lkqstrata-qwen38.json" ]; then export XTIER_CACHE_PROFILE=${XTIER_CACHE_PROFILE:-$F/lkqstrata-qwen38.json}; fi
 CONTEXT=${CONTEXT:-131072}
@@ -39,14 +48,18 @@ if [ "${MTP:-0}" = 1 ]; then   # as production: NEXTN 3 steps, 4 draft tokens, t
   export XTIER_DRAFT=${XTIER_DRAFT:-1}
   SPEC=(--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
         --speculative-draft-model-quantization modelopt_mixed --speculative-draft-kv-cache-dtype fp8_e4m3)
-  if [ -f "$F/draft-token-map-49152.pt" ]; then SPEC+=(--speculative-token-map "$F/draft-token-map-49152.pt"); fi
+  # the draft's head over 49,152 frequent tokens: SGLang cuts it from the target's lm_head by global token ids, which
+  # a vocab-parallel shard does not have (a device-side assert at start), so with TP the draft keeps the whole vocabulary
+  if [ -f "$F/draft-token-map-49152.pt" ] && [ "$TP" = 1 ]; then
+    SPEC+=(--speculative-token-map "$F/draft-token-map-49152.pt")
+  fi
 fi
 exec $E/bin/python -m sglang.launch_server --model-path $M --tokenizer-path $T --served-model-name Qwen3.8-Flash-Next \
-  --host 127.0.0.1 --port ${PORT:-30000} --tp-size 1 --trust-remote-code --skip-server-warmup --cuda-graph-backend-prefill disabled \
+  --host 127.0.0.1 --port ${PORT:-30000} --tp-size $TP --trust-remote-code --skip-server-warmup --cuda-graph-backend-prefill disabled \
   --max-running-requests 2 --cuda-graph-max-bs-decode 2 --page-size 64 --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --enable-metrics --enable-cache-report --weight-loader-drop-cache-after-load \
   --context-length $CONTEXT --max-total-tokens $CONTEXT --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 8192 \
-  --mamba-ssm-dtype bfloat16 --mem-fraction-static ${MEM_FRACTION:-0.88} "${SPEC[@]}" "$@"
+  --mamba-ssm-dtype bfloat16 "${MAMBA[@]}" --mem-fraction-static ${MEM_FRACTION:-0.88} "${SPEC[@]}" "$@"
 # --kv-cache-dtype fp8_e4m3: 12 KiB per token (BF16 24 KiB); RTX 30 series read it through the pack's software E4M3
 # decode (packs/qwen4_exp/qsa_fp4.py), RTX 40 series through SGLang's kernels. --max-total-tokens: one full context.
 # --mamba-ssm-dtype bfloat16: as production (half the SSM state memory of the FP32 default).
