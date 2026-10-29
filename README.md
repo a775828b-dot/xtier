@@ -9,7 +9,9 @@ them back when they are routed (its size and speed are bound by the drives' spee
 that uses the standard layer can run in hybrid mode without model-specific code; optional per-model acceleration packs add
 model-specific optimizations. **Status: early development** — Qwen3.8 Flash Next, GLM-5.3 Flash and DeepSeek V4.1 Flash 1017
 run on SGLang main; MiniMax-M3.1-Flash runs on SGLang's M3.1 branch (PR #45925), its development is paused (too slow here,
-and not smart enough); see [docs/PLAN.md](docs/PLAN.md).
+and not smart enough); see [docs/PLAN.md](docs/PLAN.md). GPUs: developed and benchmarked on Blackwell
+(SM120); the RTX 40 series (SM89) is supported and was tested on an RTX 4090
+([report](docs/reports/2026-10-29-rtx40.md)).
 
 ---
 
@@ -80,6 +82,13 @@ CPU 引擎，全部读完、检查完才报在线，DeepSeek V4.1 Flash 1017 启
 | GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包（FP8 权重、热词表拒绝采样、截断验证、弹性热专家槽）比官方 main 长回复每步快 22%，PPL 3.987 → 3.998 |
 | DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；加速包（含 FP8 wo_a、分页索引器、弹性热专家槽）比官方 main 长回复每步快 39%、冷 prefill 快 33% |
 | MiniMax-M3.1-Flash | `minimax_m3` | **暂停开发**（2026-10-26，本机太慢、智力不强）。SGLang 的 M3.1 分支（PR #45925）上跑通（含 DSpark），加速包比官方代码长回复每步快 34% |
+
+## 支持的显卡
+
+| 显卡 | 状态 |
+|---|---|
+| Blackwell（SM120） | 开发和测速平台（RTX PRO 5000），下面的测速都在这上面测 |
+| RTX 40 系（SM89） | 支持。RTX 4090 实测：Qwen3.8 整模型在单卡 24 GB + 120 GB 内存上照抄 0 错、120K 上下文（[配置](configs/qwen38-rtx4090-3090/README.md)）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证；GLM 要关投机解码。详见[报告](docs/reports/2026-10-29-rtx40.md) |
 
 ## 测速
 
@@ -198,6 +207,8 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-10-29：支持 RTX 40 系（SM89）：FP4 读时软件解码（与硬件逐位相同，不增加精度损失），三个模型的加速包补上 SM90
+  以下的内核；RTX 4090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](docs/reports/2026-10-29-rtx40.md)。
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
   给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](docs/reports/2026-10-28-decode-miss-gpu.md)。
 - 2026-10-27（下午）：快速加载（可选，`XTIER_FAST_LOAD=1`，默认关）：专家直接从模型文件或冷存储读进 CPU 引擎，仍是全部装好
@@ -206,8 +217,6 @@ decode 约慢 10%），主要受限于硬盘速度。
   prefill 约 1,160、decode 约 30 tok/s。详见[文档](docs/reports/2026-10-27-ds41-minimal.md)。
 - 2026-10-26（晚）：冷专家卸载到硬盘（可选，`XTIER_COLD=1`），四个模型都能用；DeepSeek 卸载 30% 时 decode 每步 +44%。
   详见[文档](docs/reports/2026-10-26-cold-experts.md)。
-- 2026-10-26：弹性热专家槽（DeepSeek 每步 −4.3%、GLM −1.5%）；GLM 常备槽 60 → 58；启动台报在线前先预热；MiniMax-M3.1-Flash
-  暂停开发。详见[文档](docs/reports/2026-10-26-elastic-cache.md)。
 
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
