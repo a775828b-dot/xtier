@@ -32,6 +32,10 @@
   warm-up thread posts /freeze_gc at once, before uvicorn has bound the port, so the request is refused (a warning
   with a traceback in every start) and no process freezes its startup objects. XTier waits until the port accepts
   connections (``XTIER_FREEZE_GC_WAIT_S``, 120 s at most), then lets SGLang post it.
+- FP8 activation quantization below SM89 (RTX 30 series): SGLang's Triton ``act_quant`` (the DSA indexer's queries)
+  stores through float8e4nv, which Triton has only from SM89 on, so it does not compile; its TileLang version (the
+  ROCm path; CUDA's cuda_fp8.h converts in software there) gives the same bytes and scales: bitwise on the RTX PRO
+  5000 against the Triton kernel, both scale formats, and again built for sm_86 (tools/arch_check.py --emulate sm86).
 """
 
 import ctypes
@@ -46,6 +50,7 @@ DROP_FILE_CACHE = 'sglang.srt.model_loader.weight_utils._drop_file_cache_after_l
 TOKEN_SYNC = 'sglang.srt.layers.sampler.Sampler._sync_token_ids_across_tp'
 MXFP8_TUNER = 'flashinfer.autotuner.autotuner.AutoTuner.choose_one'
 FREEZE_GC = 'sglang.srt.entrypoints.http_server._freeze_gc_after_server_warmup'
+ACT_QUANT = 'sglang.kernels.ops.quantization.act_quant_triton.act_quant'
 MXFP8_LARGE_TILE, MXFP8_LARGE_ROWS = 4, 256   # SM120 CUTLASS MXFP8: tactic 4 = 128 x 128 x 128, no A/B swap
 _MADV_PAGEOUT = 21
 READ_AHEAD_FILES, READ_AHEAD_MAX = 2, 16 << 30
@@ -193,6 +198,14 @@ def _freeze_gc_when_listening(original, server_args, *args, **kwargs):
     return original(server_args, *args, **kwargs)
 
 
+def _act_quant(original, *args, **kwargs):
+    from xtier.arch import HW_FP8
+    if HW_FP8:
+        return original(*args, **kwargs)
+    from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
+    return act_quant(*args, **kwargs)
+
+
 def install_serving(registry, hook_type) -> list[str]:
     """Fixes of the process that serves the API."""
     registry.register(FREEZE_GC, _freeze_gc_when_listening, hook_type.AROUND)
@@ -210,6 +223,9 @@ def install(registry, hook_type) -> list[str]:
         fixes.append('checkpoint-page-out')
     registry.register(TOKEN_SYNC, _sync_token_ids, hook_type.AROUND)
     fixes.append('tp1-token-sync')
+    if importlib.util.find_spec('tilelang') is not None:   # acts below SM89 only
+        registry.register(ACT_QUANT, _act_quant, hook_type.AROUND)
+        fixes.append('fp8-act-quant-below-sm89')
     if importlib.util.find_spec('flashinfer') is not None and os.environ.get('XTIER_MXFP8_PREFILL_TILE', '1') != '0':
         registry.register(MXFP8_TUNER, _choose_one, hook_type.AROUND)
         fixes.append('sm120-mxfp8-prefill-tile')
