@@ -11,6 +11,11 @@ from it. Here, for a layer on an NVFP4 pool:
 The global scale is the one the pool wrote with: the hybrid pool of these models passes 1.0. It passes it as a Python
 float, which NVFP4KVQuantizeUtil.quantize turns into a host-to-device copy that CUDA graph capture rejects (the target
 verify graph fails to capture); a device tensor of 1.0, made when the NVFP4 pool is created, replaces it.
+
+An FP8 (E4M3) pool takes the same route on GPUs whose Triton has no float8e4nv (RTX 30 series): SGLang's gather and
+packing kernels would not compile there, so the pack's kernels read the pool's bytes and decode them in software
+(xtier.arch; QSA stores unscaled K/V, so the value is the plain conversion, the same bits as SGLang's cast).
+Elsewhere SGLang's kernels read FP8 pools themselves.
 """
 
 import contextlib
@@ -18,6 +23,8 @@ import contextlib
 import torch
 import triton
 import triton.language as tl
+
+from xtier.arch import HW_FP8, e4m3_f32
 
 BLOCK_TOPK = 16
 BLOCK_T = 32
@@ -34,9 +41,13 @@ def _one(device):
 
 
 def raw_buffers(pool, layer):
-    """The packed K/V, block scales and global scales of ``layer`` if ``pool`` is an NVFP4 KV pool, else None."""
+    """The packed K/V, block scales and global scales of ``layer`` if ``pool`` is an NVFP4 KV pool; the K/V bytes (no
+    scales) of an FP8 pool on a GPU without float8e4nv in Triton; else None."""
     method = pool.get_kv_cache_quant_method() if hasattr(pool, 'get_kv_cache_quant_method') else None
     if getattr(method, 'name', None) != 'nvfp4':
+        if not HW_FP8 and getattr(pool, 'dtype', None) == torch.float8_e4m3fn:
+            k, v = pool.get_key_buffer(layer.layer_id), pool.get_value_buffer(layer.layer_id)
+            return k.view(torch.uint8), v.view(torch.uint8), None, None, None, None
         return None
     k, v, k_sf, v_sf = pool.get_raw_kv_buffer(layer.layer_id)
     if hasattr(pool, 'full_kv_pool'):   # HybridLinearKVPool.set_kv_buffer writes with k_scale = v_scale = 1.0
@@ -58,12 +69,13 @@ def _layer(raw):
 
 def _stand_in(raw):
     k = raw[0]
-    m, heads, half = k.shape
-    key = (heads, half * 2, k.device)
+    m, heads, width = k.shape
+    dim = width if raw[2] is None else width * 2   # FP8: a byte per value; NVFP4: two values per byte
+    key = (heads, dim, k.device)
     t = _stand_ins.get(key)
     if t is None:
-        t = _stand_ins[key] = torch.empty((1, heads, half * 2), dtype=torch.bfloat16, device=k.device)
-    return t.expand(m, heads, half * 2)
+        t = _stand_ins[key] = torch.empty((1, heads, dim), dtype=torch.bfloat16, device=k.device)
+    return t.expand(m, heads, dim)
 
 
 @triton.jit
@@ -82,18 +94,35 @@ def _dequant_rows(fp4, sf, g, rows, mask, head, HEADS: tl.constexpr, DIM: tl.con
     packed = tl.load(fp4 + rows[:, None] * (HEADS * DIM // 2) + head * (DIM // 2) + d2[None, :], mask=mask[:, None],
                      other=0).to(tl.int32)
     vals = tl.interleave(_e2m1(packed & 0xF), _e2m1(packed >> 4))
-    scales = tl.load(sf + rows[:, None] * (HEADS * DIM // 16) + head * (DIM // 16) + s[None, :], mask=mask[:, None],
-                     other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    scales = e4m3_f32(tl.load(sf + rows[:, None] * (HEADS * DIM // 16) + head * (DIM // 16) + s[None, :],
+                              mask=mask[:, None], other=0))
     for _ in tl.static_range(4):
         scales = tl.interleave(scales, scales)
     return vals * scales * tl.load(g)
 
 
 @triton.jit
+def _fp8_rows(src, rows, mask, head, HEADS: tl.constexpr, DIM: tl.constexpr):
+    """[R, DIM] fp32 of rows `rows` (int64 [R]), head `head` of an E4M3 [m, HEADS, DIM] buffer read as bytes."""
+    d = tl.arange(0, DIM)
+    return e4m3_f32(tl.load(src + rows[:, None] * (HEADS * DIM) + head * DIM + d[None, :], mask=mask[:, None], other=0))
+
+
+@triton.jit
+def _rows(src, sf, g, rows, mask, head, HEADS: tl.constexpr, DIM: tl.constexpr, FP8: tl.constexpr):
+    if FP8:
+        return _fp8_rows(src, rows, mask, head, HEADS, DIM)
+    else:
+        return _dequant_rows(src, sf, g, rows, mask, head, HEADS, DIM)
+
+
+@triton.jit
 def _gather_fp4(k, v, k_sf, v_sf, gk, gv, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v,
                 topk: tl.constexpr, HEADS: tl.constexpr, DIM: tl.constexpr, req_stride: tl.constexpr,
-                idx_stride: tl.constexpr, pad_cols, BLOCK_TOPK: tl.constexpr, ZERO_FILL: tl.constexpr):
-    """SGLang's _compact_kv (qsa/sparse_attn.py) on packed NVFP4 rows: same validity rules and layouts."""
+                idx_stride: tl.constexpr, pad_cols, BLOCK_TOPK: tl.constexpr, ZERO_FILL: tl.constexpr,
+                FP8: tl.constexpr):
+    """SGLang's _compact_kv (qsa/sparse_attn.py) on packed NVFP4 rows (FP8: E4M3 bytes): same validity rules and
+    layouts."""
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
     dims = tl.arange(0, DIM)
@@ -110,13 +139,13 @@ def _gather_fp4(k, v, k_sf, v_sf, gk, gv, req_to_token, req_indices, indices, se
     else:
         store = valid[:, None] & (dims[None, :] < DIM)
     out_dtype = out_k.dtype.element_ty
-    tl.store(out_k + dst, _dequant_rows(k, k_sf, gk, slots, valid, head, HEADS, DIM).to(out_dtype), mask=store)
-    tl.store(out_v + dst, _dequant_rows(v, v_sf, gv, slots, valid, head, HEADS, DIM).to(out_dtype), mask=store)
+    tl.store(out_k + dst, _rows(k, k_sf, gk, slots, valid, head, HEADS, DIM, FP8).to(out_dtype), mask=store)
+    tl.store(out_v + dst, _rows(v, v_sf, gv, slots, valid, head, HEADS, DIM, FP8).to(out_dtype), mask=store)
 
 
 @triton.jit
 def _pack_fp4(k, v, k_sf, v_sf, gk, gv, packed_k, packed_v, req_to_token, req_indices, cu_k, SR0, SR1,
-              HEADS: tl.constexpr, DIM: tl.constexpr, BLOCK_T: tl.constexpr):
+              HEADS: tl.constexpr, DIM: tl.constexpr, BLOCK_T: tl.constexpr, FP8: tl.constexpr):
     """Request pid 1, tokens of block pid 0, head pid 2: rows req_to_token[req, t] -> packed [cu_k[b] + t]."""
     batch, head = tl.program_id(1), tl.program_id(2)
     t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -127,39 +156,39 @@ def _pack_fp4(k, v, k_sf, v_sf, gk, gv, packed_k, packed_v, req_to_token, req_in
     dims = tl.arange(0, DIM)
     dst = (start + t)[:, None] * HEADS * DIM + head * DIM + dims[None, :]
     mask = valid[:, None] & (dims[None, :] < DIM)
-    tl.store(packed_k + dst, _dequant_rows(k, k_sf, gk, slots, valid, head, HEADS, DIM).to(packed_k.dtype.element_ty),
+    tl.store(packed_k + dst, _rows(k, k_sf, gk, slots, valid, head, HEADS, DIM, FP8).to(packed_k.dtype.element_ty),
              mask=mask)
-    tl.store(packed_v + dst, _dequant_rows(v, v_sf, gv, slots, valid, head, HEADS, DIM).to(packed_v.dtype.element_ty),
+    tl.store(packed_v + dst, _rows(v, v_sf, gv, slots, valid, head, HEADS, DIM, FP8).to(packed_v.dtype.element_ty),
              mask=mask)
 
 
 def _check(raw):
-    k = raw[0]
-    dim = k.shape[2] * 2
-    if not (k.is_contiguous() and raw[2].is_contiguous() and dim % 32 == 0 and dim & (dim - 1) == 0):
-        raise ValueError(f'xtier qsa_fp4: packed [m, heads, dim / 2] rows with a power-of-2 head size expected, got '
-                         f'{tuple(k.shape)}')
-    return k.shape[1], dim
+    k, fp8 = raw[0], raw[2] is None
+    dim = k.shape[2] if fp8 else k.shape[2] * 2
+    if not (k.is_contiguous() and (fp8 or raw[2].is_contiguous()) and dim % 32 == 0 and dim & (dim - 1) == 0):
+        raise ValueError(f'xtier qsa_fp4: packed [m, heads, dim / 2] (FP8: [m, heads, dim]) rows with a power-of-2 '
+                         f'head size expected, got {tuple(k.shape)}')
+    return k.shape[1], dim, fp8
 
 
 def gather(raw, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v, batch, topk, zero_fill_cols=0):
-    heads, dim = _check(raw)
+    heads, dim, fp8 = _check(raw)
     num_cols = zero_fill_cols if zero_fill_cols > 0 else topk
     _gather_fp4[(batch, heads, triton.cdiv(num_cols, BLOCK_TOPK))](
         *raw, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v, topk, heads, dim,
         req_to_token.stride(0), indices.stride(0), num_cols, BLOCK_TOPK=BLOCK_TOPK, ZERO_FILL=zero_fill_cols > 0,
-        num_warps=4)
+        FP8=fp8, num_warps=4)
 
 
 def pack(raw, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype):
-    heads, dim = _check(raw)
+    heads, dim, fp8 = _check(raw)
     device = raw[0].device
     packed_k = torch.empty((total_k, heads, dim), dtype=output_dtype, device=device)
     packed_v = torch.empty((total_k, heads, dim), dtype=output_dtype, device=device)
     batch = req_indices.numel()
     _pack_fp4[(triton.cdiv(max_k, BLOCK_T), batch, heads)](
         *raw, packed_k, packed_v, req_to_token, req_indices, cu_k, *req_to_token.stride(), heads, dim,
-        BLOCK_T=BLOCK_T, num_warps=4)
+        BLOCK_T=BLOCK_T, FP8=fp8, num_warps=4)
     return packed_k, packed_v
 
 

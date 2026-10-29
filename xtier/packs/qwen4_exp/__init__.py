@@ -17,6 +17,9 @@
 - QSA attention on an NVFP4 KV cache (qsa_fp4.py, ``--kv-cache-dtype nvfp4`` as production, XTIER_QSA_FP4=0 off):
   SGLang stores the cache but its QSA backend reads it as plain K/V; the pack's decode / verify gather and prefill
   packing dequantize straight from the packed rows (equal to SGLang's kernels on the dequantized pool, bitwise).
+- QSA decode / verify attention below SM90 (qsa_decode.py; RTX 30 / 40 series): SGLang falls back to flash_attn's
+  varlen kernel there, which has no head_dim 256 tile that fits their shared memory; split-key Triton kernels with the
+  flash kernels' precision take its place.
 """
 
 import logging
@@ -27,7 +30,8 @@ PLE = 'sglang.srt.models.qwen4_exp_ple_table.allocate_ple_host_table'
 HC_MIX = 'sglang.kernels.ops.gemm.hc_mix.fused_hc_mix'
 MODELS = 'sglang.srt.models.qwen4_exp'
 QSA_PREFILL = 'sglang.srt.layers.attention.qsa.mqa.tilelang_qsa_mqa_prefill'
-QSA_BACKEND = 'sglang.srt.layers.attention.qwen_sparse_attn_backend.QwenSparseAttnBackend'
+QSA_MODULE = 'sglang.srt.layers.attention.qwen_sparse_attn_backend'
+QSA_BACKEND = f'{QSA_MODULE}.QwenSparseAttnBackend'
 SPARSE_ATTN = 'sglang.srt.layers.attention.qsa.sparse_attn'
 KV_FP4 = 'sglang.srt.layers.quantization.fp4_kv_cache_quant_method'
 KV_FP4_UTIL = 'sglang.srt.layers.quantization.kvfp4_tensor'
@@ -63,6 +67,8 @@ def install(registry, hook_type):
                           hook_type.AROUND)
         registry.register(f'{KV_FP4}.NVFP4KVCacheMethod.create_buffers', qsa_fp4.create_buffers, hook_type.AFTER)
         registry.register(f'{KV_FP4_UTIL}.NVFP4KVQuantizeUtil.quantize', qsa_fp4.quantize, hook_type.AROUND)
+    from xtier.packs.qwen4_exp import qsa_decode   # acts only below SM90
+    registry.register(f'{QSA_MODULE}._resolve_flash_attn_varlen_func', qsa_decode.resolve, hook_type.AROUND)
     if os.environ.get('XTIER_PLE_ROWS', '') == 'nvme':
         from xtier.packs.qwen4_exp import ple_rows
         registry.register(f'{MODELS}.Qwen4ExpNGramEmbedding.__init__', ple_rows.ngram_init, hook_type.AROUND)
