@@ -11,7 +11,15 @@ endif()
 # from its own directory. Separate libraries matter: inline functions both builds use (e.g. std::to_string) would
 # otherwise be merged into one copy compiled for one of the ISAs. Keep the flags in step with the CPU checks in
 # engine/dispatch.cpp.
-set(XTIER_AVX512_FLAGS "-march=x86-64-v4;-mavx512bf16;-mavx512vbmi;-mtune=znver4" CACHE STRING "AVX512 kernel build flags")
+# -mtune=znver4 needs GCC 12.3 / 13 or newer; older compilers (Ubuntu 22.04's GCC 11) tune for Zen 3 (scheduling only)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-mtune=znver4 XTIER_CXX_HAS_ZNVER4)
+if(XTIER_CXX_HAS_ZNVER4)
+  set(XTIER_AVX512_TUNE znver4)
+else()
+  set(XTIER_AVX512_TUNE znver3)
+endif()
+set(XTIER_AVX512_FLAGS "-march=x86-64-v4;-mavx512bf16;-mavx512vbmi;-mtune=${XTIER_AVX512_TUNE}" CACHE STRING "AVX512 kernel build flags")
 set(XTIER_AVX2_FLAGS "-march=x86-64-v3;-mtune=znver2" CACHE STRING "AVX2 kernel build flags")
 # Down rows per microkernel iteration in the AVX512 build: 1 (one-row, the release build since lkqmoe 0.5.5) or 4.
 set(XTIER_AVX512_DOWN_R4 "1" CACHE STRING "Down microkernel rows of the AVX512 build: 1, 2 or 4")

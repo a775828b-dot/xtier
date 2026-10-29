@@ -45,11 +45,18 @@ Impl impl_storage;
 std::string error;
 
 // Must match the compile flags of the two builds (CMakeLists.txt XTIER_AVX512_FLAGS /
-// XTIER_AVX2_FLAGS).
-bool has_avx512() {
-    return __builtin_cpu_supports("x86-64-v4")&&__builtin_cpu_supports("avx512bf16")&&__builtin_cpu_supports("avx512vbmi");
+// XTIER_AVX2_FLAGS). Feature by feature: GCC 11 has no x86-64-v3 / -v4 names here (the levels' F16C,
+// LZCNT and MOVBE come with every AVX2 + FMA + BMI2 CPU).
+bool has_avx2() {
+    return __builtin_cpu_supports("avx2")&&__builtin_cpu_supports("fma")&&__builtin_cpu_supports("bmi")&&
+           __builtin_cpu_supports("bmi2");
 }
-bool has_avx2() {return __builtin_cpu_supports("x86-64-v3");}
+bool has_avx512() {
+    return has_avx2()&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&
+           __builtin_cpu_supports("avx512cd")&&__builtin_cpu_supports("avx512dq")&&
+           __builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx512bf16")&&
+           __builtin_cpu_supports("avx512vbmi");
+}
 
 std::string own_directory() {
     Dl_info info{};
