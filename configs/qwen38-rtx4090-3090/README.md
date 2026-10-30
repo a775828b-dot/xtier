@@ -61,6 +61,12 @@ work with, the rest of the larger one stays unused: on 24 + 16 GiB (the second R
 `tools/vram_limit.py`), `XTIER_CACHE_SLOTS=64` leaves 4.7 GiB on the smaller GPU, copy test 0/8, decode 51.1 tok/s at 32K
 and 49.4 at 120K, 60.0 s to the first token at 120K.
 
+For GPUs of different size or speed, the second one can hold only hot experts instead (`TP=1`, the fast GPU first):
+`XTIER_GPU2_SLOTS=auto CUDA_VISIBLE_DEVICES=0,1 bash run-qwen.sh` (`xtier/cache/second.py`). On the same 24 + 16 GiB: 48 + 113
+slots per layer, decode 57.3 tok/s at 32K and 55.9 at 120K, 58.9 s to the first token at 120K; with the second GPU about 1.2
+times slower (`XTIER_GPU2_SLOW=1`) 54.5 and 54.2. Details in
+[docs/reports/2026-10-31-second-gpu-pool.md](../../docs/reports/2026-10-31-second-gpu-pool.md).
+
 Checked on two RTX 4090 as well (SGLang main `6162b07199`; a shared PCIe switch, no P2P; 15 engine threads per rank):
 copy test 0/8 at one and two requests, with MTP as well; PPL over 1K-token segments on average +0.0013 from the RTX 3090
 pair. One GPU → two, decode at 32K: 44.7 → 61.5 tok/s, with MTP 81.9; the first token at 120K stays about 60 s, so

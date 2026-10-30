@@ -2,6 +2,11 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-10-31：第二张卡可以不放模型、纯当热专家池（可选，`XTIER_GPU2_SLOTS=N|auto`，默认关；`TP=1`），给显存或速度不一样的两张卡用：
+  主卡不变，信箱调度线程把主卡没命中、第二张卡有的专家交给它，结果经内存加回 CPU 输出，每次调用分给它多少专家自动调整。双 RTX 4090
+  模拟 24 + 16 GiB：Qwen3.8 decode 57.3 / 55.9 tok/s（32K / 120K），同样配置的 TP 51.1 / 49.4，单卡 41.0 / 43.6；第二张卡约慢 1.2 倍时
+  54.5 / 54.2。同样的专家放第二张卡和放主卡，单层结果逐位相同（Qwen3.8、GLM-5.3、DeepSeek V4.1）。真实异构卡还没测过。功能关时
+  三个模型的照抄、PPL、长上下文与上次一致，dsh 连续 15 分钟无错。详见[文档](reports/2026-10-31-second-gpu-pool.md)。
 - 2026-10-30（下午）：跟进官方 SGLang main `6162b07199`（10-22 的 `8cd3c494` 之后 592 个提交）。XTier 跟着改了 Engram 行放
   NVMe、MoE 方法的 top-k、Qwen PLE 分段 prefill；DeepSeek 的 prompt 改由上游用 deepseek-recipe 编码，删掉 `recipe_tokens`。测试过的
   提交写进安装步骤和 `xtier.SGLANG_COMMIT`，装的版本不同时启动会警告，`tools/check_sglang.py` 核对钩子目标与 import。三个模型照抄、

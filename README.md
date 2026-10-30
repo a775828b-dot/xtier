@@ -12,7 +12,8 @@ run on SGLang main; MiniMax-M3.1-Flash runs on SGLang's M3.1 branch (PR #45925),
 and not smart enough); see [docs/PLAN.md](docs/PLAN.md). GPUs: developed and benchmarked on Blackwell
 (SM120); the RTX 40 (SM89) and RTX 30 (SM86) series are supported, tested on an RTX 4090 and an RTX 3090
 ([RTX 40 report](docs/reports/2026-10-29-rtx40.md), [RTX 30 report](docs/reports/2026-10-29-rtx30.md)); two GPUs
-run tensor parallel (TP=2), tested on two RTX 3090s ([TP report](docs/reports/2026-10-30-tp.md)).
+run tensor parallel (TP=2), tested on two RTX 3090s ([TP report](docs/reports/2026-10-30-tp.md)); a second GPU of another
+size or speed can hold only hot experts instead ([report](docs/reports/2026-10-31-second-gpu-pool.md)).
 
 ---
 
@@ -28,6 +29,7 @@ XTier 是官方 SGLang 的插件（跟 main 分支），做 CPU/GPU 分层 MoE �
 xtier/
 ├── backend/   混合 MoE 后端：接管官方量化方法，权重加载完即交给 CPU 引擎；解码走信箱（CUDA 图可捕获），prefill 走 GPU 分组 GEMM 或 CPU
 ├── cache/     热专家缓存：每层槽数可不同，全部常驻的层不经过 CPU；自适应换入换出；常驻层的 prefill 直接在槽上算；
+│              第二张卡当热专家池（可选，`XTIER_GPU2_SLOTS`）
 │              冷专家池（可选，`XTIER_COLD=1`）：少用的专家放到硬盘（[设计](docs/design-cold-experts.md)）
 ├── planner/   规划器：本机探测的 GPU / CPU 耗时 + 路由档案 → 显存预算内每层的热专家槽数（按 CPU 和 GPU 同时算完分配），可在启动时自动算
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
@@ -106,6 +108,34 @@ MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（双 RTX
 两张卡显存不一样大时，SGLang 默认拒绝启动，加 `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0` 可以跑，但两张卡都只能按小卡的显存放
 （24 + 16 GiB 实测每层 64 槽，decode 51 tok/s）。
 用法见[配置](configs/qwen38-rtx4090-3090/README.md#two-gpus-tp2)，详见[报告](docs/reports/2026-10-30-tp.md)。
+
+### 异构卡：快卡带慢卡，第二张卡纯当热专家池
+
+两张卡显存或速度不一样时，TP 两边都只能按小卡、慢卡的节奏跑。这时可以让第二张卡不放模型，只放更多热专家（`XTIER_GPU2_SLOTS`，默认关）：
+
+```
+XTIER_GPU2_SLOTS=auto CUDA_VISIBLE_DEVICES=快卡,慢卡 bash configs/qwen38-rtx4090-3090/run-qwen.sh
+```
+
+- **做法**：主卡完全不变。调度线程把主卡没命中、第二张卡有的专家交给它，结果经内存加回 CPU 的输出，不需要 P2P。prefill 只用主卡，所以首字不变。
+- **自动分配**：第二张卡的显存全部用来放专家（`auto`，留 1.5 GiB）。两张卡放不同的专家，按路由统计换入换出；每次调用分给第二张卡多少专家会自动调整，让它和 CPU 差不多同时算完。
+- **精度**：用和主卡相同的内核。单层测试（Qwen3.8、GLM-5.3、DeepSeek V4.1）里，同样的专家放在第二张卡上和放在主卡上结果逐位相同。
+- **限制**：只支持 `TP=1`，不能和冷专家一起用；第一张卡有硬件 FP4 解码时，第二张卡也要有（Blackwell 之间没问题）。
+
+用两张 RTX 4090 模拟实测（Qwen3.8 整模型，单请求，输出 512 token，云主机 30 个 CPU 线程、AVX2）。第二张卡的 16 GiB 用占位进程限制。容器不能改频率，慢卡是让第二张卡每次调用多算一遍 `_down` 内核（每次调用约 102 → 120 µs，约慢 1.2 倍）：
+
+| 配置 | 每层热专家槽 | 32K decode | 120K decode | 120K 首字 |
+|---|---|---:|---:|---:|
+| 单卡 24 GiB | 48 | 41.0 | 43.6 | 60.9 s |
+| TP 24 + 16 GiB | 64 | 51.1 | 49.4 | 60.0 s |
+| **池 24 + 16 GiB** | **48 + 113** | **57.3** | **55.9** | **58.9 s** |
+| 池 24 + 16 GiB，第二张卡约慢 1.2 倍 | 48 + 113 | 54.5 | 54.2 | 59.0 s |
+| 池 24 + 24 GiB | 48 + 178 | 58.2 | 56.2 | 59.3 s |
+| TP 24 + 24 GiB（同规格） | 180 | 62.1 | 63.4 | 68.9 s |
+
+速度单位 tok/s。TP 的槽放半个专家。显存不对等时池比 TP 快 12–13%，比单卡快 28–40%；同规格的两张卡 decode 还是 TP 更快。这组数据只说明趋势：这台机器的 CPU 偏弱，CPU 越强，第二张卡能省的时间越少；第二张卡的显存带宽也没有模拟。真实的 RTX PRO 5000 + PRO 4500、RTX 5090 + 5070 Ti 还没测过，DeepSeek V4.1 和 GLM-5.3 只测了单层和截层。
+
+照抄：开这个功能时 9 次启动里有 3 次在同一处翻 1 个 token，其余 0 错。不开第二张卡也会翻这一处：这个 token 对提示词 KV 很敏感，单张卡反复清缓存重算，16 次里翻 1 次。详见[报告](docs/reports/2026-10-31-second-gpu-pool.md)。
 
 ## 测速
 
@@ -224,6 +254,7 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-10-31：第二张卡可以不放模型、纯当热专家池（可选，`XTIER_GPU2_SLOTS`，默认关），给显存或速度不一样的两张卡用：双 RTX 4090 模拟 24 + 16 GiB 时 Qwen3.8 decode 比同样配置的 TP 快 12–13%，比单卡快 28–40%。详见[文档](docs/reports/2026-10-31-second-gpu-pool.md)。
 - 2026-10-30（下午）：跟进官方 SGLang main 6162b07，安装步骤写明测试过的提交，装的版本不同时启动会警告，`tools/check_sglang.py`
   不用模型就能核对钩子；快速加载支持 MoE 张量并行（双 RTX 4090 实测通过）；英伟达官方 GLM NVFP4 检查点开 MTP 不再崩溃。详见[文档](docs/reports/2026-10-30-sglang-6162b07.md)。
 - 2026-10-30：双卡张量并行（`TP=2`）实测通过：双 RTX 3090 上 Qwen3.8 decode +42–48%、120K 首字 −35%，照抄 0 错；修了
@@ -232,8 +263,6 @@ decode 约慢 10%），主要受限于硬盘速度。
   投影只量化权重；RTX 3090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](docs/reports/2026-10-29-rtx30.md)。
 - 2026-10-29：支持 RTX 40 系（SM89）：FP4 读时软件解码（与硬件逐位相同，不增加精度损失），三个模型的加速包补上 SM90
   以下的内核；RTX 4090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](docs/reports/2026-10-29-rtx40.md)。
-- 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
-  给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](docs/reports/2026-10-28-decode-miss-gpu.md)。
 
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
