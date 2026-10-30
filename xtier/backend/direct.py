@@ -11,9 +11,11 @@ O_DIRECT read (no page cache) of each tensor's block-aligned range into a stagin
 to the expert's slot. The shards hold the same bytes as the loader's copies made them; their block scales are checked
 as the engine checks its sources.
 
-Taken where the tensors are the shards' bytes as they are: tensor parallelism 1, a w1 / w3 / w2 shard of one expert,
-rows x bytes as the engine keeps them, a one-byte dtype; any other layer is loaded as before. With cold experts the
-cold store fills a layer's RAM slots instead when its records match the checkpoint (cache/cold.py).
+Taken where the tensors are the shards' bytes as they are: a w1 / w3 / w2 shard of one expert, rows x bytes as the
+engine keeps them, a one-byte dtype; any other layer is loaded as before (logged once). With MoE tensor parallelism a
+rank keeps its rows of w1 / w3 (a range of the tensor: read alone) and its columns of w2 (the tensor is read whole and
+the rank's part of every row copied out). With cold experts the cold store fills a layer's RAM slots instead when its
+records match the checkpoint (cache/cold.py).
 
   XTIER_FAST_LOAD=1              on (here and for the cold store's layers)
   XTIER_FAST_LOAD_THREADS=16     readers
@@ -85,9 +87,11 @@ def file_range(address, nbytes):
     return None
 
 
-def locate(bulk, shard, expert, w, hidden, inter, experts, scale_format):
-    """(expert, piece, path, offset, bytes) of checkpoint tensor `w` (shard `shard` of expert `expert`, for the
-    format's bulk parameter number `bulk`) when it is a slot piece's bytes as they are, else None."""
+def locate(bulk, shard, expert, w, hidden, inter, experts, scale_format, tp_rank=0, tp_size=1):
+    """(expert, piece, path, offset, bytes, columns) of checkpoint tensor `w` (shard `shard` of expert `expert`, for
+    the format's bulk parameter number `bulk`; `inter` the rank's intermediate size) when it holds a slot piece's bytes
+    as they are, else None. Bytes [offset, offset + bytes) of the file are read; columns is None when the slot piece
+    is all of them, else (rows, row width, first column, columns): the rank's part of each row (w2 with TP)."""
     piece = PIECES.get((bulk, shard))
     try:
         expert = int(expert)
@@ -97,11 +101,16 @@ def locate(bulk, shard, expert, w, hidden, inter, experts, scale_format):
         return None
     group = 32 if scale_format == 'mxfp4' else 16
     H, I = hidden, inter
-    rows, cols = ((I, H // 2), (I, H // 2), (I, H // group), (I, H // group), (H, I // 2), (H, I // group))[piece]
-    if w.dim() != 2 or tuple(w.shape) != (rows, cols) or w.element_size() != 1 or not w.is_contiguous():
+    cols = (H // 2, H // 2, H // group, H // group, I // 2, I // group)[piece]   # of the rank's slot piece
+    if piece < 4:   # w1 / w3 and their scales: the rank's rows, one range of the tensor
+        shape, start, nbytes, columns = (I * tp_size, cols), tp_rank * I * cols, I * cols, None
+    else:           # w2 and its scales: the rank's columns of every row
+        shape, start, nbytes = (H, cols * tp_size), 0, H * cols * tp_size
+        columns = None if tp_size == 1 else (H, cols * tp_size, tp_rank * cols, cols)
+    if w.dim() != 2 or tuple(w.shape) != shape or w.element_size() != 1 or not w.is_contiguous():
         return None
-    where = file_range(w.data_ptr(), rows * cols)
-    return None if where is None else (expert, piece, where[0], where[1], rows * cols)
+    where = file_range(w.data_ptr(), shape[0] * shape[1])
+    return None if where is None else (expert, piece, where[0], where[1] + start, nbytes, columns)
 
 
 class Reader:
@@ -144,11 +153,18 @@ class Reader:
         finally:
             view.release()
         base = addr + offset - a0
-        for src, dst, size in targets:
-            C.memmove(dst, base + src, size)
+        for target in targets:
+            if len(target) == 3:
+                src, dst, size = target
+                C.memmove(dst, base + src, size)
+            else:   # rows of `seg` bytes, `width` apart in the read
+                src, dst, rows, width, seg = target
+                part = np.ndarray((rows, seg), np.uint8, buffer=buf, offset=offset - a0 + src, strides=(width, 1))
+                np.ctypeslib.as_array((C.c_uint8 * (rows * seg)).from_address(dst)).reshape(rows, seg)[:] = part
 
     def submit(self, path, offset, nbytes, targets):
-        """Bytes [offset, offset + nbytes) of `path`; (start in them, destination, bytes) of each part to copy out."""
+        """Bytes [offset, offset + nbytes) of `path`; (start in them, destination, bytes) of each part to copy out, or
+    (start, destination, rows, width, bytes) for rows `width` apart."""
         return self.pool.submit(self._read, path, offset, nbytes, targets)
 
     def close(self):
@@ -223,15 +239,23 @@ def _submit(plan, jobs):
     per = [[nbytes // slots for _, nbytes in node] for node in shards]   # each piece's bytes per slot
     nodes, total, chunk = len(shards), 0, int(os.environ.get('XTIER_FAST_LOAD_CHUNK', 32 << 20))
     reads = []   # [path, start, end, targets]
-    for expert, piece, path, offset, nbytes in sorted(jobs, key=lambda j: (j[2], j[3])):
-        step = nbytes // nodes   # the tensor's rows split evenly over the nodes, in node order
-        if step * nodes != nbytes or any(per[n][piece] != step for n in range(nodes)):
-            raise RuntimeError(f'xtier: expert {expert} piece {piece}: {nbytes} bytes do not split into the shards')
+    for expert, piece, path, offset, nbytes, columns in sorted(jobs, key=lambda j: (j[2], j[3])):
+        rows = columns[0] if columns else 0
+        own = rows * columns[3] if columns else nbytes   # the slot piece's bytes
+        step = own // nodes   # its rows split evenly over the nodes, in node order
+        if step * nodes != own or rows % nodes or any(per[n][piece] != step for n in range(nodes)):
+            raise RuntimeError(f'xtier: expert {expert} piece {piece}: {own} bytes do not split into the shards')
         r = reads[-1] if reads else None
         if r is None or r[0] != path or not 0 <= offset - r[2] <= ALIGN or offset + nbytes - r[1] > chunk:
             r = [path, offset, offset, []]
             reads.append(r)
-        r[3] += [(offset - r[1] + n * step, shards[n][piece][0] + expert * step, step) for n in range(nodes)]
+        if columns is None:
+            r[3] += [(offset - r[1] + n * step, shards[n][piece][0] + expert * step, step) for n in range(nodes)]
+        else:   # each node's rows, the rank's columns of them
+            _, width, first, seg = columns
+            k = rows // nodes
+            r[3] += [(offset - r[1] + n * k * width + first, shards[n][piece][0] + expert * step, k, width, seg)
+                     for n in range(nodes)]
         r[2] = offset + nbytes
         total += nbytes
     return [reader().submit(path, first, end - first, targets) for path, first, end, targets in reads], total

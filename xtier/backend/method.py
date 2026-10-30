@@ -61,6 +61,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
     _active = None       # int32 [DECODE_ROWS] token flags of the decode path (active_flags)
     _localized = False
     _registered = 0      # layers whose shards are pinned and caches filled
+    _copy_noted = False  # a layer XTIER_FAST_LOAD could not read was logged
 
     def __init__(self, gpu_method, layer_config: LayerConfig):
         self.gpu_method = gpu_method
@@ -143,11 +144,16 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if self._source != 'direct':
             return False
         read = direct.locate(self.format.bulk.index(name), shard, expert, w, self.hidden, self.inter, self.experts,
-                             self.format.name)
+                             self.format.name, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
         if read is None:
             if self._reads:   # the reads' [gate; up] rows and a loader's [up; gate] rows must not mix in one layer
                 raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: {name} of expert {expert} ({shard}) cannot be '
                                    'read as it is after other expert tensors were (XTIER_FAST_LOAD=0 loads them)')
+            if not XTierMoEMethod._copy_noted:
+                XTierMoEMethod._copy_noted = True
+                logger.warning('xtier: XTIER_FAST_LOAD=1, but layer %d loads by copy: %s of expert %s is %s %s, not '
+                               'bytes the CPU engine keeps (further layers like it are not logged)', self.cfg.layer_id,
+                               name, expert, tuple(w.shape), w.dtype)
             self._source = 'copy'
             return False
         self._reads.append(read)
@@ -163,7 +169,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
                 self._cold_plan = lp
                 return 'store'
             return 'copy'   # attach writes or checks the records from the loaded experts
-        if direct.enabled() and getattr(layer, 'moe_tp_size', 1) == 1:
+        if direct.enabled():
             return 'direct'
         return 'copy'
 

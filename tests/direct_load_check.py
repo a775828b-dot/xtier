@@ -4,6 +4,8 @@ safetensors views, fill), and with a cold store the RAM slots read from it (cold
 scale must be refused.
 
   python tests/direct_load_check.py [PRESET ...]      (tests/layers.py presets; default ds41_1017)
+  TP=2: every rank of MoE tensor parallelism 2, against the rank's part of the copied layer (rows of w1 / w3,
+  columns of w2: what SGLang's loader gives a rank); a rank of a small model on one node: XTIER_NODES=0 THREADS=14
   with XTIER_COLD_PATHS (the store's drives), XTIER_COLD_FRACTION, XTIER_COLD_SOURCE (the model directory: the store
   key) and the XTIER_CACHE_PROFILE the store was written with, the store's slots of that model's preset as well
 """
@@ -37,7 +39,7 @@ def same(a, b):
     return True
 
 
-def reads(preset, layer):
+def reads(preset, layer, rank=0, tp=1):
     """The direct reads of the layer's expert tensors, as the loader's hook notes them (files kept open while noted)."""
     MODEL, KEY, NAMES, H, I, E, K, LIMIT, LAYER, VM, FMT, SWITCHES = layers.PRESETS[preset]
     root = Path(MODEL)
@@ -53,11 +55,54 @@ def reads(preset, layer):
         with safe_open(root / file, framework='pt', device='cpu') as f:
             for e, name, shard in items:
                 for bulk, suffix in ((0 if shard != 'w2' else 1, wsuf), (2 if shard != 'w2' else 3, ssuf)):
-                    read = direct.locate(bulk, shard, e, f.get_tensor(name + suffix), H, I, E, FMT)
+                    read = direct.locate(bulk, shard, e, f.get_tensor(name + suffix), H, I // tp, E, FMT, rank, tp)
                     assert read is not None, (name + suffix, 'not readable as it is')
                     out.append(read)
     return out
 
+
+def rank_part(inputs, rank, tp):
+    """The engine inputs of one rank of MoE TP: its rows of gate and of up, its columns of down (globals unchanged)."""
+    import torch
+    w13, w2, s13, s2, g13, g2 = inputs
+    half = w13.shape[1] // 2
+    i = half // tp
+
+    def rows(t):
+        return torch.cat([t[:, rank * i:(rank + 1) * i], t[:, half + rank * i:half + (rank + 1) * i]], 1).contiguous()
+
+    def cols(t):
+        return t[:, :, rank * t.shape[2] // tp:(rank + 1) * t.shape[2] // tp].contiguous()
+    return rows(w13), cols(w2), rows(s13), cols(s2), g13, g2
+
+
+TP = int(os.environ.get('TP', '1'))
+THREADS = int(os.environ.get('THREADS', '112'))   # engine threads (fewer with XTIER_NODES on one node)
+if TP > 1:
+    for preset in sys.argv[1:] or ['ds41_1017']:
+        MODEL, KEY, NAMES, H, I, E, K, LIMIT, LAYER, VM, FMT, SWITCHES = layers.PRESETS[preset]
+        for name, value in SWITCHES.items():
+            os.environ.setdefault('XTIER_' + name, value)
+        inputs = layers.load(preset)
+        alpha, beta = layers.SWIGLU.get(preset, (1.0, 0.0))
+        kw = dict(swiglu_alpha=alpha, swiglu_beta=beta)
+        for rank in range(TP):
+            part = rank_part(inputs, rank, TP)
+            pointers = [t.data_ptr() for t in part]
+            copied = CpuPlan(E, THREADS, pointers, H, I // TP, LIMIT, FMT, **kw)
+            t1 = time.time()
+            jobs = reads(preset, LAYER, rank, TP)
+            filled = CpuPlan(E, THREADS, [None] * 4 + pointers[4:], H, I // TP, LIMIT, FMT, **kw)
+            nbytes = direct.fill(filled, jobs, FMT)
+            t2 = time.time()
+            ok = same(copied, filled)
+            print(f'{preset} layer {LAYER}, TP {TP} rank {rank}: {len(jobs)} reads, {nbytes / 1e9:.2f} GB read in '
+                  f'{t2 - t1:.2f} s; shards identical {ok}', flush=True)
+            assert ok
+            del copied, filled, part
+    direct.close()
+    print('DIRECT-LOAD-CHECK TP PASS')
+    sys.exit(0)
 
 for preset in sys.argv[1:] or ['ds41_1017']:
     MODEL, KEY, NAMES, H, I, E, K, LIMIT, LAYER, VM, FMT, SWITCHES = layers.PRESETS[preset]
@@ -69,10 +114,10 @@ for preset in sys.argv[1:] or ['ds41_1017']:
     empty = [None] * 4 + pointers[4:]
     alpha, beta = layers.SWIGLU.get(preset, (1.0, 0.0))
     kw = dict(swiglu_alpha=alpha, swiglu_beta=beta)
-    copied = CpuPlan(E, 112, pointers, H, I, LIMIT, FMT, **kw)
+    copied = CpuPlan(E, THREADS, pointers, H, I, LIMIT, FMT, **kw)
     t1 = time.time()
     jobs = reads(preset, LAYER)
-    filled = CpuPlan(E, 112, empty, H, I, LIMIT, FMT, **kw)
+    filled = CpuPlan(E, THREADS, empty, H, I, LIMIT, FMT, **kw)
     nbytes = direct.fill(filled, jobs, FMT)
     t2 = time.time()
     ok = same(copied, filled)
@@ -91,8 +136,8 @@ for preset in sys.argv[1:] or ['ds41_1017']:
     byte.value = old
     if os.environ.get('XTIER_COLD_PATHS') and Path(os.environ.get('XTIER_COLD_SOURCE', '')) == Path(MODEL):
         lp = cold.LayerPlan(LAYER, E, 50)
-        resident = CpuPlan(E, 112, pointers, H, I, LIMIT, FMT, resident=lp.resident, **kw)
-        slots = CpuPlan(E, 112, empty, H, I, LIMIT, FMT, resident=lp.resident, **kw)
+        resident = CpuPlan(E, THREADS, pointers, H, I, LIMIT, FMT, resident=lp.resident, **kw)
+        slots = CpuPlan(E, THREADS, empty, H, I, LIMIT, FMT, resident=lp.resident, **kw)
         t3 = time.time()
         cold.attach_loaded(slots, lp, FMT)
         direct.finish()   # the slots' reads run in the background until the end of loading
