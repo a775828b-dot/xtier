@@ -3,7 +3,12 @@ before the layer can go to the CPU engine, and how they become the engine's inpu
 block scales s13 / s2 as bytes, global scales g13 [E, 2] / g2 [E]).
 """
 
+import logging
+import time
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class Format:
@@ -106,7 +111,56 @@ class Fp8Fp4Experts(Format):
         return torch.ones((E, 2), dtype=torch.float32), torch.ones((E,), dtype=torch.float32)
 
 
-def detect(gpu_method) -> Format:
+E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)   # midpoints of the E2M1 magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6
+
+
+def nvfp4_encode(w: torch.Tensor):
+    """ModelOpt NVFP4 of a matrix w [rows, K], K a multiple of 16: (E2M1 pairs [rows, K/2], the even element in the low
+    nibble; E4M3 block scales [rows, K/16] as bytes; the FP32 global scale amax / (6 * 448)), w ~ e2m1 x scale x global.
+    Rounding to the nearest E2M1 value of w / (scale x global)."""
+    w = w.float()
+    g = (w.abs().amax() / (6 * 448)).clamp_min(1e-12)
+    blocks = w.unflatten(-1, (-1, 16))
+    s = (blocks.abs().amax(-1) / (6 * g)).to(torch.float8_e4m3fn)   # at most 448: the global scale's choice
+    q = (blocks / (s.float() * g).clamp_min(1e-30).unsqueeze(-1)).flatten(-2)   # a zero scale dequantizes to 0
+    code = torch.bucketize(q.abs().clamp(max=6.0), torch.tensor(E2M1_BOUNDS, device=w.device)).to(torch.uint8)
+    code |= ((q < 0) & (code > 0)).to(torch.uint8) << 3
+    return code[:, 0::2] | (code[:, 1::2] << 4), s.view(torch.uint8), g
+
+
+class Bf16AsNvFp4(Format):
+    """A draft model's BF16 experts (GLM-5.3's NextN layer in NVIDIA's ModelOpt checkpoint, excluded from its NVFP4)
+    quantized to ModelOpt NVFP4 at the hand-off, so the CPU engine runs them as it runs the target's: the draft's
+    precision only, the target model verifies every token the draft proposes. Per expert on the GPU when there is one;
+    a global scale per expert and projection."""
+    name = 'nvfp4'
+    required = {'w13_weight': 'w13', 'w2_weight': 'w2'}
+
+    def engine_inputs(self, layer, up_first):
+        t0 = time.perf_counter()
+        w13, w2 = layer.w13_weight.data, layer.w2_weight.data   # [E, 2I, H], [E, H, I] BF16
+        E, I2, H = w13.shape
+        dev = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else w13.device
+        q13 = torch.empty((E, I2, H // 2), dtype=torch.uint8)
+        s13 = torch.empty((E, I2, H // 16), dtype=torch.uint8)
+        q2 = torch.empty((E, H, I2 // 4), dtype=torch.uint8)
+        s2 = torch.empty((E, H, I2 // 32), dtype=torch.uint8)
+        g13 = torch.empty((E, 2), dtype=torch.float32)
+        g2 = torch.empty((E,), dtype=torch.float32)
+        for e in range(E):
+            m = _gate_up(w13[e:e + 1], up_first)[0].to(dev)
+            for j in range(2):   # gate rows, up rows: a global scale each
+                rows = slice(j * I2 // 2, (j + 1) * I2 // 2)
+                q, s, g = nvfp4_encode(m[rows])
+                q13[e, rows], s13[e, rows], g13[e, j] = q.cpu(), s.cpu(), g.item()
+            q, s, g = nvfp4_encode(w2[e].to(dev))
+            q2[e], s2[e], g2[e] = q.cpu(), s.cpu(), g.item()
+        logger.info('xtier: %d BF16 draft experts quantized to NVFP4 for the CPU engine in %.1f s (the draft\'s '
+                    'precision only: the target model verifies every token)', E, time.perf_counter() - t0)
+        return q13, q2, s13, s2, g13, g2
+
+
+def detect(gpu_method, draft=False) -> Format:
     name = type(gpu_method).__name__
     if name == 'ModelOptNvFp4FusedMoEMethod':
         return ModelOptNvFp4()
@@ -116,4 +170,6 @@ def detect(gpu_method) -> Format:
         return Fp8Fp4Experts()   # SGLang's SM90 / SM120 choice for these experts: Fp8MoEMethod's parameters, E8M0 scales
     if name == 'CompressedTensorsFusedMoEMethod':
         return CompressedTensorsNvFp4()   # the scheme sits on the layer: checked once the parameters exist
+    if name == 'UnquantizedFusedMoEMethod' and draft:
+        return Bf16AsNvFp4()   # a target model's BF16 experts stay with SGLang: no precision change there
     raise NotImplementedError(f'xtier: no CPU engine format for the MoE method {name}')

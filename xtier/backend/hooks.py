@@ -25,6 +25,9 @@ def install(registry, hook_type):
     class KTEPWrapperMethod(original):
         def __new__(cls, gpu_method, kt_config, *args, **kwargs):
             if isinstance(kt_config, LayerConfig):   # not an instance of cls: __init__ is skipped
+                if gpu_method is None:   # a layer its quantization config excludes: FusedMoE without KT takes this
+                    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+                    gpu_method = UnquantizedFusedMoEMethod()
                 try:
                     return XTierMoEMethod(gpu_method, kt_config)
                 except NotImplementedError as e:

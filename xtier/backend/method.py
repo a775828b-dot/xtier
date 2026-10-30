@@ -65,7 +65,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
     def __init__(self, gpu_method, layer_config: LayerConfig):
         self.gpu_method = gpu_method
         self.cfg = layer_config
-        self.format = formats.detect(gpu_method)
+        self.format = formats.detect(gpu_method, draft=layer_config.draft)
         self.plan = None
         self.prefill = None
         self.mailbox = None

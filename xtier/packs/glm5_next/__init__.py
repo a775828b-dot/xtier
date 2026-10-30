@@ -10,7 +10,9 @@
   NextN draft) uses the same DSA attention and passes the check as GLM-5.
 - NextN draft quantization: ``DeepseekModelNextN.__init__`` drops a ``modelopt_fp4`` quantization config (DeepSeek
   NVFP4 checkpoints keep their NextN layer in BF16), but GLM-5.3's NextN experts are NVFP4: built as BF16, loading
-  fails on the packed tensors. For a GLM-5.3 draft the check does not fire (the config keeps its methods).
+  fails on the packed tensors. For a GLM-5.3 draft the check does not fire (the config keeps its methods), unless the
+  checkpoint excludes the NextN layer from its quantization (NVIDIA's ModelOpt checkpoint: BF16); with XTIER_DRAFT=1
+  the CPU engine then takes those experts as NVFP4 (formats.Bf16AsNvFp4).
 - FP8 storage of the BF16 attention and dense weights (XTIER_FP8_WEIGHTS=1, fp8_weights.py): ~15 GB read every
   decode step become ~7.5 GB; W8A16 decode kernel, W8A8 prefill for XTIER_FP8_W8A8_PREFILL.
 - DSA on a BF16 KV cache with SGLang's TileLang backend on GPUs with less than Hopper's shared memory per block
@@ -64,6 +66,8 @@ def _is_glm5_next(config):
 def _nextn_model_init(original, self, config, quant_config=None, *args, **kwargs):
     if quant_config is None or quant_config.get_name() != 'modelopt_fp4' or not _is_glm5_next(config):
         return original(self, config, quant_config, *args, **kwargs)
+    if quant_config.is_layer_excluded(f'model.layers.{config.num_hidden_layers}.mlp.experts'):
+        return original(self, config, quant_config, *args, **kwargs)   # a BF16 NextN layer: SGLang drops the config
     quant_config.get_name = lambda: 'modelopt_fp4 (GLM-5.3 NextN)'   # shadows the method while the draft is built
     try:
         return original(self, config, quant_config, *args, **kwargs)
