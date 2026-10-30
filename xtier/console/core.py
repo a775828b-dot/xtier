@@ -153,12 +153,14 @@ def gpus():
 
 
 def _user_systemd():
-    """A user service manager to run servers in transient scopes (they then outlive the console and its session)."""
+    """A user service manager to run servers in transient scopes (they then outlive the console and its session): a
+    scope running ``true`` has to start. ``systemctl --user`` is no test, it answers 0 where no user manager can be
+    reached (in a chroot it ignores the command); systemd-run fails there (Failed to connect to bus)."""
     if not shutil.which('systemd-run'):
         return False
     try:
-        return subprocess.run(['systemctl', '--user', 'show-environment'], capture_output=True,
-                              timeout=5).returncode == 0
+        return subprocess.run(['systemd-run', '--user', '--scope', '--quiet', '--collect', 'true'],
+                              capture_output=True, timeout=10).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 

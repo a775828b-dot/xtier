@@ -8,6 +8,7 @@ renders, and the standalone server answers (its POST guard included).
 import itertools
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,6 +20,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from xtier.console import __main__ as server, core, ui  # noqa: E402
+
+# runner=auto: systemd only where a user scope starts (a chroot's systemctl answers 0, its systemd-run cannot reach a bus)
+def _fake_run(returncode):
+    def run(argv, **kwargs):
+        assert argv[:3] == ['systemd-run', '--user', '--scope'], argv
+        return subprocess.CompletedProcess(argv, returncode, b'', b'Failed to connect to bus' if returncode else b'')
+    return run
+
+
+_which, _run = core.shutil.which, core.subprocess.run
+try:
+    core.shutil.which = lambda name: f'/usr/bin/{name}'
+    core.subprocess.run = _fake_run(1)
+    assert core._user_systemd() is False
+    core.subprocess.run = _fake_run(0)
+    assert core._user_systemd() is True
+    core.shutil.which = lambda name: None
+    assert core._user_systemd() is False
+finally:
+    core.shutil.which, core.subprocess.run = _which, _run
 
 models = core.load_models()
 assert list(models)[:3] == ['qwen38', 'glm53', 'ds41'], list(models)
