@@ -55,6 +55,17 @@ the whole vocabulary (SGLang cuts the draft token map's head from the target's l
 vocab-parallel shard does not have). Host memory: ~9 GiB more than one GPU (a second process and PLE row cache), ~83 GiB
 at the peak of a 120K-token prompt.
 
+Two GPUs with different memory: SGLang refuses to start when one has under 90% of the other's free memory;
+`SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0` turns that into a warning. Both ranks then have the smaller GPU's memory to
+work with, the rest of the larger one stays unused: on 24 + 16 GiB (the second RTX 4090 held at 16 GiB with
+`tools/vram_limit.py`), `XTIER_CACHE_SLOTS=64` leaves 4.7 GiB on the smaller GPU, copy test 0/8, decode 51.1 tok/s at 32K
+and 49.4 at 120K, 60.0 s to the first token at 120K.
+
+Checked on two RTX 4090 as well (SGLang main `6162b07199`; a shared PCIe switch, no P2P; 15 engine threads per rank):
+copy test 0/8 at one and two requests, with MTP as well; PPL over 1K-token segments on average +0.0013 from the RTX 3090
+pair. One GPU → two, decode at 32K: 44.7 → 61.5 tok/s, with MTP 81.9; the first token at 120K stays about 60 s, so
+on this host the gain is decode only.
+
 Checked on the two RTX 3090 of the instance above (one per CPU socket, no P2P between them; 14 engine threads per
 rank): copy test 0/8 at one and two requests, with MTP as well; PPL over 1K-token segments on average +0.002 from one
 GPU; a 120K-token prompt without running out of memory. Single requests, one GPU → two:

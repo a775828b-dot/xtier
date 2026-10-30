@@ -5,7 +5,7 @@
 - 2026-10-30（下午）：跟进官方 SGLang main `6162b07199`（10-22 的 `8cd3c494` 之后 592 个提交）。XTier 跟着改了 Engram 行放
   NVMe、MoE 方法的 top-k、Qwen PLE 分段 prefill；DeepSeek 的 prompt 改由上游用 deepseek-recipe 编码，删掉 `recipe_tokens`。测试过的
   提交写进安装步骤和 `xtier.SGLANG_COMMIT`，装的版本不同时启动会警告，`tools/check_sglang.py` 核对钩子目标与 import。三个模型照抄、
-  PPL 与旧版一致，512K 不 OOM，dsh 连续 15 分钟无错。另外：快速加载支持 MoE 张量并行（逐字节对过，尚未在双卡上实测）；英伟达官方
+  PPL 与旧版一致，512K 不 OOM，dsh 连续 15 分钟无错。另外：快速加载支持 MoE 张量并行（双 RTX 4090 实测通过：分片与普通加载逐字节相同）；英伟达官方
   GLM NVFP4 检查点（NextN 层是 BF16）开 MTP 不再崩溃，草稿层的专家加载时转成 NVFP4 交给 CPU 引擎；启动台在 chroot 等没有用户
   systemd 的环境里退回 setsid。详见[文档](reports/2026-10-30-sglang-6162b07.md)。
 - 2026-10-30：双卡张量并行（`TP=2`）实测通过：双 RTX 3090 上 Qwen3.8 decode +42–48%、120K 首字 −35%，照抄 0 错；修了

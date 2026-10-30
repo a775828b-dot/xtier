@@ -64,7 +64,7 @@ XTier 跟着官方 SGLang main 走，每次只认一个测试过的提交（[xti
 
 快速加载（可选，`XTIER_FAST_LOAD=1`；默认关，即 SGLang 原来的加载方式）：专家直接从模型文件（开冷专家时从冷存储）读进
 CPU 引擎，全部读完、检查完才报在线，DeepSeek V4.1 Flash 1017 启动 472 → 186 s（[报告](docs/reports/2026-10-27-fast-load.md)）。
-MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（2026-10-30，逐字节对过，尚未在双卡上实测）。
+MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（双 RTX 4090 实测 Qwen3.8 权重加载 170 → 133 s，分片与普通加载逐字节相同）。
 
 ## 启动台
 
@@ -103,6 +103,8 @@ MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（2026-10
 两张卡用张量并行（`TP=2`）：每张卡放每个热专家的一半和一半 KV，每卡能放的热专家槽数是单卡的三倍多；CPU 引擎每个 rank 一个进程，
 各用自己 GPU 那组 NUMA 节点（每颗 CPU 带一张卡时正好一卡一 CPU）。两卡之间不需要 P2P / NVLink，SGLang 会自动改走 NCCL。
 双 RTX 3090 实测 Qwen3.8：decode 42.1 → 59.6–61.7 tok/s（+42–48%，开 MTP 69–72 tok/s），120K 首字 72.6 → 47.0 s，照抄 0 错。
+两张卡显存不一样大时，SGLang 默认拒绝启动，加 `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0` 可以跑，但两张卡都只能按小卡的显存放
+（24 + 16 GiB 实测每层 64 槽，decode 51 tok/s）。
 用法见[配置](configs/qwen38-rtx4090-3090/README.md#two-gpus-tp2)，详见[报告](docs/reports/2026-10-30-tp.md)。
 
 ## 测速
@@ -223,7 +225,7 @@ decode 约慢 10%），主要受限于硬盘速度。
 ## 版本更新
 
 - 2026-10-30（下午）：跟进官方 SGLang main 6162b07，安装步骤写明测试过的提交，装的版本不同时启动会警告，`tools/check_sglang.py`
-  不用模型就能核对钩子；快速加载支持 MoE 张量并行（尚未在双卡上实测）；英伟达官方 GLM NVFP4 检查点开 MTP 不再崩溃。详见[文档](docs/reports/2026-10-30-sglang-6162b07.md)。
+  不用模型就能核对钩子；快速加载支持 MoE 张量并行（双 RTX 4090 实测通过）；英伟达官方 GLM NVFP4 检查点开 MTP 不再崩溃。详见[文档](docs/reports/2026-10-30-sglang-6162b07.md)。
 - 2026-10-30：双卡张量并行（`TP=2`）实测通过：双 RTX 3090 上 Qwen3.8 decode +42–48%、120K 首字 −35%，照抄 0 错；修了
   `~/.cache` 是软链接时 SGLang 的 JIT 内核每次启动都重编（30 系单卡启动省约 5 分钟）。详见[文档](docs/reports/2026-10-30-tp.md)。
 - 2026-10-29（晚）：支持 RTX 30 系（SM86）：没有 FP8 硬件，FP8 一律读时软件解码（与硬件逐位相同），DeepSeek 的 FP8
