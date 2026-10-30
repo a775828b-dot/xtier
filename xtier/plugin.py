@@ -13,7 +13,7 @@ import logging
 import os
 import sys
 
-from xtier import __version__, config
+from xtier import SGLANG_COMMIT, __version__, config
 
 logger = logging.getLogger(__name__)
 _installed = []
@@ -29,9 +29,25 @@ def _in_scheduler() -> bool:
     return False
 
 
+def _check_sglang() -> None:
+    """A warning when the installed SGLang is not the main commit XTier is tested with."""
+    import re
+    from importlib import metadata
+
+    try:
+        version = metadata.version('sglang')
+    except metadata.PackageNotFoundError:
+        return
+    m = re.search(r'\+g([0-9a-f]{7,})', version)
+    if not m or m.group(1)[:7] != SGLANG_COMMIT[:7]:
+        logger.warning('xtier %s is tested with SGLang main %s; this SGLang is %s, so some hooks may not apply '
+                       '(tools/check_sglang.py lists them)', __version__, SGLANG_COMMIT, version)
+
+
 def install() -> None:
     if _installed:
         return
+    _check_sglang()
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
     from xtier import packs, platform

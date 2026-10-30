@@ -276,9 +276,12 @@ class XTierMoEMethod(FusedMoEMethodBase):
     # -- forward ----------------------------------------------------------------------------------------------------
     def apply(self, layer, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         x = dispatch_output.hidden_states
         topk = dispatch_output.topk_output
+        if TopKOutputChecker.format_is_bypassed(topk):   # routing left to the MoE kernel: the standard ids, as KT's
+            topk = topk.to_standard()
         m = x.shape[0]
         if m == 0:
             return StandardCombineInput(hidden_states=x.new_zeros(x.shape))

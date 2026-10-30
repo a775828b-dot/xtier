@@ -33,7 +33,7 @@ def install(registry, hook_type) -> list[str]:
 
 # packs with hooks in the process that serves the API (prompt tokenization, argument resolution), installed there
 # and nowhere else
-SERVING = ('deepseek_v4', 'minimax_m3')
+SERVING = ('minimax_m3',)
 
 
 def install_serving(registry, hook_type) -> list[str]:

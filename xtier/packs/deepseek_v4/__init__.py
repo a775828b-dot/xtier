@@ -39,10 +39,8 @@
   and selects with torch.topk. Nothing on the paged path is SM90-only; see paged_indexer.py. RTX PRO 5000, DSpark,
   16K context: the indexer's kernels 1.08 -> 0.33 ms per decode step, the main stream's work 15.4 -> 13.7 ms;
   agent_bench long responses 33.0 -> 32.5 ms per step.
-- Prompts tokenized as DeepSeek's deepseek-recipe does (``XTIER_DS_RECIPE_TOKENS``, default on; the 1017 pipeline's
-  DS41_PLAIN_CONTENT_TOKENS): added-token spellings in message content stay plain text, only the template's control
-  tokens are special, and the prompt is encoded in regions instead of one string (a 568K-token prompt 1.3 -> 0.18 s,
-  every turn). Hooks of the serving process, not the schedulers; see recipe_tokens.py.
+- (Until SGLang main e22a530 of 2026-10-23 prompts were tokenized here as DeepSeek's deepseek-recipe does; SGLang now
+  renders V4 / V4.1 chat prompts with deepseek-recipe itself.)
 - Attention below SM90 (sparse_mla.py; RTX 30 / 40 series): off SM120 SGLang serves every DeepSeek V4 attention call
   through FlashMLA, built for SM90 / SM100 only; a Triton sparse MLA over the same FP8 pages takes the backend's calls,
   prefill included (it stays on the paged caches, as on SM120).
@@ -138,7 +136,8 @@ def _check_rows(self, param, loaded_weight):
 
 
 def _init(original, self, num_embeddings, dim, layer_id, column_bounds, *args, **kwargs):
-    from sglang.srt.layers.engram import shard_range
+    from sglang.srt.arg_groups import engram_config   # its EngramLookup, not this module's
+    from sglang.srt.layers.engram import resolve_engram_config, shard_range
     from sglang.srt.runtime_context import get_parallel
 
     if dim != ROW_BYTES:
@@ -149,6 +148,14 @@ def _init(original, self, num_embeddings, dim, layer_id, column_bounds, *args, *
     self.row_start, row_end = shard_range(num_embeddings, column_bounds, get_parallel().tp_rank, self.tp_size)
     self.rows = row_end - self.row_start
     self.host_table = None
+    # what SGLang's __init__ sets for its peer reads, host table and DP lookups; none of them serves rows on NVMe, so
+    # forward() comes to _lookup and the rows to _owned_rows (replaced below); a peer read falls back to the all-reduce
+    self._sort_host_reads = False
+    self.staged_by_scheduler = False
+    self.peer = None
+    lookup, kinds = resolve_engram_config(len(column_bounds) - 1).lookup, engram_config.EngramLookup
+    self.lookup = kinds.ALL_REDUCE if lookup == kinds.PEER_READ else lookup
+    self._cols_per_rank = engram_config.cols_per_rank(len(column_bounds) - 1, self.tp_size)
     cache = int(float(os.environ.get('XTIER_ENGRAM_CACHE_GIB', '4')) * 2**30) // ENGRAM_LAYERS
     store = open_table(model_dir(), layer_id, cache, (self.row_start, row_end))
     if store.rows != num_embeddings:
@@ -338,10 +345,3 @@ def install(registry, hook_type):
     if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0' and torch.cuda.get_device_capability() >= (8, 9):
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)
-
-
-def install_serving(registry, hook_type):
-    """Hooks of the process that serves the API: prompts tokenized as deepseek-recipe does (recipe_tokens)."""
-    from xtier.packs.deepseek_v4 import recipe_tokens
-
-    return recipe_tokens.install_serving(registry, hook_type)

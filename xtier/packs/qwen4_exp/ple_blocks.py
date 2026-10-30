@@ -50,7 +50,8 @@ def ple_forward(original, self, hidden_states, forward_batch, batch):
     if hidden_states.shape[-1] != hc_count * hidden_size:
         raise RuntimeError('PLE hidden size does not match its hyper-connection layout: '
                            f'expected {hc_count * hidden_size}, got {hidden_states.shape[-1]}')
-    conv_state = qwen4_exp.get_req_to_token_pool().short_conv_layer_cache(self.layer_id)
+    short_conv = qwen4_exp.get_token_to_kv_pool().layer_router.read(self.layer_id, qwen4_exp.SHORT_CONV_PART)
+    conv_state = short_conv.view.layer_cache(short_conv.view_layer_id)
     length = self.short_conv_state_len
     state = conv_state.index_select(0, batch.state_indices).to(dtype=hidden_states.dtype)   # [1, C, length]
     weight = self.conv1d.weight.to(dtype=hidden_states.dtype)
