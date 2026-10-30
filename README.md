@@ -48,17 +48,23 @@ bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟
 ## 快速上手
 
 ```bash
-pip install -e /path/to/sglang/python          # 官方 SGLang main
+git -C /path/to/sglang checkout 6162b07199      # 测试过的官方 SGLang main（2026-10-30）
+SGLANG_BUILD_RUST_EXTS=none pip install -e /path/to/sglang/python   # 没装 Rust 时跳过 SGLang 可选的 Rust 扩展
 tools/build_engine.sh /path/to/site-packages/nvidia/cu13   # CPU 引擎与信箱库 -> xtier/engine/lib
 pip install --no-deps -e .                      # 注册插件入口 sglang.srt.plugins: xtier
+python tools/check_sglang.py                    # 不用模型：核对 SGLang 的提交、XTier 的钩子目标和 import
 XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
   python -m sglang.launch_server --model-path <MoE 检查点> --cuda-graph-backend-prefill disabled ...
 ```
+
+XTier 跟着官方 SGLang main 走，每次只认一个测试过的提交（[xtier/__init__.py](xtier/__init__.py) 的 `SGLANG_COMMIT`，更新时写进
+版本更新）；装的 SGLang 不是这个提交时，启动日志会警告，`tools/check_sglang.py` 列出挂不上的钩子。
 
 开关见 [xtier/config.py](xtier/config.py)；按模型和硬件的完整启动参数见 [configs/](configs/)，也可以用下面的启动台。
 
 快速加载（可选，`XTIER_FAST_LOAD=1`；默认关，即 SGLang 原来的加载方式）：专家直接从模型文件（开冷专家时从冷存储）读进
 CPU 引擎，全部读完、检查完才报在线，DeepSeek V4.1 Flash 1017 启动 472 → 186 s（[报告](docs/reports/2026-10-27-fast-load.md)）。
+MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（2026-10-30，逐字节对过，尚未在双卡上实测）。
 
 ## 启动台
 
@@ -216,6 +222,8 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-10-30（下午）：跟进官方 SGLang main 6162b07，安装步骤写明测试过的提交，装的版本不同时启动会警告，`tools/check_sglang.py`
+  不用模型就能核对钩子；快速加载支持 MoE 张量并行（尚未在双卡上实测）；英伟达官方 GLM NVFP4 检查点开 MTP 不再崩溃。详见[文档](docs/reports/2026-10-30-sglang-6162b07.md)。
 - 2026-10-30：双卡张量并行（`TP=2`）实测通过：双 RTX 3090 上 Qwen3.8 decode +42–48%、120K 首字 −35%，照抄 0 错；修了
   `~/.cache` 是软链接时 SGLang 的 JIT 内核每次启动都重编（30 系单卡启动省约 5 分钟）。详见[文档](docs/reports/2026-10-30-tp.md)。
 - 2026-10-29（晚）：支持 RTX 30 系（SM86）：没有 FP8 硬件，FP8 一律读时软件解码（与硬件逐位相同），DeepSeek 的 FP8
@@ -224,8 +232,6 @@ decode 约慢 10%），主要受限于硬盘速度。
   以下的内核；RTX 4090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](docs/reports/2026-10-29-rtx40.md)。
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
   给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](docs/reports/2026-10-28-decode-miss-gpu.md)。
-- 2026-10-27（下午）：快速加载（可选，`XTIER_FAST_LOAD=1`，默认关）：专家直接从模型文件或冷存储读进 CPU 引擎，仍是全部装好
-  才报在线；DeepSeek 启动 472 → 186 s，卸载 30% 409 → 124 s。详见[文档](docs/reports/2026-10-27-fast-load.md)。
 
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
