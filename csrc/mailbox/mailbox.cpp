@@ -56,6 +56,7 @@ void driver(CUresult rc) {
 }
 struct Bridge;
 struct Slot;
+struct G2Layer;
 class Dispatcher {
     std::mutex mutex;
     std::vector<Slot*> slots;
@@ -120,6 +121,7 @@ struct Bridge {
     std::atomic<int> pool{0};
     std::array<double,3> pool_stats{};
     int pool_layer=-1;   // index in the pool manager (adaptive residency), -1 = not attached
+    G2Layer *g2=nullptr; // second GPU as a hot expert pool (kept until the process exits)
     explicit Bridge(void *p):plan(xtier_retain(p)) {
         if(!plan)throw std::runtime_error(xtier_last_error());
         int shape[4];
@@ -165,6 +167,7 @@ struct PoolLayer {
     std::vector<int> slot_of;         // expert -> slot, as decided
     std::vector<uint32_t> busy;       // slot -> seq of its in-flight copy (0 = none)
     std::vector<float> usage;         // decayed route counts
+    const std::atomic<int32_t> *g2_table=nullptr;   // second GPU: experts it holds are not worth a slot here
 };
 class PoolManager {
 public:
@@ -232,16 +235,16 @@ public:
         if(any){warm_left.store(warm_rounds,std::memory_order_relaxed);prompts++;}
     }
     // ram: the RAM slot holding the expert (xtier_slot_pin; the expert itself without cold experts)
-    void upload(PoolLayer &L,int ram,int slot) {
+    void upload(PoolLayer &L,int ram,int slot,char *const *arena,cudaStream_t stream) {
         const size_t H=L.H,I=L.I,IN=I/L.nodes,HN=H/L.nodes;
         // (arena, first row, rows per node, total rows, bytes per row) of each shard tensor, as prefill._shard_layout
         const size_t lay[6][5]={{0,0,IN,2*I,H/2},{0,I,IN,2*I,H/2},{2,0,IN,2*I,H/L.group},{2,I,IN,2*I,H/L.group},
                                 {1,0,HN,H,I/2},{3,0,HN,H,I/L.group}};
         for(int node=0;node<L.nodes;node++)for(int j=0;j<6;j++) {
             const size_t *q=lay[j];
-            char *dst=L.arena[q[0]]+size_t(slot)*q[3]*q[4]+(q[1]+node*q[2])*q[4];
+            char *dst=arena[q[0]]+size_t(slot)*q[3]*q[4]+(q[1]+node*q[2])*q[4];
             const char *src=L.shard[node][j]+size_t(ram)*q[2]*q[4];
-            check(cudaMemcpyAsync(dst,src,q[2]*q[4],cudaMemcpyHostToDevice,copy));
+            check(cudaMemcpyAsync(dst,src,q[2]*q[4],cudaMemcpyHostToDevice,stream));
         }
     }
     struct Copy {PoolLayer *L;int in,slot,ram;uint32_t seq;};
@@ -274,7 +277,7 @@ public:
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         for(auto &c:todo) {
-            upload(*c.L,c.ram,c.slot);
+            upload(*c.L,c.ram,c.slot,c.L->arena,copy);
             driver(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy),dev_seqs+32*4,c.seq,0));
         }
     }
@@ -289,7 +292,7 @@ public:
         for(size_t l=0;l<layers.size();l++) {
             auto *L=layers[l].get();if(!L)continue;
             cand.clear();vict.clear();
-            for(int e=0;e<L->E;e++)if(L->slot_of[e]<0&&u[l][e]>=2.f)cand.emplace_back(u[l][e],e);
+            for(int e=0;e<L->E;e++)if(L->slot_of[e]<0&&u[l][e]>=2.f&&!(L->g2_table&&L->g2_table[e].load(std::memory_order_relaxed)>=0))cand.emplace_back(u[l][e],e);
             const int A=L->active.load(std::memory_order_acquire);
             for(int s=0;s<A;s++) {
                 if(L->busy[s]&&L->busy[s]>done)continue;   // its copy has not landed yet
@@ -354,12 +357,164 @@ public:
 };
 PoolManager &pool_manager(){static PoolManager *m=new PoolManager();return *m;}
 
+// ---- Second GPU as a hot expert pool (XTIER_GPU2_SLOTS, cache/second.py) -----------------------------------------
+// The dispatcher splits a call before the CPU starts: routes the first GPU left to the CPU and this GPU holds get -1
+// and go to a graph captured per layer and shape, whose kernels read the control block and x from pinned host memory
+// (not the copy engine: the policy's uploads occupy it), run the pool kernels and write the part to host memory, then
+// a flag; the part joins the CPU output before the mailbox answer. The GPUs hold different experts: the first GPU's
+// policy leaves this one's experts alone, and this one's evicts first what the first has taken before.
+// Calls are serial (one dispatcher), so one control block serves every layer. The residency table lives on the host.
+struct G2Control {int32_t rslot[128],list[128],expert[128];float routing[128];};   // then x: BF16 [8, H]
+static_assert(sizeof(G2Control)==2048,"cache/second.py CONTROL");
+struct G2Layer {
+    PoolLayer *L=nullptr;
+    int S=0,k=0;
+    std::unique_ptr<std::atomic<int32_t>[]> table;   // expert -> slot, -1 = not here
+    std::vector<int> resident;                       // slot -> expert, -1 = empty (policy thread)
+    char *arena[4]{};
+    cudaGraphExec_t exec[MAX_SLOT_M]{};
+};
+struct G2State {
+    int device=-1,H=0;
+    cudaStream_t stream=nullptr,copy=nullptr;
+    G2Control *control=nullptr;float *out=nullptr;uint32_t *flag=nullptr;CUdeviceptr device_flag=0;
+    std::atomic<uint64_t> calls{0};   // odd from the first table read of a call to its graph's end
+    std::vector<G2Layer*> layers;
+    int budget=64;float min_gain=.25f,min_use=.5f;
+    // Balance (XTIER_GPU2_BALANCE=1, default): at most `cap` experts per call here, the others stay with the CPU. A
+    // call ends with the later of the two: every 256 calls the cap goes down when this GPU was last in most of them,
+    // up when the CPU was. So a slow GPU or a fast CPU never makes a call later than it needs to be.
+    bool balance=true;int cap=128,window=0,late=0,peak=0;
+    std::atomic<long> swaps{0};
+    double n=0,routes=0,launch=0,total=0,wait=0;   // dispatcher thread: since the last log line
+    std::chrono::steady_clock::time_point start;
+};
+G2State &g2_state(){static G2State *g=new G2State();return *g;}
+// Dispatcher thread, before the CPU reads the routes. True: a graph runs and g2_finish must follow.
+bool g2_launch(Slot *s) {
+    G2Layer *g=s->owner->g2;
+    if(!g)return false;
+    const int m=s->m,n=m*s->k;
+    const cudaGraphExec_t exec=__atomic_load_n(&g->exec[m-1],__ATOMIC_ACQUIRE);
+    if(!exec||g->k!=s->k)return false;
+    auto &G=g2_state();
+    static thread_local bool selected=false;
+    if(!selected){check(cudaSetDevice(G.device));selected=true;}
+    auto *c=G.control;
+    int used=0;
+    G.calls.fetch_add(1);
+    for(int i=0;i<n;i++) {
+        int rank=-1;
+        const int e=s->ids[i];
+        if(e>=0) {
+            const int slot=g->table[e].load();
+            if(slot>=0) {
+                for(int j=0;j<used;j++)if(c->list[j]==slot){rank=j;break;}
+                if(rank<0&&used<G.cap){c->list[used]=slot;c->expert[used]=e;rank=used++;}
+                if(rank>=0)s->ids[i]=-1;
+            }
+        }
+        c->rslot[i]=rank;
+    }
+    if(!used){G.calls.fetch_add(1);return false;}
+    G.peak=std::max(G.peak,used);
+    for(int i=used;i<n;i++)c->list[i]=-1;
+    std::memcpy(c->routing,s->routing,size_t(n)*4);
+    std::memcpy(c+1,s->x,size_t(m)*s->H*2);
+    __atomic_store_n(G.flag,0,__ATOMIC_RELAXED);
+    G.start=std::chrono::steady_clock::now();
+    check(cudaGraphLaunch(exec,G.stream));
+    G.n++;G.routes+=used;
+    G.launch+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-G.start).count();
+    return true;
+}
+void g2_finish(Slot *s) {
+    auto &G=g2_state();
+    const auto cpu_done=std::chrono::steady_clock::now();
+    if(G.balance) {
+        G.late+=!__atomic_load_n(G.flag,__ATOMIC_ACQUIRE);
+        if(++G.window>=256) {
+            if(G.late>154)G.cap=std::max(std::min(G.cap,G.peak)-1,1);   // this GPU last in over 60% of the calls
+            else if(G.late<102)G.cap=std::min(G.cap+1,128);               // in under 40%
+            G.window=G.late=G.peak=0;
+        }
+    }
+    while(!__atomic_load_n(G.flag,__ATOMIC_ACQUIRE))_mm_pause();
+    const auto end=std::chrono::steady_clock::now();
+    G.wait+=std::chrono::duration<double,std::micro>(end-cpu_done).count();
+    G.total+=std::chrono::duration<double,std::micro>(end-G.start).count();
+    const size_t cells=size_t(s->m)*s->H;
+    for(size_t i=0;i<cells;i++)s->out[i]+=G.out[i];
+    G.calls.fetch_add(1);
+}
+// Policy thread of the second GPU, after each round of the first one: the most routed experts in neither GPU replace
+// this GPU's coldest (first of all those the first GPU has taken over). Out of the table first, then wait for a call
+// that may have read the table before; upload on a low-priority stream; into the table when landed.
+void g2_policy() {
+    auto &G=g2_state();auto &pm=pool_manager();
+    try {
+        check(cudaSetDevice(G.device));
+        int lo=0,hi=0;check(cudaDeviceGetStreamPriorityRange(&lo,&hi));
+        check(cudaStreamCreateWithPriority(&G.copy,cudaStreamNonBlocking,lo));
+        struct Swap {float gain;G2Layer *g;int in,slot,ram;};
+        std::vector<Swap> todo;
+        std::vector<float> u;
+        std::vector<std::pair<float,int>> cand,vict;
+        long seen=0;
+        for(;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            const long now=__atomic_load_n(&pm.rounds,__ATOMIC_ACQUIRE);
+            if(now==seen)continue;
+            seen=now;
+            todo.clear();
+            for(auto *g:G.layers) {
+                auto &L=*g->L;
+                {std::lock_guard<std::mutex> lock(pm.mu);u=L.usage;}
+                cand.clear();vict.clear();
+                for(int e=0;e<L.E;e++)if(u[e]>=G.min_use&&L.slot_of[e]<0&&g->table[e].load(std::memory_order_relaxed)<0)cand.emplace_back(u[e],e);
+                if(cand.empty())continue;
+                for(int s=0;s<g->S;s++) {
+                    const int e=g->resident[s];
+                    vict.emplace_back(e<0?-2.f:L.slot_of[e]>=0?-1.f:u[e],s);
+                }
+                const size_t nc=std::min(cand.size(),vict.size());
+                std::partial_sort(cand.begin(),cand.begin()+nc,cand.end(),[](auto&a,auto&b){return a.first>b.first;});
+                std::partial_sort(vict.begin(),vict.begin()+nc,vict.end(),[](auto&a,auto&b){return a.first<b.first;});
+                for(size_t i=0;i<nc;i++) {
+                    if(cand[i].first<vict[i].first+G.min_gain)break;
+                    todo.push_back({cand[i].first-vict[i].first,g,cand[i].second,vict[i].second,-1});
+                }
+            }
+            if(todo.empty())continue;
+            std::sort(todo.begin(),todo.end(),[](const Swap&a,const Swap&b){return a.gain>b.gain;});
+            if(todo.size()>size_t(G.budget))todo.resize(G.budget);
+            for(auto &t:todo) {
+                t.ram=xtier_slot_pin(t.g->L->bridge->plan,t.in);
+                if(t.ram<0)continue;
+                const int out=t.g->resident[t.slot];
+                if(out>=0)t.g->table[out].store(-1);
+                t.g->resident[t.slot]=-1;
+            }
+            const uint64_t c=G.calls.load();
+            if(c&1)while(G.calls.load()==c)_mm_pause();
+            for(auto &t:todo)if(t.ram>=0)pm.upload(*t.g->L,t.ram,t.slot,t.g->arena,G.copy);
+            check(cudaStreamSynchronize(G.copy));
+            for(auto &t:todo)if(t.ram>=0) {
+                t.g->table[t.in].store(t.slot);t.g->resident[t.slot]=t.in;
+                xtier_slot_unpin(t.g->L->bridge->plan,t.ram);
+                G.swaps.fetch_add(1,std::memory_order_relaxed);
+            }
+        }
+    }catch(const std::exception &e){std::fprintf(stderr,"[xtier] second GPU policy stopped: %s\n",e.what());}
+}
+
 void CUDART_CB execute(void *p) noexcept {
     auto *s=static_cast<Slot*>(p);auto *b=s->owner;
     // Test hook for the watchdog only; unset in normal use.
     static const long stall_us=[]{const char *v=std::getenv("XTIER_DEBUG_STALL_US");return v?std::stol(v):0L;}();
     if(stall_us)std::this_thread::sleep_for(std::chrono::microseconds(stall_us));
     timespec real{};if(trace_file())clock_gettime(CLOCK_REALTIME,&real);
+    const bool second=g2_launch(s);
     auto begin=std::chrono::steady_clock::now();
     // Tokens whose route ids are -1 were skipped on the GPU (XTIER_ACTIVE_FLAGS: e.g. a truncated
     // speculative verify): compute only the others, in order, and return zero rows for them.
@@ -402,6 +557,7 @@ void CUDART_CB execute(void *p) noexcept {
         b->failed.store(1,std::memory_order_release);
         std::fill(s->out,s->out+s->m*s->H,std::numeric_limits<float>::quiet_NaN());
     }
+    if(second)g2_finish(s);
     if(s->shadow) {
         double d2=0,r2=0,mx=0,bad=0;
         for(int i=0;i<s->m*s->H;i++) {
@@ -441,6 +597,12 @@ void CUDART_CB execute(void *p) noexcept {
             std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far, %ld prompts%s\n",
                          every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds,pm.prompts,slots);
             win_n=win_hit=win_wall=win_calls=0;
+            auto &G=g2_state();
+            if(G.device>=0&&G.n>0) {
+                std::fprintf(stderr,"[xtier] second GPU: %.0f%% of calls, %.1f experts, %.0f us launch, %.0f us total, %.0f us waited for after the CPU; cap %d; %ld swaps so far\n",
+                             100.*G.n/std::max(double(every)*std::max(pm.layers.size(),size_t(1)),1.0),G.routes/G.n,G.launch/G.n,G.total/G.n,G.wait/G.n,G.cap,G.swaps.load());
+                G.n=G.routes=G.launch=G.total=G.wait=0;
+            }
         }
     }
     if(std::FILE *f=trace_file()) {
@@ -660,6 +822,97 @@ int xtier_mailbox_signal(void *bridge,void *stream,int m,int k,int part) {
         if(b->failed.load(std::memory_order_acquire))throw std::runtime_error("Prior CPU callback failed");
         auto st=static_cast<cudaStream_t>(stream);std::lock_guard<std::mutex> lock(b->slot_mutex);
         notify_and_wait(st,b->find(st,m,k,false),part);
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// Second GPU (cache/second.py). All with the second GPU current on the calling thread.
+int xtier_mailbox_gpu2_init(void *stream,int H,void **pointers) {
+    try {
+        auto &G=g2_state();
+        if(G.device>=0)throw std::runtime_error("Second GPU initialized twice");
+        check(cudaGetDevice(&G.device));
+        G.H=H;G.stream=static_cast<cudaStream_t>(stream);
+        if(const char *v=std::getenv("XTIER_GPU2_BALANCE"))G.balance=std::atoi(v)!=0;
+        check(cudaHostAlloc(reinterpret_cast<void**>(&G.control),sizeof(G2Control)+size_t(MAX_SLOT_M)*H*2,cudaHostAllocMapped));
+        check(cudaHostAlloc(reinterpret_cast<void**>(&G.out),size_t(MAX_SLOT_M)*H*4,cudaHostAllocMapped));
+        check(cudaHostAlloc(reinterpret_cast<void**>(&G.flag),256,cudaHostAllocMapped));
+        *G.flag=0;
+        void *d=nullptr;check(cudaHostGetDevicePointer(&d,G.flag,0));G.device_flag=reinterpret_cast<CUdeviceptr>(d);
+        check(cudaHostGetDevicePointer(&d,G.control,0));pointers[0]=d;
+        check(cudaHostGetDevicePointer(&d,G.out,0));pointers[1]=d;
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// slots of this bridge's layer (pool_attach first); resident: their experts, loaded now
+int xtier_mailbox_gpu2_attach(void *bridge,int slots,void **arena,const int32_t *resident) {
+    try {
+        auto *b=static_cast<Bridge*>(bridge);auto &G=g2_state();auto &m=pool_manager();
+        if(b->pool_layer<0||G.device<0)throw std::runtime_error("Second GPU: layer without adaptive residency");
+        auto *g=new G2Layer();
+        g->L=m.layers[b->pool_layer].get();g->S=slots;
+        for(int j=0;j<4;j++)g->arena[j]=static_cast<char*>(arena[j]);
+        g->table.reset(new std::atomic<int32_t>[g->L->E]);
+        for(int e=0;e<g->L->E;e++)g->table[e].store(-1);
+        g->resident.assign(resident,resident+slots);
+        for(int s=0;s<slots;s++) {
+            const int e=g->resident[s];
+            if(e<0)continue;
+            const int ram=xtier_slot_pin(b->plan,e);
+            if(ram<0)throw std::runtime_error("Second GPU: expert not in RAM");
+            m.upload(*g->L,ram,s,g->arena,G.stream);
+            xtier_slot_unpin(b->plan,ram);
+            g->table[e].store(s);
+        }
+        check(cudaStreamSynchronize(G.stream));
+        g->L->g2_table=g->table.get();
+        G.layers.push_back(g);b->g2=g;
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+int xtier_mailbox_gpu2_capture_begin(void *stream) {
+    try {
+        check(cudaStreamBeginCapture(static_cast<cudaStream_t>(stream),cudaStreamCaptureModeRelaxed));
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+int xtier_mailbox_gpu2_capture_end(void *bridge,void *stream,int m,int k) {
+    try {
+        auto *b=static_cast<Bridge*>(bridge);auto &G=g2_state();auto st=static_cast<cudaStream_t>(stream);
+        if(!b->g2||m<1||m>MAX_SLOT_M)throw std::runtime_error("Second GPU: invalid capture");
+        CUstreamBatchMemOpParams op{};
+        op.writeValue.operation=CU_STREAM_MEM_OP_WRITE_VALUE_32;op.writeValue.address=G.device_flag;op.writeValue.value=1;
+        cudaStreamCaptureStatus status;cudaGraph_t graph=nullptr;
+        const cudaGraphNode_t *deps=nullptr;size_t count=0;
+        check(cudaStreamGetCaptureInfo(st,&status,nullptr,&graph,&deps,nullptr,&count));
+        CUDA_BATCH_MEM_OP_NODE_PARAMS params{};driver(cuCtxGetCurrent(&params.ctx));
+        params.count=1;params.paramArray=&op;
+        CUgraphNode node;
+        driver(cuGraphAddBatchMemOpNode(&node,reinterpret_cast<CUgraph>(graph),reinterpret_cast<const CUgraphNode*>(deps),count,&params));
+        cudaGraphNode_t runtime_node=reinterpret_cast<cudaGraphNode_t>(node);
+        check(cudaStreamUpdateCaptureDependencies(st,&runtime_node,nullptr,1,cudaStreamSetCaptureDependencies));
+        graph=nullptr;
+        check(cudaStreamEndCapture(st,&graph));
+        cudaGraphExec_t exec=nullptr;
+        const cudaError_t rc=cudaGraphInstantiate(&exec,graph,0);
+        check(cudaGraphDestroy(graph));check(rc);
+        b->g2->k=k;__atomic_store_n(&b->g2->exec[m-1],exec,__ATOMIC_RELEASE);
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// a capture that failed: end it, its nodes are dropped (a capture already ended: an error, ignored by the caller)
+int xtier_mailbox_gpu2_capture_abort(void *stream) {
+    try {
+        cudaGraph_t graph=nullptr;
+        check(cudaStreamEndCapture(static_cast<cudaStream_t>(stream),&graph));
+        if(graph)check(cudaGraphDestroy(graph));
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+int xtier_mailbox_gpu2_start(int budget,float min_gain,float min_use) {
+    try {
+        auto &G=g2_state();
+        G.budget=budget;G.min_gain=min_gain;G.min_use=min_use;
+        std::thread(g2_policy).detach();
         return 0;
     }catch(const std::exception&e){error=e.what();return -1;}
 }

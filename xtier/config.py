@@ -33,6 +33,10 @@
                              weights copied over PCIe while the CPU computes the others (cache/pool.py; 0: off,
                              0.1: 10 %; at most XTIER_DECODE_MISS_GPU_MAX=8 per call). For CPUs that compute an
                              expert slower than PCIe moves it; results as for cached experts
+  XTIER_GPU2_SLOTS=          a second GPU as a hot expert pool (cache/second.py; TP = 1, both GPUs visible): N slots per
+                             layer, or auto: its free memory less XTIER_GPU2_RESERVE_GIB=1.5. XTIER_GPU2_DEVICE (the
+                             next one), _BALANCE=1, _ADAPT=1, _SWAPS=64, _MIN_USE=0.5, _MIN_GAIN=0.25; _SLOW=n (test
+                             only: a slower GPU, the down kernel n more times per call)
 Engine switches (XTIER_DYNAMIC, XTIER_DOWN_BF16, XTIER_SPIN_COUNT, ...) are read by the engine itself, see csrc/.
 """
 

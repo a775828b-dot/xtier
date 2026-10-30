@@ -32,6 +32,7 @@ slots (_miss_copy: read over PCIe by the SMs, since copy-engine copies in a CUDA
 the GPU) and computed with the cached ones while the CPU computes the others. Pays off only where PCIe moves an expert
 about as fast as the CPU computes one (few cores, no AVX-512, memory bandwidth to spare). Not on layers with cold
 experts (their RAM slots change during a forward). The cache log's hit counts these experts too.
+Second GPU (XTIER_GPU2_SLOTS, default off; cache/second.py): more hot experts on another GPU, behind the mailbox.
 
 Numerics: GPU routes are W4A16 (FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
 CPU routes unchanged. Without cached experts the result equals the plain mailbox path except for the FP32 addition of
@@ -471,6 +472,8 @@ class LayerPool:
         self.miss = None   # XTIER_DECODE_MISS_GPU: _miss_layer at the fill (the staging slots now)
         _miss_stage(self)
         self._pool_on = False
+        self.second = None   # XTIER_GPU2_SLOTS: cache/second.py
+        self.tp_size = 1     # set by the MoE method
         LayerPool.layers.append(self)
 
     def bytes(self):
@@ -565,6 +568,8 @@ class LayerPool:
             if self.mailbox.lib.xtier_mailbox_pool_enable(self.mailbox.bridge, 1) < 0:
                 raise RuntimeError(self.mailbox.error())
             self._pool_on = True
+        if self.second is not None:
+            self.second.ensure(m, k)
         sx, sids, sroute, sout, sorig = self.mailbox.slot(stream, m, k, with_routes=True)
         self._route(m, k, x, ids, routing, act, (sx, sids, sroute, sorig))
         if self.miss is not None:   # before the CPU reads the routes
@@ -657,6 +662,8 @@ def fill_all():
                                              C.cast(arena, C.c_void_p), C.cast(res, C.c_void_p)) < 0:
                 raise RuntimeError(pool.mailbox.error())
         _glob['adapt'] = (lib, every, budget, decay, gain)
+        from xtier.cache import second
+        second.attach(partial)
         stretch = [p for p in partial if p.S > p.base]
         if stretch:
             from xtier.cache import elastic
@@ -675,6 +682,8 @@ def fill_all():
                                    host=torch.zeros((rows, stride), dtype=torch.float32, pin_memory=True))
             logger.info('xtier cache: prompt warm-up on: a prompt\'s routes as %s decode windows (old counts x %s), '
                         'then %d rounds of up to %d swaps', windows, keep, rounds, swaps)
+    elif partial and os.environ.get('XTIER_GPU2_SLOTS', '') not in ('', '0'):
+        logger.warning('xtier cache: XTIER_GPU2_SLOTS needs XTIER_CACHE_ADAPT=1: the second GPU stays unused')
     gib = sum(p.bytes() for p in todo) / 2**30
     full = [p.layer_id for p in todo if p.full]
     logger.info('xtier cache: %d layers (%d with every expert: %s), %.1f GiB, %d experts loaded from %s in %.1f s',

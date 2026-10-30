@@ -301,6 +301,9 @@ def mailbox_lib() -> C.CDLL:
             'vmm_mapped': ([_P], C.c_longlong), 'vmm_granularity': ([], C.c_size_t),
             'pool_start': ([_I, _I, C.c_float, C.c_float], _I), 'pool_prompt': ([_P, _P, _I, _I], _I),
             'pool_warm': ([C.c_float, C.c_float, _I, _I], _I), 'stats': ([_P, _P], _I), 'timing': ([_P, _P], _I),
+            'gpu2_init': ([_P, _I, _P], _I), 'gpu2_attach': ([_P, _I, _P, _P], _I),
+            'gpu2_capture_begin': ([_P], _I), 'gpu2_capture_end': ([_P, _P, _I, _I], _I), 'gpu2_capture_abort': ([_P], _I),
+            'gpu2_start': ([_I, C.c_float, C.c_float], _I),
             'destroy': ([_P], _I),
         }
         for name, (args, res) in signatures.items():

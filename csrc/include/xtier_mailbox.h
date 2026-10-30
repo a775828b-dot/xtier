@@ -36,6 +36,16 @@ int xtier_mailbox_pool_stats(void *bridge, double *statistics);
 int xtier_mailbox_pool_ring(void **pointers);
 int xtier_mailbox_pool_attach(void *bridge, int layer, int slots, int experts, void **arena, const int *resident);
 int xtier_mailbox_pool_start(int every, int budget, float decay, float min_gain);
+// Second GPU as a hot expert pool (cache/second.py), all with that GPU current on the calling thread. gpu2_init returns the
+// device addresses of the host control block and output; gpu2_attach registers a pool_attached layer's slots there and
+// loads its residents; a decode shape's graph is captured between gpu2_capture_begin and _end (or _abort); gpu2_start
+// launches the policy thread (swaps per round, minimum gain, minimum route count).
+int xtier_mailbox_gpu2_init(void *stream, int H, void **pointers);
+int xtier_mailbox_gpu2_attach(void *bridge, int slots, void **arena, const int *resident);
+int xtier_mailbox_gpu2_capture_begin(void *stream);
+int xtier_mailbox_gpu2_capture_end(void *bridge, void *stream, int m, int k);
+int xtier_mailbox_gpu2_capture_abort(void *stream);
+int xtier_mailbox_gpu2_start(int budget, float min_gain, float min_use);
 // Seven doubles: calls, elements, squared error, squared reference norm,
 // max absolute error, max per-call relative L2 error, nonfinite element count.
 // Error statistics describe shadow calls; counts include both modes.

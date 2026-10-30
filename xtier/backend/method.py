@@ -248,6 +248,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if slots > 0:   # allocated now, so the KV cache is sized after it
             from xtier.cache.pool import LayerPool
             self.pool = LayerPool(self.prefill, slots, self.plan, self.mailbox, self.cfg.layer_id)
+            self.pool.tp_size = getattr(layer, 'moe_tp_size', 1)
             if self.pool.full:   # a staged prefill reads the experts from the slots instead of host memory
                 self.prefill._upload_chunk = self._upload_from_cache
         self.plan.pool = self.pool   # read by the prefill (residency of the FP4 path)
