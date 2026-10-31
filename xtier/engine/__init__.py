@@ -29,9 +29,8 @@ def engine() -> C.CDLL:
         lib = C.CDLL(str(lib_dir() / 'libxtier_engine.so'))
         lib.xtier_create3.argtypes = [_I, _I, _I, _I, C.c_float, _I] + [_P] * 6
         lib.xtier_create3.restype = _P
-        if hasattr(lib, 'xtier_set_swiglu'):   # builds before 2026-10-24 have the plain SiLU only
-            lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
-            lib.xtier_set_swiglu.restype = _I
+        lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
+        lib.xtier_set_swiglu.restype = _I
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
         lib.xtier_forward.restype = _I
         lib.xtier_destroy.argtypes = [_P]
@@ -45,21 +44,20 @@ def engine() -> C.CDLL:
         lib.xtier_nodes.restype = _I
         lib.xtier_worker_cpus.argtypes = [_I, _P, _I]
         lib.xtier_worker_cpus.restype = _I
-        if hasattr(lib, 'xtier_create4'):   # RAM slots and the cold store (2026-10-26)
-            lib.xtier_create4.argtypes = [_I, _I, _I, _I, _I, C.c_float, _I] + [_P] * 7
-            lib.xtier_create4.restype = _P
-            for name, args, res in (('place', [_P, _I, _I], _I), ('slot_table', [_P, _P], _I),
-                                    ('slot_pieces', [_P, _I, _I, _P, _P], _I),
-                                    ('cold_attach', [_P, _P, _P, _P, _P, C.c_float], _I),
-                                    ('slot_pin', [_P, _I], _I), ('slot_unpin', [_P, _I], None),
-                                    ('cold_plan_stats', [_P, _P], None),
-                                    ('cold_open', [_P, _I, _I, _I], _P), ('cold_write', [_P, _I, C.c_longlong, _P, _P, _I], _I),
-                                    ('cold_read', [_P, _I, _P, _P, _P, _P, _I], _I), ('cold_stats', [_P, _P], None),
-                                    ('cold_submit', [_P, _I, _P, _P, _P, _P, _I, _P, _I], _P),
-                                    ('cold_wait', [_P, _P, _I, _I], _I), ('cold_finish', [_P, _P], _I),
-                                    ('cold_close', [_P], None), ('cold_error', [], C.c_char_p)):
-                fn = getattr(lib, 'xtier_' + name)
-                fn.argtypes, fn.restype = args, res
+        lib.xtier_create4.argtypes = [_I, _I, _I, _I, _I, C.c_float, _I] + [_P] * 7
+        lib.xtier_create4.restype = _P
+        for name, args, res in (('place', [_P, _I, _I], _I), ('slot_table', [_P, _P], _I),
+                                ('slot_pieces', [_P, _I, _I, _P, _P], _I),
+                                ('cold_attach', [_P, _P, _P, _P, _P, C.c_float], _I),
+                                ('slot_pin', [_P, _I], _I), ('slot_unpin', [_P, _I], None),
+                                ('cold_plan_stats', [_P, _P], None),
+                                ('cold_open', [_P, _I, _I, _I], _P), ('cold_write', [_P, _I, C.c_longlong, _P, _P, _I], _I),
+                                ('cold_read', [_P, _I, _P, _P, _P, _P, _I], _I), ('cold_stats', [_P, _P], None),
+                                ('cold_submit', [_P, _I, _P, _P, _P, _P, _I, _P, _I], _P),
+                                ('cold_wait', [_P, _P, _I, _I], _I), ('cold_finish', [_P, _P], _I),
+                                ('cold_close', [_P], None), ('cold_error', [], C.c_char_p)):
+            fn = getattr(lib, 'xtier_' + name)
+            fn.argtypes, fn.restype = args, res
         _engine = lib
     return _engine
 
@@ -96,8 +94,6 @@ class CpuPlan:
             self.plan = self.lib.xtier_create3(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
                                                SCALE_FORMATS[scale_format], *weight_pointers)
         else:
-            if not hasattr(self.lib, 'xtier_create4'):
-                raise RuntimeError('xtier: this engine build has no RAM slots; rebuild it (tools/build_engine.sh)')
             res = (C.c_int32 * self.slots)(*[int(e) for e in resident])
             self.plan = self.lib.xtier_create4(self.hidden, self.inter, self.experts, self.slots, int(threads),
                                                self.swiglu_limit, SCALE_FORMATS[scale_format], *weight_pointers,
@@ -106,8 +102,6 @@ class CpuPlan:
             raise RuntimeError(self.lib.xtier_last_error().decode())
         # GPT-OSS SwiGLU (MiniMax M3): gate * sigmoid(alpha * gate) * (up + beta); 1 / 0 keep the plain SiLU path
         if (swiglu_alpha, swiglu_beta) != (1.0, 0.0):
-            if not hasattr(self.lib, 'xtier_set_swiglu'):
-                raise RuntimeError('xtier: this engine build has no GPT-OSS SwiGLU; rebuild it (tools/build_engine.sh)')
             if self.lib.xtier_set_swiglu(self.plan, swiglu_alpha, swiglu_beta):
                 raise RuntimeError(self.lib.xtier_last_error().decode())
         self._localized = False
@@ -220,8 +214,6 @@ class ColdStore:
 
     def __init__(self, paths, threads=8, writable=True):
         self.lib = engine()
-        if not hasattr(self.lib, 'xtier_cold_open'):
-            raise RuntimeError('xtier: this engine build has no cold store; rebuild it (tools/build_engine.sh)')
         self.paths = [str(p) for p in paths]
         names = (C.c_char_p * len(self.paths))(*[p.encode() for p in self.paths])
         self.handle = self.lib.xtier_cold_open(C.cast(names, _P), len(self.paths), int(threads), int(bool(writable)))

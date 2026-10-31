@@ -28,7 +28,11 @@ Safety, so that a model never runs out of memory because of the extra slots:
 - every XTIER_CACHE_ELASTIC_CHECK (16) decode forwards: free memory under XTIER_CACHE_ELASTIC_CRITICAL_GIB (1)
   releases every extra slot and stops growing for XTIER_CACHE_ELASTIC_COOLDOWN_S (600);
 - an out-of-memory error in a forward while extra slots are held releases them all, empties the allocator's cache,
-  turns the elastic cache off for the process and runs the forward once more.
+  turns the elastic cache off for the process and runs the forward once more. That keeps the server up, but the second
+  run is not the first run: the layers before the error have already updated what a forward updates in place (with an
+  injected error, GLM-5.3's indexer tails: the retried prompt's logprobs 0.3 nats worse on average, Qwen3.8's PLE
+  state: 0.17; DeepSeek V4.1: no difference from run-to-run noise). So the error is logged and the prefix cache goes as soon
+  as the server is idle: what that request computed serves nothing after it. It has not happened in any real run so far.
 Per layer (layout): address space for XTIER_CACHE_ELASTIC_MAX (2.0) x its configured slots
 (XTIER_CACHE_ELASTIC_MAX_SLOTS: a number), at most every expert; XTIER_CACHE_ELASTIC_BASE (1.0) x them mapped for good.
 XTIER_CACHE_ELASTIC_IDLE (32): decode forwards after an allocating one before slots are added again.
@@ -47,7 +51,9 @@ import torch
 logger = logging.getLogger(__name__)
 GIB = 2 ** 30
 FORWARD = 'sglang.srt.model_executor.model_runner.ModelRunner.forward'
+ON_IDLE = 'sglang.srt.managers.scheduler.Scheduler.on_idle'
 _governor = None
+_flush_when_idle = []   # a forward ran twice (_forward)
 
 
 def enabled():
@@ -448,9 +454,19 @@ def _forward(original, runner, forward_batch, *args, **kwargs):
         g.off = True
         torch.cuda.empty_cache()
         out = original(runner, forward_batch, *args, **kwargs)
+        logger.error('xtier elastic cache: a forward of %d tokens ran twice: that request\'s results may be off, the '
+                     'prefix cache is dropped once the server is idle', tokens)
+        _flush_when_idle.append(True)
     g.learn(tokens, draft, max(0, torch.cuda.max_memory_allocated() - before, torch.cuda.max_memory_reserved() - held),
             ctx)
     return out
+
+
+def _on_idle(original, scheduler, *args, **kwargs):
+    if _flush_when_idle and scheduler.is_fully_idle():
+        _flush_when_idle.clear()
+        scheduler.flush_cache()
+    return original(scheduler, *args, **kwargs)
 
 
 def install(registry, hook_type):
@@ -458,4 +474,5 @@ def install(registry, hook_type):
     if not enabled():
         return False
     registry.register(FORWARD, _forward, hook_type.AROUND)
+    registry.register(ON_IDLE, _on_idle, hook_type.AROUND)
     return True

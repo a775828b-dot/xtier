@@ -10,7 +10,8 @@ while kill -0 "$pid" 2>/dev/null; do
   avail=$(awk '/^MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)
   [ "$avail" -lt "$low" ] && low=$avail
   if [ "$avail" -lt "$min" ]; then
-    echo "$(date '+%F %T') mem_guard: MemAvailable $avail GiB < $min GiB, killing process group $pgid (pid $pid)"
+    largest=$(ps -eo rss=,comm= --sort=-rss | head -4 | awk '{printf "%s %d GiB, ", $2, $1 / 1048576}')
+    echo "$(date '+%F %T') mem_guard: MemAvailable $avail GiB < $min GiB, killing process group $pgid (pid $pid); largest: $largest"
     kill -9 -- "-$pgid" 2>/dev/null || kill -9 "$pid"
     exit 1
   fi

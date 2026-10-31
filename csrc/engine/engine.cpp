@@ -1,5 +1,4 @@
-// Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_engine.py: identifiers, strings and comments
-// renamed only, so the kernels compile to the same code.
+// Ported from lkqmoe 0.5.6 (commit 93edcc1).
 // Independent NVFP4 CPU MoE, generic over the model: hidden size H and expert
 // intermediate size I (both multiples of 64), 10..512 experts, top-k<=10, optional
 // SwiGLU clamp limit, set per plan at creation. Qwen3.8 (2560/640), DeepSeek V4.1
@@ -1492,11 +1491,6 @@ int XTIER_API(xtier_slot_pieces)(void *plan,int slot,int node,void **pointers,si
     int rc=static_cast<Handle*>(plan)->plan->slot_pieces(slot,node,pointers,bytes);
     if(rc<0)last_error="Invalid slot or node";
     return rc;
-}
-void *XTIER_API(xtier_create2)(int hidden,int inter,int experts,int threads,float limit,
-                    const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
-                    const float *g13,const float *g2) {
-    return XTIER_API(xtier_create3)(hidden,inter,experts,threads,limit,0,w13,w2,s13,s2,g13,g2);
 }
 int XTIER_API(xtier_set_swiglu)(void *plan,float alpha,float beta) {
     if(!plan||!(alpha>0.f)){last_error="Invalid SwiGLU parameters";return -1;}

@@ -12,6 +12,7 @@
   XTIER_FAST_LOAD=0          1: fast load, the experts read straight into the CPU engine from the checkpoint files
                              (with cold experts a layer's RAM slots from the cold store), all of them read and checked
                              before the server comes up (backend/direct.py; XTIER_LOAD_DIGEST=1 logs each layer's digest)
+  XTIER_PREBUILD=1           build the FlashInfer modules requests would build before loading the model (prebuild.py)
   XTIER_DECODE_MAX=64       calls of up to this many tokens use the mailbox (CUDA-graph capturable); larger ones
                              are prefill
   XTIER_CPU_PREFILL_BATCH=1024  tokens per synchronous CPU engine call in prefill
@@ -22,7 +23,8 @@
   XTIER_CACHE_FULL=list      layers that keep every expert on the GPU (no CPU part)
   XTIER_CACHE_PROFILE=file   ranking profile that fills the slots at start (LKQstrata format)
   XTIER_CACHE_ADAPT=1, XTIER_CACHE_EVERY=4, XTIER_CACHE_SWAPS=16, XTIER_CACHE_DECAY=0.7, XTIER_CACHE_MIN_GAIN=1.5,
-  XTIER_CACHE_LOG=N          adaptive residency (see cache/pool.py)
+  XTIER_CACHE_LOG=N          adaptive residency (see cache/pool.py; XTIER_DEBUG_SEQ_START=N, test only: the first swap's
+                             sequence number, to run a server across their wrap)
   XTIER_CACHE_PROMPT=0       1: warm the cache from each prompt's routes (cache/pool.py record_prompt;
                              XTIER_CACHE_PROMPT_KEEP=0.7, _WINDOWS=10, _ROUNDS=4, _SWAPS=256)
   XTIER_CACHE_ELASTIC=0      1: extra hot-expert slots in the memory only a prefill needs, released before it
@@ -135,7 +137,7 @@ _plan = []
 
 
 def cache_plan() -> dict[int, int]:
-    """XTIER_CACHE_PLAN=file: {"slots": {layer: slots}} from tools/plan_cache.py --write (a layer's experts count as
+    """XTIER_CACHE_PLAN=file: {"slots": {layer: slots}} from tools/plan_auto.py --write (a layer's experts count as
     full); layers it does not list keep XTIER_CACHE_FULL / XTIER_CACHE_SLOTS."""
     if not _plan:
         path = os.environ.get('XTIER_CACHE_PLAN', '')

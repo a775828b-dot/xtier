@@ -127,9 +127,7 @@ def resident_prefill(prefill, arena, x, ids, weights):
                                        num_warps=gw, num_stages=gs)
         _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[0], meta[1], meta[2], arena[1], arena[3], g2, routes, H, I, bm,
                                     dbn, bki, MX=prefill.mxfp4, num_warps=dw, num_stages=ds)
-        # M of _reduce is unused by the kernel body: a fixed value keeps one compiled variant for every length
-        _reduce[(size, triton.cdiv(H, 256))](routes, weights[start:start + size], out[start:start + size], 1, k,
-                                             256, H)
+        _reduce[(size, triton.cdiv(H, 256))](routes, weights[start:start + size], out[start:start + size], k, 256, H)
     return out
 
 
@@ -172,31 +170,33 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
 
     worker = threading.Thread(target=cpu_part, name='xtier-hybrid-prefill')
     worker.start()
-    counts, owner = host[:S], host[S:]
-    bm = 64 if sum(counts) >= 48 * max(1, sum(1 for c in counts if c)) else 32
-    small = bm == 32
-    gbn, gw, gs = (64, 8, 2) if small else (32, 4, 3)
-    dbn, dw = (64, 4) if small else (128, 8)
-    tiles, offset = [], 0
-    for s in range(S):
-        c = counts[s]
-        for q in range(0, c, bm):
-            tiles.append((owner[s], s, offset + q, offset + c))
-        offset += c
-    out_g = torch.zeros((m, H), dtype=torch.float32, device=x.device)
-    if tiles:
-        meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
-        mid = torch.empty((max(offset, 1), I), dtype=torch.bfloat16, device=x.device)
-        routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)   # CPU routes stay 0 for the sum
-        nt = len(tiles)
-        _gate_up_tiles[(nt, I // gbn)](x, order, meta[0], meta[1], meta[2], meta[3], pool.arena[0], pool.arena[2], g13,
-                                       mid, k, H, I, prefill.swiglu_limit, bm, gbn, _tile_k(H), MX=prefill.mxfp4,
-                                       ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
-                                       num_warps=gw, num_stages=gs)
-        _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], meta[3], pool.arena[1], pool.arena[3], g2,
-                                    routes, H, I, bm, dbn, _tile_k(I), MX=prefill.mxfp4, num_warps=dw, num_stages=2)
-        _reduce[(m, triton.cdiv(H, 256))](routes, torch.where(on_gpu, weights, 0.0), out_g, 1, k, 256, H)
-    worker.join()
+    try:
+        counts, owner = host[:S], host[S:]
+        bm = 64 if sum(counts) >= 48 * max(1, sum(1 for c in counts if c)) else 32
+        small = bm == 32
+        gbn, gw, gs = (64, 8, 2) if small else (32, 4, 3)
+        dbn, dw = (64, 4) if small else (128, 8)
+        tiles, offset = [], 0
+        for s in range(S):
+            c = counts[s]
+            for q in range(0, c, bm):
+                tiles.append((owner[s], s, offset + q, offset + c))
+            offset += c
+        out_g = torch.zeros((m, H), dtype=torch.float32, device=x.device)
+        if tiles:
+            meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
+            mid = torch.empty((max(offset, 1), I), dtype=torch.bfloat16, device=x.device)
+            routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)   # CPU routes stay 0 for the sum
+            nt = len(tiles)
+            _gate_up_tiles[(nt, I // gbn)](x, order, meta[0], meta[1], meta[2], meta[3], pool.arena[0], pool.arena[2], g13,
+                                           mid, k, H, I, prefill.swiglu_limit, bm, gbn, _tile_k(H), MX=prefill.mxfp4,
+                                           ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                           num_warps=gw, num_stages=gs)
+            _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], meta[3], pool.arena[1], pool.arena[3], g2,
+                                        routes, H, I, bm, dbn, _tile_k(I), MX=prefill.mxfp4, num_warps=dw, num_stages=2)
+            _reduce[(m, triton.cdiv(H, 256))](routes, torch.where(on_gpu, weights, 0.0), out_g, k, 256, H)
+    finally:   # before the caller may run this layer again (elastic cache): the CPU plan takes one caller
+        worker.join()
     if errors:
         raise errors[0]
     return out_g + out_h.to(x.device, non_blocking=True)

@@ -22,7 +22,7 @@ export XTIER_DOWN_PRECISION=${XTIER_DOWN_PRECISION:-bf16}
 # the GPU and the CPU, above on the GPU
 export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFILL_MIN=${XTIER_GPU_PREFILL_MIN:-640}
 export XTIER_HYBRID_PREFILL_MAX=${XTIER_HYBRID_PREFILL_MAX:-640} XTIER_SPLIT_PREFILL_MAX=${XTIER_SPLIT_PREFILL_MAX:-1792}
-export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-60} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
+export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-58} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
 export XTIER_CACHE_PROFILE=${XTIER_CACHE_PROFILE:-/data/fast/workspaces/gh-ref/lsglang_glm5.3/lkqmoe/lkqstrata-glm53.json}
 # BF16 attention / dense weights stored as FP8 as in production (its include / exclude; W8A8 prefill per its runtime
 # file "w8a8_prefill"; XTIER_FP8_WEIGHTS=0 keeps BF16)

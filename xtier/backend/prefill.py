@@ -1,5 +1,5 @@
 """Grouped GPU prefill of a MoE layer whose experts live in host memory (the CPU engine's NUMA shards).
-Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_prefill.py: names changed only.
+Ported from lkqmoe 0.5.6 (commit 93edcc1).
 
 Compressed weights and FP8 block scales are unchanged. Gate/up use exact BF16
 operands with FP32 accumulation; activation, down and route reduction stay FP32.
@@ -28,7 +28,7 @@ class Pointer:
 
 
 @tr.jit
-def _copy_ids(S, D, N: tl.constexpr, B: tl.constexpr):
+def _copy_ids(S, D, N, B: tl.constexpr):   # N at run time: prompts end in any length, each would compile a kernel
     i = tl.program_id(0) * B + tl.arange(0, B)
     tl.store(D + i, tl.load(S + i, i < N, 0), i < N)
 
@@ -137,7 +137,7 @@ def _down(MID, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, ROUTE_OUT, E0, R0,
 
 
 @tr.jit
-def _reduce(R, WEIGHTS, OUT, M: tl.constexpr, K: tl.constexpr, B: tl.constexpr, HID: tl.constexpr):
+def _reduce(R, WEIGHTS, OUT, K: tl.constexpr, B: tl.constexpr, HID: tl.constexpr):
     t = tl.program_id(0)
     n = tl.program_id(1) * B + tl.arange(0, B)
     acc = tl.full((B,), 0., tl.float32)
@@ -213,19 +213,6 @@ def drain_prefetch():
             _pending = None
 
 
-def link_prefill_ring(plans):
-    """Explicit model-order ring; never infer ownership from call timing."""
-    if not plans or len({id(p) for p in plans}) != len(plans):
-        raise ValueError('Expected unique prefill plans')
-    if len({(p.experts, p.hidden, p.inter) for p in plans}) != 1:
-        raise ValueError('Prefetch ring requires equal weight shapes')
-    drain_prefetch()
-    for index, plan in enumerate(plans):
-        if not plan.prefetch_enabled:
-            raise ValueError('Prefetch must be explicitly enabled on every plan')
-        plan.next_prefill = weakref.ref(plans[(index + 1) % len(plans)])
-
-
 class _DeviceArray:
     """A raw device address as a torch tensor (no copy) through __cuda_array_interface__."""
     def __init__(self, address, shape, typestr):
@@ -253,7 +240,8 @@ _cudart = None
 def _runtime():
     global _cudart
     if _cudart is None:
-        lib = C.CDLL('libcudart.so.13')
+        from xtier.tables.lookup import _runtime as cuda_runtime   # the library of torch's CUDA, 13 or 12
+        lib = cuda_runtime()
         lib.cudaHostRegister.argtypes = [C.c_void_p, C.c_size_t, C.c_uint]
         lib.cudaHostUnregister.argtypes = [C.c_void_p]
         lib.cudaHostGetDevicePointer.argtypes = [C.POINTER(C.c_void_p), C.c_void_p, C.c_uint]
@@ -652,7 +640,7 @@ class Prefill:
                     _emit[(size, tr.cdiv(H, 256))](acc, dst, 256, H)
                 else:
                     _reduce[(size, tr.cdiv(H, 256))](routes, Pointer(routing+start*k*4, torch.float32), dst,
-                                        size, k, 256, H)
+                                        k, 256, H)
                 stamp('reduce')
             # Cross-layer prefetch: the next layer's first chunk into a slot whose
             # contents this call no longer needs (the only slot, once unpacked).

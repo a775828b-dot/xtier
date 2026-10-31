@@ -1,6 +1,5 @@
 #pragma once
-// Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_engine.py: identifiers, strings and comments
-// renamed only, so the kernels compile to the same code.
+// Ported from lkqmoe 0.5.6 (commit 93edcc1).
 #include <stddef.h>
 #include <stdint.h>
 
@@ -26,9 +25,6 @@ extern "C" {
 // 0 disables the clamp. create owns an explicitly NUMA-bound, sharded copy (overrides
 // inherited interleave policy for its own mappings only). The input buffers can be
 // released after create returns. experts=10..512; threads<=128, divisible by the node count.
-void *xtier_create2(int hidden, int inter, int experts, int threads, float swiglu_limit,
-                    const uint8_t *w13, const uint8_t *w2, const uint8_t *s13, const uint8_t *s2,
-                    const float *g13, const float *g2);
 // scale_format: 0=NVFP4 (E4M3/16), 1=MXFP4 (UE8M0/32).
 // MXFP4 globals must be arrays of 1. Shard scales retain compact 32-wide UE8M0
 // blocks; packed weights are unchanged. NVFP4 retains its original layout.

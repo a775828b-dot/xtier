@@ -332,17 +332,24 @@ def attach(plan, lp, inputs, scale_format):
             st.manifest['layers'].pop(key, None)
             st.save()
 
+            errors = []
+
             def write(d):   # drive d: its node parts of every record, in part order, back to back
-                mine = [n for n in range(nodes) if drive_of[n] == d]
-                for i, e in enumerate(lp.stored):
-                    pieces = [p for n in mine for p in _pieces(inputs, e, n, nodes, H, I, group)]
-                    st.native.write(d, starts[d] + i * share[d], pieces)
+                try:
+                    mine = [n for n in range(nodes) if drive_of[n] == d]
+                    for i, e in enumerate(lp.stored):
+                        pieces = [p for n in mine for p in _pieces(inputs, e, n, nodes, H, I, group)]
+                        st.native.write(d, starts[d] + i * share[d], pieces)
+                except BaseException as e:   # re-raised after the join: the manifest must not vouch for these records
+                    errors.append(e)
 
             threads = [threading.Thread(target=write, args=(d,)) for d in range(D)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
+            if errors:
+                raise errors[0]
             st.sync()
             st.manifest['layers'][key] = dict(record=record, stored=lp.stored, starts=starts, parts=counts,
                                               ends=[s + z for s, z in zip(starts, size)], source=source())

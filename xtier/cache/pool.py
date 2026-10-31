@@ -114,23 +114,25 @@ def _commit(RING_P, SEQS, STATE, TABLE, OWNER, E, NR: tl.constexpr):
     experts of newly posted swaps leave it (and `applied` lets the copy stream overwrite their slots).
     Publish before evict: a landed expert may already be the victim of a newer swap (posted after it landed,
     before this window), and must end up out of the table. A swap is always evicted in an earlier window
-    than it is published (its copy waits for `applied`). Table and owner rows both have stride E."""
+    than it is published (its copy waits for `applied`). Table and owner rows both have stride E. Sequence numbers
+    wrap (uint32 on the host, the same bits as int32 here): only their differences count, the low bits index the
+    ring (NR is a power of two)."""
     posted = tl.atomic_add(SEQS, 0, sem='acquire', scope='sys')
     landed = tl.atomic_add(SEQS + 32, 0, sem='acquire', scope='sys')
     done = tl.load(STATE)
     pub = tl.load(STATE + 1)
-    upto = tl.minimum(landed, done)
-    for s in range(pub + 1, upto + 1):
-        i = (s % NR) * 4
+    publish = tl.minimum(landed - pub, done - pub)
+    for j in range(0, publish):
+        i = ((pub + 1 + j) & (NR - 1)) * 4
         layer = tl.load(RING_P + i, volatile=True)
         ein = tl.load(RING_P + i + 1, volatile=True)
         slot = tl.load(RING_P + i + 3, volatile=True)
         if ein >= 0:   # -1: a slot the elastic cache released (cache/elastic.py), nothing to publish
             tl.store(TABLE + layer * E + ein, slot)
         tl.store(OWNER + layer * E + slot, ein)
-    tl.store(STATE + 1, upto)
-    for s in range(done + 1, posted + 1):
-        i = (s % NR) * 4
+    tl.store(STATE + 1, pub + publish)
+    for j in range(0, posted - done):
+        i = ((done + 1 + j) & (NR - 1)) * 4
         layer = tl.load(RING_P + i, volatile=True)
         out = tl.load(RING_P + i + 2, volatile=True)
         if out >= 0:
@@ -455,6 +457,10 @@ class LayerPool:
                 if mailbox.lib.xtier_mailbox_pool_ring(C.cast(ptr, C.c_void_p)) < 0:
                     raise RuntimeError(mailbox.error())
                 _glob['ring'], _glob['seqs'] = ptr[0], ptr[1]
+                first_seq = C.cast(ptr[1], C.POINTER(C.c_int32))[0]
+                if first_seq:   # test only
+                    logger.warning('xtier cache: XTIER_DEBUG_SEQ_START: sequence numbers start at %d', first_seq)
+                    _glob['state'].fill_(first_seq)
             if _glob['E'] != E:
                 raise ValueError('xtier cache: every partly cached layer needs the same expert count')
             self.index = _glob['rows']

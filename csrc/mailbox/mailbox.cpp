@@ -1,5 +1,4 @@
-// Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_engine.py: identifiers, strings and comments
-// renamed only, so the kernels compile to the same code.
+// Ported from lkqmoe 0.5.6 (commit 93edcc1).
 // Standalone mailbox bridge (production path of the WebUI launcher since 2026-09-27).
 // One shared CPU dispatcher polls mapped host mailboxes. Stream mem-ops replace
 // CUDA host callbacks; all graph dependencies remain explicit and stream ordered.
@@ -10,6 +9,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include "xtier_engine.h"
+#include "xtier_mailbox.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -201,6 +201,8 @@ public:
         check(cudaHostAlloc(reinterpret_cast<void**>(&ring),sizeof(PoolCmd)*POOL_RING,cudaHostAllocMapped));
         check(cudaHostAlloc(reinterpret_cast<void**>(&seqs),256,cudaHostAllocMapped));
         std::memset(ring,0,sizeof(PoolCmd)*POOL_RING);std::memset(seqs,0,256);
+        // test only: start close to the wrap of the sequence numbers (a server's copy test across it)
+        if(const char *v=std::getenv("XTIER_DEBUG_SEQ_START"))next_seq=seqs[0]=seqs[16]=seqs[32]=uint32_t(std::stoul(v,nullptr,0));
         void *d=nullptr;
         check(cudaHostGetDevicePointer(&d,ring,0));dev_ring=reinterpret_cast<CUdeviceptr>(d);
         check(cudaHostGetDevicePointer(&d,seqs,0));dev_seqs=reinterpret_cast<CUdeviceptr>(d);
@@ -265,7 +267,7 @@ public:
         ring[seq%POOL_RING]=PoolCmd{L.layer,in,out,slot};
         __atomic_store_n(posted(),seq,__ATOMIC_RELEASE);
         if(out>=0)L.slot_of[out]=-1;
-        L.resident[slot]=in;L.slot_of[in]=slot;L.busy[slot]=seq;
+        L.resident[slot]=in;L.slot_of[in]=slot;L.busy[slot]=seq?seq:1;   // busy 0 is "no copy in flight"
         return seq;
     }
     // After the GPU acknowledged the evictions (next decode window): upload, then mark each command landed.
@@ -295,7 +297,7 @@ public:
             for(int e=0;e<L->E;e++)if(L->slot_of[e]<0&&u[l][e]>=2.f&&!(L->g2_table&&L->g2_table[e].load(std::memory_order_relaxed)>=0))cand.emplace_back(u[l][e],e);
             const int A=L->active.load(std::memory_order_acquire);
             for(int s=0;s<A;s++) {
-                if(L->busy[s]&&L->busy[s]>done)continue;   // its copy has not landed yet
+                if(L->busy[s]&&int32_t(L->busy[s]-done)>0)continue;   // its copy has not landed yet
                 L->busy[s]=0;
                 vict.emplace_back(L->resident[s]<0?-1.f:u[l][L->resident[s]],s);
             }
@@ -391,6 +393,8 @@ struct G2State {
 };
 G2State &g2_state(){static G2State *g=new G2State();return *g;}
 // Dispatcher thread, before the CPU reads the routes. True: a graph runs and g2_finish must follow.
+// Called from execute, which is noexcept: a driver error here ends the process (its message is the exception's), on
+// purpose: the routes of this call are already taken from the CPU, a result without them would be wrong.
 bool g2_launch(Slot *s) {
     G2Layer *g=s->owner->g2;
     if(!g)return false;
@@ -511,7 +515,7 @@ void g2_policy() {
 void CUDART_CB execute(void *p) noexcept {
     auto *s=static_cast<Slot*>(p);auto *b=s->owner;
     // Test hook for the watchdog only; unset in normal use.
-    static const long stall_us=[]{const char *v=std::getenv("XTIER_DEBUG_STALL_US");return v?std::stol(v):0L;}();
+    static const long stall_us=[]{const char *v=std::getenv("XTIER_DEBUG_STALL_US");return v?std::strtol(v,nullptr,0):0L;}();
     if(stall_us)std::this_thread::sleep_for(std::chrono::microseconds(stall_us));
     timespec real{};if(trace_file())clock_gettime(CLOCK_REALTIME,&real);
     const bool second=g2_launch(s);
@@ -587,7 +591,7 @@ void CUDART_CB execute(void *p) noexcept {
         }
         {std::lock_guard<std::mutex> lock(b->stats_mutex);auto &ps=b->pool_stats;ps[0]++;ps[1]+=n;ps[2]+=hit;}
         if(b->pool_layer>=0)pool_manager().observe(b->pool_layer,s->orig,m*k);
-        static const long every=[]{const char *v=std::getenv("XTIER_CACHE_LOG");return v?std::stol(v):0L;}();
+        static const long every=[]{const char *v=std::getenv("XTIER_CACHE_LOG");return v?std::strtol(v,nullptr,0):0L;}();
         static double win_n=0,win_hit=0,win_wall=0,win_calls=0;static long windows=0;
         win_n+=n;win_hit+=hit;win_wall+=wall;win_calls++;
         if(every>0&&b->index==0&&++windows%every==0) {
@@ -1059,11 +1063,11 @@ int xtier_mailbox_pool_shrink(int extra) {
                 if(out<0)continue;
                 const uint32_t seq=++m.next_seq;
                 m.ring[seq%POOL_RING]=PoolCmd{L->layer,-1,out,s};
-                L->slot_of[out]=-1;L->resident[s]=-1;L->busy[s]=seq;last=seq;
+                L->slot_of[out]=-1;L->resident[s]=-1;L->busy[s]=seq?seq:1;last=seq;
             }
             L->active.store(keep,std::memory_order_release);
         }
-        if(last) {
+        if(n) {
             __atomic_store_n(m.posted(),last,__ATOMIC_RELEASE);
             if(m.copy)driver(cuStreamWriteValue32(reinterpret_cast<CUstream>(m.copy),m.dev_seqs+32*4,last,0));
             else __atomic_store_n(m.landed(),last,__ATOMIC_RELEASE);

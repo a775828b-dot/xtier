@@ -1,6 +1,6 @@
 # GLM-5.3 Flash NVFP4 on RTX PRO 5000 72GB + 2x EPYC 9334 (NPS4)
 
-`run-glm-xtier.sh`: upstream SGLang main + XTier, 42 MoE layers on XTier with 60 hot slots each (production profile and
+`run-glm-xtier.sh`: upstream SGLang main + XTier, 42 MoE layers on XTier with 58 hot slots each (production profile and
 GPU prefill switches), 16K prefill chunks and BF16 SSM states as in production, a KV pool of one 512K context.
 Arguments of the README measurement (2026-10-23, EAGLE with the NextN draft on XTier):
 

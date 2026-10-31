@@ -1,7 +1,6 @@
 # csrc
 
-The CPU expert engine and the CPU-GPU mailbox, ported from lkqmoe 0.5.6 (commit `93edcc1`) by
-[tools/port_engine.py](../tools/port_engine.py): identifiers, strings and comments renamed only.
+The CPU expert engine and the CPU-GPU mailbox, ported from lkqmoe 0.5.6 (commit `93edcc1`).
 
 | File | What |
 |---|---|

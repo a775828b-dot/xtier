@@ -12,14 +12,17 @@ to BF16 (FP8 products are exact in FP32, accumulated in FP32 as in DeepGEMM), pr
 import torch
 
 SCORE_BUDGET = 256 << 20   # bytes of FP32 scores per prefill chunk
-_arange = {}
+_arange = {}   # device -> the longest positions so far: a prefill's key count differs with every chunk
 
 
 def _positions(n, device):
-    key = (n, device)
-    if key not in _arange:
-        _arange[key] = torch.arange(n, device=device)
-    return _arange[key]
+    t = _arange.get(device)
+    if t is not None and t.shape[0] >= n:
+        return t[:n]
+    if torch.cuda.is_current_stream_capturing():   # only the graph's replays would fill it: not for other calls
+        return torch.arange(n, device=device)
+    t = _arange[device] = torch.arange(max(n, 2 * (t.shape[0] if t is not None else 0)), device=device)
+    return t[:n]
 
 
 def fp8_mqa_logits(q_fp8, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):

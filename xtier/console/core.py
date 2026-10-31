@@ -25,12 +25,12 @@ PUBLIC = ('name', 'code', 'port', 'served', 'spec', 'arch', 'hardware', 'bench',
 
 
 def common_options(spec, threads=('112', '96', '64'), contexts=('524288', '393216', '262144')):
-    """The options every model has: the packs (off = the README "官方 main" configuration), speculative decoding, the
+    """The options every model has: the packs (off = the README "基线" configuration), speculative decoding, the
     context (= the KV pool) and the CPU engine's threads (the first context and thread count are the measured ones)."""
     return [
         {'key': 'packs', 'label': '加速包', 'default': 'on',
-         'choices': [['on', '开 · 实测配置'], ['off', '关 · 官方 main 基线']],
-         'hint': '关：只保留跑起来必需的修正，与 README「官方 main」那行同一配置'},
+         'choices': [['on', '开 · 实测配置'], ['off', '关 · 基线']],
+         'hint': '关：只保留跑起来必需的修正，与 README「基线」那行同一配置'},
         {'key': 'spec', 'label': f'{spec} 投机解码', 'default': 'on', 'choices': [['on', '开'], ['off', '关']]},
         {'key': 'context', 'label': '上下文 / KV 池', 'default': contexts[0],
          'choices': [[c, f'{int(c) // 1024}K'] for c in contexts]},
@@ -370,7 +370,7 @@ class Console:
     def describe(self, model, o):
         """One line for job labels and the status panel."""
         m = self.models[model]
-        parts = [m['name'], '加速包' if o.get('packs', 'on') == 'on' else '官方 main']
+        parts = [m['name'], '加速包' if o.get('packs', 'on') == 'on' else '基线']
         if m.get('spec'):
             parts.append(m['spec'] + ('' if o.get('spec', 'on') == 'on' else ' 关'))
         if o.get('context'):
@@ -437,7 +437,8 @@ class Console:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log = self.log_dir / f"xtier-{model}-{time.strftime('%Y%m%d-%H%M%S')}.log"
         # the console's environment minus anything that looks like a credential
-        env = {k: v for k, v in os.environ.items() if not re.search(r'KEY|TOKEN|SECRET|PASSW', k, re.I)}
+        env = {k: v for k, v in os.environ.items()
+               if k.startswith('XTIER_') or not re.search(r'KEY|TOKEN|SECRET|PASSW', k, re.I)}
         env.update(PYTHONUNBUFFERED='1', **env_add)
         label = self.describe(model, values)
         with log.open('ab') as fh:
@@ -509,6 +510,8 @@ class Console:
                     why = warm_up(state['port'], state.get('served'), deadline)
                     _note(state.get('log'), f'warm-up {"failed after" if why else "done in"} '
                                             f'{time.monotonic() - t0:.1f} s{": " + why if why else ""}')
+                    if not self.active(state):   # the warm-up took the server down (out of memory, a crash)
+                        return False, '服务在预热时退出：' + ' | '.join(log_tail(state.get('log'), 6))
                     state['ready_at'] = time.time()
                     self.write_state(state)
                     return True, ''

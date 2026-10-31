@@ -1,10 +1,10 @@
 """The installed SGLang against this XTier, without a model: its main commit against the tested one
 (xtier.SGLANG_COMMIT), every hook target XTier registers (all packs, all features on) resolving to an attribute, and
 every name XTier imports from sglang importing. SGLang's HookRegistry logs a hook it cannot apply and goes on; this
-lists them all before a server starts. Exit status 1 on a missing target or import. The packs that choose hooks by
-GPU architecture ask the CUDA device.
+lists them all before a server starts. Exit status 1 on a missing target or import, and with --strict on another
+commit too. The packs that choose hooks by GPU architecture ask the CUDA device.
 
-  <SGLang venv>/bin/python tools/check_sglang.py
+  <SGLang venv>/bin/python tools/check_sglang.py [--strict]
 """
 import ast
 import importlib
@@ -50,6 +50,8 @@ def hook_targets():
         def register(target, fn, hook_type=None, *args, **kwargs):
             targets.setdefault(target, f'{fn.__module__}.{fn.__qualname__}')
 
+    from xtier import plugin
+    targets[f'sglang.srt.managers.scheduler.{plugin.SCHEDULER_ENTRY}'] = 'xtier.plugin._in_scheduler'
     hooks.install(Recorder, HookType)
     elastic.install(Recorder, HookType)
     packs.install(Recorder, HookType)
@@ -97,7 +99,7 @@ def main():
     for b in bad:
         print(f'  import missing: {b}')
     print(f'{len(missing)} of {len(targets)} hook targets and {len(bad)} of {len(names)} imports missing')
-    return 1 if missing or bad else 0
+    return 1 if missing or bad or ('--strict' in sys.argv[1:] and not same) else 0
 
 
 if __name__ == '__main__':

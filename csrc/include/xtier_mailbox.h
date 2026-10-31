@@ -1,6 +1,6 @@
 #pragma once
-// Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_engine.py: identifiers, strings and comments
-// renamed only, so the kernels compile to the same code.
+// Ported from lkqmoe 0.5.6 (commit 93edcc1). mailbox.cpp includes this, so the two cannot disagree.
+#include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,11 +31,31 @@ int xtier_mailbox_pool_enable(void *bridge, int on);
 int xtier_mailbox_pool_stats(void *bridge, double *statistics);
 // Adaptive residency: pool_ring returns the device addresses of the mapped command ring and its sequence
 // words (posted at +0, applied at +64 B, landed at +128 B; commands are int32 {layer, in, out, slot}).
-// pool_attach registers one layer (arena: device w13, w2, s13, s2 slots; resident: S experts, -1 = empty);
-// pool_start launches the policy thread (every windows, budget swaps per window, decay, minimum gain).
+// pool_attach registers one layer (arena: device w13, w2, s13, s2 slots; resident: S experts, -1 = empty; active: the slots
+// in use, the others are the elastic cache's); pool_start launches the policy thread (every windows, budget swaps per
+// window, decay, minimum gain).
 int xtier_mailbox_pool_ring(void **pointers);
-int xtier_mailbox_pool_attach(void *bridge, int layer, int slots, int experts, void **arena, const int *resident);
+int xtier_mailbox_pool_attach(void *bridge, int layer, int slots, int active, int experts, void **arena, const int *resident);
 int xtier_mailbox_pool_start(int every, int budget, float decay, float min_gain);
+// Prompt warm-up (XTIER_CACHE_PROMPT, cache/pool.py record_prompt): pool_prompt hands a prefill's route counts (host) to the
+// policy on the stream; pool_warm sets how they blend in and what they may swap.
+int xtier_mailbox_pool_prompt(void *stream, const float *host, int layers, int stride);
+int xtier_mailbox_pool_warm(float keep, float windows, int rounds, int budget);
+// Elastic slots (cache/elastic.py): pause (no new rounds); quiesce until 0 (1: a round still runs, 2: copies in flight; the
+// caller runs a commit kernel on its stream, synchronizes and asks again); shrink to `extra` slots over each layer's base;
+// resume. grow raises the usable count over mapped granules; active: the extra slots now.
+int xtier_mailbox_pool_pause(int on);
+int xtier_mailbox_pool_quiesce(int timeout_ms);
+int xtier_mailbox_pool_shrink(int extra);
+int xtier_mailbox_pool_resume(void);
+int xtier_mailbox_pool_grow(int extra);
+int xtier_mailbox_pool_active(void);
+// Device address space for the elastic arenas: reserve, map and unmap granules, the bytes mapped.
+size_t xtier_mailbox_vmm_granularity(void);
+int xtier_mailbox_vmm_reserve(size_t bytes, void **va, size_t *granularity);
+int xtier_mailbox_vmm_map(void *va, size_t offset, size_t bytes);
+int xtier_mailbox_vmm_unmap(void *va, size_t offset);
+long long xtier_mailbox_vmm_mapped(void *va);
 // Second GPU as a hot expert pool (cache/second.py), all with that GPU current on the calling thread. gpu2_init returns the
 // device addresses of the host control block and output; gpu2_attach registers a pool_attached layer's slots there and
 // loads its residents; a decode shape's graph is captured between gpu2_capture_begin and _end (or _abort); gpu2_start
@@ -50,7 +70,7 @@ int xtier_mailbox_gpu2_start(int budget, float min_gain, float min_use);
 // max absolute error, max per-call relative L2 error, nonfinite element count.
 // Error statistics describe shadow calls; counts include both modes.
 int xtier_mailbox_stats(void *bridge, double *statistics);
-// Sixteen doubles, for M=1..4 in order: calls, callback wall-clock us, gate+barrier us,
+// Thirty-two doubles, for M=1..8 in order: calls, callback wall-clock us, gate+barrier us,
 // down+barrier us (sums). Mailbox bridge only; the host-callback bridge returns -1.
 int xtier_mailbox_timing(void *bridge, double *timing);
 const char *xtier_mailbox_error(void);

@@ -264,10 +264,10 @@ class XTierMoEMethod(FusedMoEMethodBase):
             logger.info('xtier: layer %d: shards digest %s', self.cfg.layer_id, direct.digest(self.plan))
 
     def process_weights_after_loading(self, layer):
-        if self.plan is None:   # some expert tensor never came through the loader
-            logger.warning('xtier: layer %d: loading did not complete (experts missing per parameter: %s); handing '
-                           'the experts over now', self.cfg.layer_id, {n: c for n, c in self._missing.items() if c})
-            self._hand_off(layer)
+        if self.plan is None:   # some expert tensor never came through the loader: those weights would be garbage
+            missing = {n: c for n, c in self._missing.items() if c}
+            raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: loading did not complete (experts missing per '
+                               f'parameter: {missing}); is the checkpoint complete?')
 
     def _upload_from_cache(self, slot, e0, e1, stream, up_first=False):
         """Staged prefill of a fully cached layer (XTIER_CACHE_PREFILL=staged): device copies of slots e0..e1 (filled
@@ -448,16 +448,19 @@ class XTierMoEMethod(FusedMoEMethodBase):
         w_h.copy_(torch.where(gpu, 0.0, weights), non_blocking=True)
         staged = torch.cuda.Event()
         staged.record()
-        timing, batch = {}, config.cpu_prefill_batch()
+        timing, errors, batch = {}, [], config.cpu_prefill_batch()
 
         def cpu_part():
-            staged.synchronize()
-            t0 = time.perf_counter()
-            for start in range(0, m, batch):
-                n = min(batch, m - start)
-                self.plan.forward(n, k, x_h.data_ptr() + start * H * 2, ids_h.data_ptr() + start * k * 4,
-                                  w_h.data_ptr() + start * k * 4, out_c.data_ptr() + start * H * 4)
-            timing['cpu'] = time.perf_counter() - t0
+            try:
+                staged.synchronize()
+                t0 = time.perf_counter()
+                for start in range(0, m, batch):
+                    n = min(batch, m - start)
+                    self.plan.forward(n, k, x_h.data_ptr() + start * H * 2, ids_h.data_ptr() + start * k * 4,
+                                      w_h.data_ptr() + start * k * 4, out_c.data_ptr() + start * H * 4)
+                timing['cpu'] = time.perf_counter() - t0
+            except BaseException as e:   # re-raised after the join: out_c is not complete
+                errors.append(e)
 
         worker = threading.Thread(target=cpu_part, name='xtier-split-cpu')
         worker.start()
@@ -469,12 +472,13 @@ class XTierMoEMethod(FusedMoEMethodBase):
             gpu_s = time.perf_counter() - t0   # the GPU part only; the join may wait for the CPU
         finally:
             worker.join()
+        if errors:
+            raise errors[0]
         out = out_g + out_c.to(x.device, non_blocking=True)
         cost = XTierMoEMethod._split_cost
-        if 'cpu' in timing:
-            cost['cpu_ms'] = 0.8 * cost['cpu_ms'] + 0.2 * timing['cpu'] * 1e3 / ((E - g) * m)
+        cost['cpu_ms'] = 0.8 * cost['cpu_ms'] + 0.2 * timing['cpu'] * 1e3 / ((E - g) * m)
         cost['gpu_ms'] = 0.8 * cost['gpu_ms'] + 0.2 * gpu_s * 1e3 / g
-        self.last_split = dict(m=m, gpu_experts=g, cpu_ms=round(timing.get('cpu', 0) * 1e3, 1),
+        self.last_split = dict(m=m, gpu_experts=g, cpu_ms=round(timing['cpu'] * 1e3, 1),
                                gpu_ms=round(gpu_s * 1e3, 1))
         return out
 

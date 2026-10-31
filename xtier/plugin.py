@@ -12,21 +12,37 @@ here, so the backend checks after every model load that it took over (``xtier.ba
 import logging
 import os
 import sys
+from pathlib import Path
 
-from xtier import SGLANG_COMMIT, __version__, config
+from xtier import SGLANG_COMMIT, __version__, config, prebuild
 
 logger = logging.getLogger(__name__)
 _installed = []
 _serving = []
+SCHEDULER_ENTRY = 'run_scheduler_process'   # of sglang.srt.managers.scheduler
 
 
 def _in_scheduler() -> bool:
     frame = sys._getframe(1)
     while frame is not None:
-        if frame.f_code.co_name == 'run_scheduler_process':
+        if frame.f_code.co_name == SCHEDULER_ENTRY:
             return True
         frame = frame.f_back
     return False
+
+
+def _check_scheduler_entry() -> None:
+    """_in_scheduler goes by that function's name: under another name no process would install the hooks and the server
+    would run without XTier. SystemExit, because SGLang swallows the exceptions of a plugin. From the source, the
+    module is heavy to import."""
+    import importlib.util
+    import re
+
+    spec = importlib.util.find_spec('sglang.srt.managers.scheduler')
+    source = spec.loader.get_source(spec.name) if spec is not None else None
+    if source is not None and not re.search(rf'^def {SCHEDULER_ENTRY}\(', source, re.M):
+        raise SystemExit(f'xtier: XTIER=1, but this SGLang has no {SCHEDULER_ENTRY}: XTier would not be installed. '
+                         'Install the SGLang commit README.md names, or unset XTIER.')
 
 
 def _check_sglang() -> None:
@@ -42,6 +58,36 @@ def _check_sglang() -> None:
     if not m or m.group(1)[:7] != SGLANG_COMMIT[:7]:
         logger.warning('xtier %s is tested with SGLang main %s; this SGLang is %s, so some hooks may not apply '
                        '(tools/check_sglang.py lists them)', __version__, SGLANG_COMMIT, version)
+
+
+def _require_hooks() -> None:
+    """SGLang logs a hook it cannot apply and goes on: the server would run without that part of XTier, slower or with
+    other results. Checked right after SGLang applied them, before anything is loaded."""
+    from sglang.srt.plugins.hook_registry import HookRegistry
+
+    apply_hooks = HookRegistry.apply_hooks
+
+    def checked():
+        apply_hooks()
+        failed = sorted(target for target, hooks in HookRegistry._hooks.items() if target not in HookRegistry._patched
+                        and any(getattr(h[-1], 'plugin_name', None) == 'xtier' for h in hooks))
+        if failed:
+            raise SystemExit(f'xtier: hooks not applied (SGLang logged why): {failed}; tools/check_sglang.py lists what '
+                             'this SGLang lacks')
+
+    if hasattr(HookRegistry, '_hooks') and hasattr(HookRegistry, '_patched'):
+        HookRegistry.apply_hooks = checked
+
+
+def _check_settings() -> None:
+    """A setting XTier does not know (misspelled, or removed) would be ignored without a word. xtier/env_names.txt:
+    tools/repo_check.py --write."""
+    names = Path(__file__).with_name('env_names.txt')
+    if names.exists():
+        known = set(names.read_text().split())
+        unknown = sorted(k for k in os.environ if k.startswith('XTIER_') and k not in known)
+        if unknown:
+            print(f'[xtier] settings XTier does not know are ignored: {unknown}', file=sys.stderr, flush=True)
 
 
 def install() -> None:
@@ -92,11 +138,15 @@ def load() -> None:
         from xtier.engine import placement
         if not placement.deferred():   # with TP the rank's placement waits for its first MoE layer
             placement.apply(config.threads())
+    _require_hooks()
     if _in_scheduler():
+        _check_settings()
+        prebuild.run()   # nothing is loaded yet
         install()
         # SGLang configures logging only after loading the plugins: one line on stderr
         print(f'[xtier] {__version__}: hooks installed in scheduler pid {os.getpid()}, CPUs '
               f'{len(os.sched_getaffinity(0))}, SGLANG_AUTO_NUMA_BIND={os.environ.get("SGLANG_AUTO_NUMA_BIND", "")}',
               file=sys.stderr, flush=True)
     else:
+        _check_scheduler_entry()
         install_serving()
