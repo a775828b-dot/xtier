@@ -44,7 +44,7 @@ MODEL = {
         miss_option(),
     ],
     'notes': [
-        {'when': {'packs': 'off'}, 'text': '官方 main 基线：FP8 KV、16K 分块、不开 hc_mix / PLE / QSA 分段'},
+        {'when': {'packs': 'off'}, 'text': '基线：FP8 KV、16K 分块、不开 hc_mix / PLE / QSA 分段'},
         {'when': {'packs': 'on', 'kv': 'fp8'}, 'text': 'FP8 KV：用生产布局（25 层常驻）', 'warn': True},
         {'when': {'packs': 'on', 'kv': 'fp8', 'chunk': '32768'}, 'text': '分块按 24K 启动', 'warn': True},
         {'when': {'ple': 'nvme'}, 'text': 'PLE 行从傲腾读取，主机内存省 48 GiB'},
@@ -62,7 +62,7 @@ def build(o, port):
     layout = 'prod' if kv == 'fp8_e4m3' else o['layout']
     env.update(LAYOUT='auto' if layout == 'auto' else 'prod', SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN='1',
                XTIER_CACHE_SLOTS='155', XTIER_CACHE_FULL=LAYOUTS[layout])
-    if base:   # README "官方 main": no pack kernels; SGLang's QSA cannot read NVFP4
+    if base:   # README "基线": no pack kernels; SGLang's QSA cannot read NVFP4
         env.update(XTIER_HC_MIX_OVERLAP='0', XTIER_PLE_BLOCK='0', XTIER_QSA_KEYS_PER_CTA='0', XTIER_QSA_FP4='0')
     elif kv == 'fp8_e4m3' and chunk == '32768':
         chunk = '24576'   # 32K chunks need the memory NVFP4 KV frees

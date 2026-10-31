@@ -7,8 +7,9 @@ with the lowest decayed use counts (xtier_cold_attach). The GPU hot-expert pool 
 uploads the RAM slots, and uploads them after (PrefillCold).
 
 The drives' bandwidth sizes it: decode waits for the experts it misses (DeepSeek V4.1 Flash, the store on four PCIe
-4.0 drives: the agent's decode step +8 / +24 / +44 % at 10 / 20 / 30 %), a prefill call reads every cold expert of
-the layer it routes to, the next layer's ahead (X x the experts' bytes / the drives' bandwidth).
+5.0 drives: the agent's decode step +5 / +15 / +26 / +48 / +78 % at 10 / 20 / 30 / 40 / 50 %, about 0.5 ms a miss), a
+prefill call reads every cold expert of the layer it routes to, the next layer's ahead (X x the experts' bytes / the
+drives' bandwidth).
 
   XTIER_COLD=1                   on
   XTIER_COLD_PATHS=dir[:dir...]  one directory per drive; node part n of every record goes to drive n % drives
@@ -26,6 +27,13 @@ restarts: the manifest (first directory, KEY.json) names every layer's records, 
 samples each; a layer whose records are missing or differ is written again (a few seconds per layer). Each layer
 also notes the checkpoint its records match (source: the model files' names, sizes and modification times), saved
 only after its records are flushed to the drives.
+
+Only one copy of the experts (a model larger than the drive it was downloaded to can spare): the store holds every
+expert, so tools/cold_punch.py can take their bytes out of the checkpoint files once it has compared them with the
+records (holes: the files keep their sizes, modification times and everything else). KEY.ranges, next to the manifest,
+says where each expert tensor lies in the files (noted while loading, save_ranges). The marker XTIER-COLD-ONLY in the
+model directory then lists the layers that can only load from the store; any other way of loading them stops the start
+(require_checkpoint) instead of reading zeros, and such a layer's records are never rewritten.
 """
 import hashlib
 import json
@@ -44,6 +52,7 @@ _store_lock = threading.Lock()
 _staging = [None, None]   # the prefills' pinned stagings: layers alternate (a layer's reads run during the last one)
 _locked = [None, None]    # the page-locked (cudaHostRegister) start of each staging
 _open = set()             # PrefillColds holding a ticket or a read-ahead (finished by the next prepare)
+MARKER = 'XTIER-COLD-ONLY'   # in the model directory (tools/cold_punch.py); not a .json file: source() stays the same
 
 
 def enabled():
@@ -71,18 +80,57 @@ def load_enabled():
 
 
 _source = []
+_marker = []
+
+
+def checkpoint_id(d):
+    """Directory d's .safetensors and .json files' names, sizes and modification times."""
+    h = hashlib.sha1()
+    for p in sorted(list(d.glob('*.safetensors')) + list(d.glob('*.json'))):
+        s = p.stat()
+        h.update(f'{p.name} {s.st_size} {s.st_mtime_ns}\n'.encode())
+    return h.hexdigest()[:16]
 
 
 def source():
-    """The checkpoint a layer's records match: its .safetensors and .json files' names, sizes and modification times."""
+    """The checkpoint a layer's records match."""
     if not _source:
-        h = hashlib.sha1()
-        d = _model_dir()
-        for p in sorted(list(d.glob('*.safetensors')) + list(d.glob('*.json'))):
-            s = p.stat()
-            h.update(f'{p.name} {s.st_size} {s.st_mtime_ns}\n'.encode())
-        _source.append(h.hexdigest()[:16])
+        _source.append(checkpoint_id(_model_dir()))
     return _source[0]
+
+
+def cold_only():
+    """The marker of a checkpoint whose experts' bytes tools/cold_punch.py took out, or None. Its files must be the ones
+    it punched (a new download over the old one leaves a stale marker)."""
+    if not _marker:
+        d = _model_dir()
+        marker = json.loads((d / MARKER).read_text()) if (d / MARKER).exists() else None
+        if marker is not None:
+            for name, (size, mtime) in marker['files'].items():
+                s = (d / name).stat()
+                if (s.st_size, s.st_mtime_ns) != (size, mtime):
+                    raise RuntimeError(f'xtier cold: {d / name} changed since tools/cold_punch.py punched it (or it did '
+                                       f'not finish): tools/cold_punch.py {d} --restore, or remove {MARKER} if this is '
+                                       'a new download')
+        _marker.append(marker)
+    return _marker[0]
+
+
+def only_in_store(layer_id):
+    """Whether the checkpoint no longer holds the bytes of layer_id's experts."""
+    marker = cold_only()
+    return marker is not None and str(layer_id) in marker['layers']
+
+
+def require_checkpoint(layer_id):
+    """A layer about to load from anything but the store: stops the start if its experts are only in the store."""
+    if only_in_store(layer_id):
+        marker = cold_only()
+        raise RuntimeError(
+            f'xtier cold: layer {layer_id}: the checkpoint no longer holds its experts ({MARKER}; they would read as '
+            f'zeros) and it cannot load from the store. It needs XTIER_COLD=1, XTIER_FAST_LOAD=1, a partly cached layer '
+            f"and the records: XTIER_COLD_PATHS={':'.join(marker['paths'])}, store {marker['key']}. "
+            f'tools/cold_punch.py {_model_dir()} --restore writes the experts back.')
 
 
 class Store:
@@ -104,10 +152,13 @@ class Store:
                 manifest = json.loads(self.manifest_path.read_text())
             except ValueError:
                 manifest = None
-                logger.warning('xtier cold: unreadable manifest %s, writing every layer again', self.manifest_path)
+                logger.warning('xtier cold: unreadable manifest %s', self.manifest_path)
             if manifest is not None and manifest.get('version') == 2:
                 self.manifest = manifest
             else:   # version 1 (a whole record on one drive) or unreadable: the files start again
+                if cold_only() is not None:
+                    raise RuntimeError(f'xtier cold: {self.manifest_path} is not usable and these records are the only '
+                                       'copy of the experts: nothing is rewritten')
                 for p in self.paths:
                     p.unlink(missing_ok=True)
                 logger.info('xtier cold: store %s has another layout, writing every layer again', key)
@@ -168,6 +219,7 @@ class LayerPlan:
         self.stored = rank
         self.half_life = _float('XTIER_COLD_HALF_LIFE', 50)
         self.gpu_slots = max(0, int(gpu_slots))   # the GPU pool starts with the top of the ranking (pool.fill)
+        self.reads = []   # where the loader's expert tensors lie in the checkpoint files (direct.locate; save_ranges)
 
 
 def _drive_parts(nodes, drives):
@@ -177,13 +229,18 @@ def _drive_parts(nodes, drives):
     counts = [int(c) for c in spec.split(':')] if spec else [nodes // drives + (d < nodes % drives) for d in range(drives)]
     if len(counts) != drives or sum(counts) != nodes or min(counts) < 1:
         raise RuntimeError(f'xtier cold: XTIER_COLD_PARTS={spec} needs {drives} counts of at least 1 summing to {nodes}')
+    return counts, hand_out(counts)
+
+
+def hand_out(counts):
+    """Per node part, its drive, from the node parts per drive."""
     left, drive_of, d = list(counts), [], 0
-    while len(drive_of) < nodes:
+    while len(drive_of) < sum(counts):
         if left[d]:
             drive_of.append(d)
             left[d] -= 1
-        d = (d + 1) % drives
-    return counts, drive_of
+        d = (d + 1) % len(counts)
+    return drive_of
 
 
 def _pieces(inputs, e, node, nodes, H, I, group):
@@ -221,7 +278,7 @@ def _key(E, H, I, scale_format, nodes):
     return os.environ.get('XTIER_COLD_KEY') or f'{_model_name()}-E{E}-H{H}-I{I}-{scale_format}-n{nodes}'
 
 
-def _where(drive_of, counts, part):
+def where_records(drive_of, counts, part):
     share = [c * part for c in counts]   # a record's bytes on each drive
     rank_in = [drive_of[:n].count(drive_of[n]) for n in range(len(drive_of))]   # a part's place among its drive's parts
 
@@ -242,16 +299,21 @@ def _nodes(threads):
 
 def loadable(lp, hidden, inter, scale_format, threads):
     """Whether the store holds layer lp's records as attach wrote or checked them from this checkpoint: the layer can
-    leave its expert tensors unread and fill its RAM slots from the store (attach_loaded)."""
+    leave its expert tensors unread and fill its RAM slots from the store (attach_loaded). A changed ranking moves the
+    RAM slots, not the records: lp takes their order from the manifest. A layer only in the store has no checkpoint
+    bytes to match (its files are checked by cold_only, the model's .json files may change)."""
     nodes = _nodes(threads)
     _, _, record = _layout(hidden, inter, nodes, scale_format)
     st = store(_key(lp.experts, hidden, inter, scale_format, nodes))
     counts, _ = _drive_parts(nodes, len(st.paths))
     with st.lock:
         entry = st.manifest['layers'].get(str(lp.layer_id))
-        return (entry is not None and entry.get('source') == source() and entry.get('record') == record
-                and entry.get('stored') == lp.stored and len(entry.get('starts', [])) == len(st.paths)
-                and entry.get('parts', counts) == counts)
+        ok = (entry is not None and (entry.get('source') == source() or only_in_store(lp.layer_id))
+              and entry.get('record') == record and sorted(entry.get('stored', [])) == sorted(lp.stored)
+              and len(entry.get('starts', [])) == len(st.paths) and entry.get('parts', counts) == counts)
+        if ok:
+            lp.stored = entry['stored']
+        return ok
 
 
 class _Ticket:
@@ -273,7 +335,7 @@ def attach_loaded(plan, lp, scale_format):
     sizes, part, record = _layout(H, I, nodes, scale_format)
     st = store(_key(E, H, I, scale_format, nodes))
     counts, drive_of = _drive_parts(nodes, len(st.paths))
-    where = _where(drive_of, counts, part)
+    where = where_records(drive_of, counts, part)
     t0 = time.time()
     with st.lock:
         starts = st.manifest['layers'][str(lp.layer_id)]['starts']
@@ -294,7 +356,7 @@ def attach(plan, lp, inputs, scale_format):
     D = len(st.paths)
     counts, drive_of = _drive_parts(nodes, D)
     share = [c * part for c in counts]   # a record's bytes on each drive
-    where = _where(drive_of, counts, part)
+    where = where_records(drive_of, counts, part)
     key = str(lp.layer_id)
     t0 = time.time()
     with st.lock:
@@ -374,6 +436,7 @@ def _attach(plan, lp, st, starts, where, sizes, part, nodes, record, how, t0):
     if _layers:
         _layers[-1][2].next = pc   # read ahead by the previous layer's calls (layers attach in model order)
     _layers.append((lp.layer_id, plan, pc, record))
+    _ranges[lp.layer_id] = (sizes, E, lp.reads)
     _start_reporter()
     logger.info('xtier cold: layer %d: %d of %d experts in RAM, %d records (%.1f GB) on %d drives %s in %.1f s',
                 lp.layer_id, plan.slots, E, len(lp.stored), len(lp.stored) * record / 1e9, len(st.paths), how,
@@ -382,7 +445,34 @@ def _attach(plan, lp, st, starts, where, sizes, part, nodes, record, how, t0):
 
 
 _layers = []         # (layer id, plan, PrefillCold, record bytes) of every layer with cold experts
+_ranges = {}         # layer id -> (piece bytes per node part, experts, LayerPlan.reads), until save_ranges
 _reporter = None
+
+
+def save_ranges():
+    """After loading: where this start's cold layers' expert tensors lie in the checkpoint files, next to the manifest
+    (KEY.ranges, for tools/cold_punch.py), unless the checkpoint is already punched. A layer not all of whose tensors
+    are bytes of the records in a file (with tensor parallelism, say) is left out: it stays in the checkpoint."""
+    if _store is None or not _ranges:
+        return
+    try:
+        if cold_only() is None:
+            names = {str(p.resolve()): p.name for p in _model_dir().glob('*.safetensors')}
+            files, layers = {}, {}
+            for layer_id, (sizes, experts, reads) in _ranges.items():
+                if len(reads) == 6 * experts and all(r and r[5] is None and r[2] in names for r in reads):
+                    layers[str(layer_id)] = dict(sizes=sizes, reads=[
+                        (r[0], r[1], files.setdefault(names[r[2]], len(files)), r[3], r[4]) for r in reads])
+            path = _store.manifest_path.with_suffix('.ranges')
+            with open(f'{path}.tmp', 'w') as f:
+                f.write(json.dumps(dict(source=source(), files=list(files), layers=layers)))
+            os.replace(f'{path}.tmp', path)
+            logger.info('xtier cold: noted the expert tensors of %d of %d layers in %s', len(layers), len(_ranges), path)
+    except OSError as e:   # only tools/cold_punch.py needs them
+        logger.warning('xtier cold: where the expert tensors lie was not saved: %s', e)
+    for _, _, reads in _ranges.values():
+        reads.clear()
+    _ranges.clear()
 
 
 def _start_reporter():

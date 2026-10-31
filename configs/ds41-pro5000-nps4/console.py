@@ -6,9 +6,8 @@ from pathlib import Path
 from xtier.console.core import common_options, elastic_option, miss_env, miss_option
 
 HERE = Path(__file__).resolve().parent
-# the cold-expert store (XTIER_COLD): Optane x2, 990 PRO, FX700, in this order (the manifest is in the first)
-COLD_PATHS = ['/data/fast/p5800x1/xtier-cold', '/data/fast/p5800x2/xtier-cold', '/data/fast/nvme1/xtier-cold',
-              '/data/fast/ds41/xtier-cold']
+# the cold-expert store (XTIER_COLD): four PCIe 5.0 drives (the manifest is in the first)
+COLD_PATHS = [f'/data/fast/cold{i}/xtier-cold' for i in (1, 2, 3, 4)]
 
 MODEL = {
     'id': 'ds41', 'order': 30,
@@ -28,19 +27,19 @@ MODEL = {
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '22528',
          'choices': [['22528', '22K'], ['20480', '20K'], ['16384', '16K']]},
         {'key': 'cold', 'label': '冷专家卸载', 'default': 'off',
-         'choices': [['off', '关'], ['10', '10% · 29 GB 放硬盘'], ['20', '20% · 58 GB 放硬盘'], ['30', '30% · 87 GB 放硬盘']],
-         'hint': '内存只放 70–90% 的专家，其余放在 4 块 NVMe 上、用到时读回（模拟内存不够；10-26 实测见 docs/reports）',
+         'choices': [['off', '关'], ['10', '10% · 27 GiB 放硬盘'], ['20', '20% · 54 GiB 放硬盘'], ['30', '30% · 81 GiB 放硬盘']],
+         'hint': '内存只放 70–90% 的专家，其余放在 4 块 NVMe 上、用到时读回（模拟内存不够；11-01 实测见 docs/reports）',
          'unavailable': lambda: {} if all(Path(p).is_dir() for p in COLD_PATHS)
          else {c: '本机没有冷专家盘目录' for c in ('10', '20', '30')}},
         miss_option([{'cold': c} for c in ('10', '20', '30')]),   # not on layers with cold experts
     ],
-    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'},
+    'notes': [{'when': {'packs': 'off'}, 'text': '基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'},
               {'when': {'cold': '10'}, 'warn': True,
-               'text': '冷专家 10%：29 GB 专家放 4 块 NVMe；实测 decode 每步约 −7%，长 prefill 约 −2%，增量 prefill 持平'},
+               'text': '冷专家 10%：27 GiB 专家放 4 块 NVMe；实测 decode 约 −5%，长 prefill 约 −12%，增量 prefill 首字约 1.1 s（不卸载 0.8 s）'},
               {'when': {'cold': '20'}, 'warn': True,
-               'text': '冷专家 20%：58 GB 专家放 4 块 NVMe；实测 decode 约 −19%，长 prefill 约 −3%，增量 prefill 约 −14%'},
+               'text': '冷专家 20%：54 GiB 专家放 4 块 NVMe；实测 decode 约 −13%，长 prefill 约 −13%，增量 prefill 首字约 1.1 s（不卸载 0.8 s）'},
               {'when': {'cold': '30'}, 'warn': True,
-               'text': '冷专家 30%：87 GB 专家放 4 块 NVMe；实测 decode 约 −31%，长 prefill 约 −10%，增量 prefill 约 −27%'}],
+               'text': '冷专家 30%：81 GiB 专家放 4 块 NVMe；实测 decode 约 −21%，长 prefill 约 −13%，增量 prefill 首字约 1.3–1.7 s（不卸载 0.8 s）'}],
 }
 
 
@@ -49,7 +48,7 @@ def build(o, port):
     env = {'XTIER_THREADS': o['threads'], 'PORT': str(port), 'DSPARK': '1' if o['spec'] == 'on' else '0',
            'CONTEXT': o['context'], 'BATCH': o['chunk'], 'XTIER_CACHE_SLOTS': o['slots'],
            'XTIER_ENGRAM_CACHE_GIB': o['engram']}
-    if o['packs'] == 'off':   # README "官方 main": Triton block FP8 without tuned configs, no prefetch / FP8 draft head
+    if o['packs'] == 'off':   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
                    XTIER_DRAFT_LMHEAD_FP8='0')
     elif o['elastic'] == 'on':   # past ~66 slots the GPU side of a layer is the slower one (planner, 10-26)

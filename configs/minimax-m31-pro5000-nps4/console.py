@@ -24,7 +24,7 @@ MODEL = {
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '16384', 'choices': [['16384', '16K'], ['8192', '8K']]},
         elastic_option('off', '一档额外槽 1.69 GiB，decode 时空闲显存只够 +3 档：命中 0.245 → 0.285，agent 每步持平（10-26），默认关'),
     ],
-    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：只保留在 SM120 上跑起来必需的修正，草稿长度用检查点的 7'}],
+    'notes': [{'when': {'packs': 'off'}, 'text': '基线：只保留在 SM120 上跑起来必需的修正，草稿长度用检查点的 7'}],
 }
 
 
@@ -37,7 +37,7 @@ def build(o, port):
     """(environment additions, argv) for validated options o."""
     env = {'XTIER_THREADS': o['threads'], 'PORT': str(port), 'CONTEXT': '524288', 'BATCH': o['chunk'],
            'XTIER_CACHE_SLOTS': o['slots'], 'DSPARK': '1' if o['spec'] == 'on' else '0', 'GAMMA': o['gamma']}
-    if o['packs'] == 'off':   # README "官方 main": the SM120 fixes only (packs/minimax_m3), the checkpoint's draft length
+    if o['packs'] == 'off':   # README "基线": the SM120 fixes only (packs/minimax_m3), the checkpoint's draft length
         env.update(XTIER_DRAFT_LMHEAD_FP8='0', XTIER_MXFP8_B12X_ROWS='', GAMMA='7', XTIER_DSPARK_TRUNCATE='0')
     elif o['elastic'] == 'on':
         env['XTIER_CACHE_ELASTIC'] = '1'

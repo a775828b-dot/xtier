@@ -10,9 +10,8 @@ from pathlib import Path
 from xtier.console.core import common_options, elastic_option
 
 HERE = Path(__file__).resolve().parent
-# the cold-expert store of the DS card (XTIER_COLD): Optane x2, 990 PRO, FX700, in this order (the manifest is in the first)
-COLD_PATHS = ['/data/fast/p5800x1/xtier-cold', '/data/fast/p5800x2/xtier-cold', '/data/fast/nvme1/xtier-cold',
-              '/data/fast/ds41/xtier-cold']
+# the cold-expert store of the DS card (XTIER_COLD): four PCIe 5.0 drives (the manifest is in the first)
+COLD_PATHS = [f'/data/fast/cold{i}/xtier-cold' for i in (1, 2, 3, 4)]
 
 MODEL = {
     'id': 'ds41mini', 'order': 31,
@@ -30,7 +29,7 @@ MODEL = {
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '8192', 'choices': [['8192', '8K · 实测'], ['4096', '4K']]},
         elastic_option('on', 'decode 时把 prefill 才用的显存借给热专家（32 GB 里常驻只放 4 槽），prefill 前还回'),
     ],
-    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'}],
+    'notes': [{'when': {'packs': 'off'}, 'text': '基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'}],
 }
 
 
@@ -40,7 +39,7 @@ def build(o, port):
            'CONTEXT': '131072', 'BATCH': o['chunk'], 'XTIER_CACHE_SLOTS': o['slots'], 'XTIER_ENGRAM_CACHE_GIB': '2',
            'MEM': '0.95', 'XTIER_COLD': '1', 'XTIER_COLD_PATHS': ':'.join(COLD_PATHS),
            'XTIER_COLD_FRACTION': f"0.{o['cold']}", 'XTIER_SIM_VRAM_MIB': '32000', 'XTIER_SIM_HOST_MAX': '128G'}
-    if o['packs'] == 'off':   # README "官方 main": Triton block FP8 without tuned configs, no prefetch / FP8 draft head
+    if o['packs'] == 'off':   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
                    XTIER_DRAFT_LMHEAD_FP8='0')
     elif o['elastic'] == 'on':

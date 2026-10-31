@@ -34,7 +34,7 @@ MODEL = {
         elastic_option('on', 'decode 时每层多约 12–14 槽（prefill 余量约 6.6 GiB），agent 每步 −1.5%（10-26）'),
         miss_option(),
     ],
-    'notes': [{'when': {'packs': 'off'}, 'text': '官方 main 基线：BF16 权重、55 槽、不开拒绝采样'}],
+    'notes': [{'when': {'packs': 'off'}, 'text': '基线：BF16 权重、55 槽、不开拒绝采样'}],
 }
 
 

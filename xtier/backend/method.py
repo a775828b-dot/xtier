@@ -139,12 +139,14 @@ class XTierMoEMethod(FusedMoEMethodBase):
             return False   # global scales: through the loader
         if self._source is None:
             self._source = self._choose_source(layer)
+        lp = self._cold_plan
+        if lp is not None and None not in lp.reads[-1:]:   # where it lies: cold.save_ranges (a tensor not in a file ends it)
+            lp.reads.append(self._locate(layer, name, w, shard, expert))
         if self._source == 'store':
             return True
         if self._source != 'direct':
             return False
-        read = direct.locate(self.format.bulk.index(name), shard, expert, w, self.hidden, self.inter, self.experts,
-                             self.format.name, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
+        read = self._locate(layer, name, w, shard, expert)
         if read is None:
             if self._reads:   # the reads' [gate; up] rows and a loader's [up; gate] rows must not mix in one layer
                 raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: {name} of expert {expert} ({shard}) cannot be '
@@ -159,14 +161,24 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self._reads.append(read)
         return True
 
+    def _locate(self, layer, name, w, shard, expert):
+        return direct.locate(self.format.bulk.index(name), shard, expert, w, self.hidden, self.inter, self.experts,
+                             self.format.name, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
+
     def _choose_source(self, layer):
         from xtier.cache import cold
+        source = self._pick_source(cold)
+        if source != 'store' and not self.cfg.draft:
+            cold.require_checkpoint(self.cfg.layer_id)
+        return source
+
+    def _pick_source(self, cold):
         if os.environ.get('XTIER_PREFILL_FROM_SHARDS', '1') != '1':
             return 'copy'   # the prefill copies the inputs then
         if cold.enabled() and not self.cfg.draft and 0 < self.cfg.cache_slots < self.experts:
-            lp = cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
-            if cold.load_enabled() and cold.loadable(lp, self.hidden, self.inter, self.format.name, self.cfg.threads):
-                self._cold_plan = lp
+            self._cold_plan = cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
+            if cold.load_enabled() and cold.loadable(self._cold_plan, self.hidden, self.inter, self.format.name,
+                                                     self.cfg.threads):
                 return 'store'
             return 'copy'   # attach writes or checks the records from the loaded experts
         if direct.enabled():

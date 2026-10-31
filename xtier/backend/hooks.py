@@ -47,7 +47,9 @@ def install(registry, hook_type):
 
     def after_load(result, model_runner, *args, **kwargs):
         from xtier.backend import direct
+        from xtier.cache import cold
         direct.close()   # XTIER_FAST_LOAD: every layer's reads done and checked, then the readers go
+        cold.save_ranges()
         check(model_runner)
         return result
 
