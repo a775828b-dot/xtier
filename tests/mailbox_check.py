@@ -80,3 +80,4 @@ for m in range(1, 9):
 box.close()
 plan.close()
 print('MAILBOX-CHECK', 'PASS' if not bad else f'FAIL ({bad} sizes)')
+sys.exit(0 if not bad else 1)

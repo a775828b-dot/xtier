@@ -59,3 +59,4 @@ for n, k in SHAPES:
     print(f'N={n:5d} K={k:5d}: decode rel {worst:.2e}, graph replays {"bitwise" if replay_ok else "DIFFERENT"}, '
           f'W8A8 prefill rel {e_w8a8:.2e}, dequant prefill rel {e_deq:.2e} -> {"ok" if ok else "FAIL"}', flush=True)
 print('FP8-WEIGHTS-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

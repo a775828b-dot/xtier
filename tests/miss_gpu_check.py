@@ -150,3 +150,4 @@ for share in [float(s) for s in A.shares.split(',')]:
 box.close()
 plan.close()
 print('MISS-GPU-CHECK', 'PASS' if not bad else f'FAIL ({bad} cases)')
+sys.exit(0 if not bad else 1)

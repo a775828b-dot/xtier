@@ -142,3 +142,4 @@ for plan, _, _ in layers:
     plan.close()
 full.close()
 print('COLD-PREFILL-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

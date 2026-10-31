@@ -84,3 +84,4 @@ for alpha, beta, label in ((ALPHA, BETA, f'GPT-OSS alpha {ALPHA} beta {BETA}'), 
         print(f'{label}, m={m}: rel L2 {err:.2e} over {len(rows)} tokens{"" if ok else " FAIL"}', flush=True)
 plan.close()
 print('SWIGLU-OAI-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

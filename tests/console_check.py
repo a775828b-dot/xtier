@@ -186,4 +186,14 @@ assert sizes == sorted(sizes) and all(b['model'] == 'Some-Model' and b['max_toke
                                      and 0 < b['top_p'] < 1 and b['temperature'] > 0 for _, b in seen), seen
 assert 'HTTP Error 500' in core.warm_up(fake.server_address[1], 'Some-Model', deadline)
 fake.shutdown()
+# a warm-up that takes the server down (out of memory, a crash) is not a server that is ready
+alive = iter((True, False))
+console.active = lambda state: next(alive)
+health, warm = core.health, core.warm_up
+core.health, core.warm_up = (lambda port: True), (lambda *a: 'the connection dropped')
+log = Path(tempfile.mkdtemp(prefix='xtier-console-')) / 'server.log'
+log.write_text('mem_guard: killing\n')
+ok, why = console.wait_ready(dict(port=1, served='Some-Model', log=str(log)), 60)
+core.health, core.warm_up = health, warm
+assert not ok and '预热' in why, (ok, why)
 print(f'console ok: {len(models)} models, {combos} option combinations built, warm-up requests checked')

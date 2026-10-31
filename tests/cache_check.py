@@ -100,3 +100,4 @@ for m in range(1, 9):
 box.close()
 plan.close()
 print('CACHE-CHECK', 'PASS' if not bad else f'FAIL ({bad} cases)')
+sys.exit(0 if not bad else 1)

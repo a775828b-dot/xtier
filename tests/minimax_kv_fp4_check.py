@@ -180,3 +180,4 @@ oks = [check_layout(), check_decode([4000, 2500, 1300]), check_decode([8000]), c
        check_prefill([0], [1500]), check_prefill([1000], [500]), check_prefill([0, 300], [900, 600]),
        check_prefill([5000], [3000]), check_store()]
 print('MINIMAX-KV-FP4-CHECK', 'PASS' if all(oks) else 'FAIL')
+sys.exit(0 if all(oks) else 1)

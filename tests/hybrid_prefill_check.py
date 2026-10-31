@@ -83,3 +83,4 @@ for m in map(int, A.lengths.split(',')):
 box.close()
 plan.close()
 print('HYBRID-PREFILL-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

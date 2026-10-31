@@ -97,3 +97,4 @@ if A.qwen:
                  lambda rr: ple_table(A.qwen, '', torch.float8_e4m3fn, dim, rows, len(names), A.cache_mib << 20,
                                       rr)[0], rows, False)
 print('TABLES-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

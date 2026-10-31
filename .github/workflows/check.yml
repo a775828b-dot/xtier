@@ -1,0 +1,14 @@
+name: check
+on: [push, pull_request]
+jobs:
+  repo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/repo_check.py
+      - run: pip install numpy
+      - run: python tests/console_check.py
+      - run: python tests/planner_check.py

@@ -63,3 +63,4 @@ for rows in (1, 2, 3, 4, 5, 8, 12, 16):
     print(f'rows {rows:2d}: max rel L2 {max(errs):.2e}{"" if ok else " FAIL"}, SGLang {times[0]:.1f} us, '
           f'overlap {times[1]:.1f} us per call (CUDA graph)', flush=True)
 print('HC-MIX-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

@@ -48,14 +48,13 @@ INITIAL_STATE = torch.randn(8, C, S, device='cuda').bfloat16()
 class Pool:
     def __init__(self):
         self.cache = INITIAL_STATE.clone()   # the same incoming state for both implementations
-
-    def short_conv_layer_cache(self, layer_id):
-        return self.cache
+        view = SimpleNamespace(layer_cache=lambda layer_id: self.cache, layer_intermediate_cache=lambda layer_id: None)
+        self.layer_router = SimpleNamespace(read=lambda layer_id, part: SimpleNamespace(view=view, view_layer_id=layer_id))
 
 
 def run(fn, hidden, embeddings, track_offset):
     pool = Pool()
-    qwen4_exp.get_req_to_token_pool = lambda: pool
+    qwen4_exp.get_token_to_kv_pool = lambda: pool
     qwen4_exp._ple_track_targets = (lambda fb, b: None) if track_offset is None else (
         lambda fb, b: (torch.tensor([5], device='cuda'), torch.tensor([track_offset], device='cuda')))
     T = hidden.shape[0]

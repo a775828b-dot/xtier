@@ -1,6 +1,8 @@
 """Prefill of a fully cached layer (xtier/cache/prefill.py, packed slots in place) against the GPU prefill through its
-staging (device copies from the slots) and BF16 unpack (backend/prefill.py) on one real layer: relative L2 error (the
-route sums run in a different FP32 order) and time per call.
+staging (device copies from the slots) and BF16 unpack (backend/prefill.py) on one real layer: relative L2 error and time
+per call. The two compute differently: the cached path's activation is 16-bit between gate and down (W4A16, as decode:
+BF16 with MXFP4, FP16 with NVFP4), the staged path's FP32, read by the tensor cores in XTIER_DOWN_PRECISION. Here the
+staged path's down runs in BF16, the closest it gets: 1e-4 to 2e-4 (its default tf32x3: 2.5e-3).
 
   python tests/resident_prefill_check.py --preset qwen38 --lengths 100,1000,4096,8192
 """
@@ -18,11 +20,11 @@ P = argparse.ArgumentParser()
 P.add_argument('--preset', choices=sorted(PRESETS), required=True)
 P.add_argument('--threads', type=int, default=16)
 P.add_argument('--lengths', default='100,1000,4096,8192')
-P.add_argument('--tolerance', type=float, default=1e-4)
+P.add_argument('--tolerance', type=float, default=3e-4)
 A = P.parse_args()
 MODEL, KEY, NAMES, H, I, E, K, LIMIT, LAYER, VM, FMT, SWITCHES = PRESETS[A.preset]
 for name, value in dict(PREFILL_EXPERT_CHUNK='32', PREFILL_ROUTE_ACCUM='1', PREFILL_UNPACK='1',
-                        GPU_PREFILL_CHUNK='8192').items():
+                        GPU_PREFILL_CHUNK='8192', DOWN_PRECISION='bf16').items():
     os.environ.setdefault('XTIER_' + name, value)
 
 import torch  # noqa: E402
@@ -84,3 +86,4 @@ for m in map(int, A.lengths.split(',')):
 prefill.close()
 plan.close()
 print('RESIDENT-PREFILL-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

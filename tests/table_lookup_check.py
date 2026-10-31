@@ -120,3 +120,4 @@ if A.qwen:
                    lambda ids: ple_reference(store, ids, dim), ((1, 16), (8, 16), (600, 16)), (4, 16))
         store.close()
 print('TABLE-LOOKUP-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)

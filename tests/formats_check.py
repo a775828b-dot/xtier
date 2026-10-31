@@ -59,3 +59,4 @@ for up_first in (False, True):
     print(f'{A.preset} ({FMT}), loaded {"[up; gate]" if up_first else "[gate; up]"}: '
           f'{"engine inputs byte for byte" if not bad else "DIFFERENT"}', flush=True)
 print('FORMATS-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
+sys.exit(0 if not bad else 1)
