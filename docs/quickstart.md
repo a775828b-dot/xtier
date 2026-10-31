@@ -85,7 +85,9 @@ DATA=$DATA configs/qwen38-rtx4090-3090/run-qwen.sh > $DATA/qwen.log 2>&1 &
 tail -f $DATA/qwen.log
 ```
 
-看到 `The server is fired up` 就可以用了。第一次要先编译内核（日志停在 `building FlashInfer modules`），再加上加载权重，一共要几分钟到十几分钟；之后启动快得多。
+看到 `The server is fired up` 就可以用了。第一次要先编译内核（日志停在 `building FlashInfer modules`），再加载权重，实测约 6 分钟（其中编译 1 分钟），之后约 3 分钟，硬盘和 CPU 慢的机器会更久。
+
+**用代理上网的话（设了 `http_proxy`）**，启动前先 `export no_proxy=127.0.0.1,localhost`，否则服务发给自己的请求和下面的 curl 都会走代理，返回 502 或空内容。
 
 默认每层 48 个热专家槽、128K 上下文、端口 30000。两张卡加 `TP=2 CUDA_VISIBLE_DEVICES=0,1`，开投机解码加 `MTP=1`，其余见[配置说明](../configs/qwen38-rtx4090-3090/README.md)。
 
@@ -99,7 +101,7 @@ curl -s http://127.0.0.1:30000/v1/chat/completions -H 'Content-Type: application
 }'
 ```
 
-返回 JSON，`choices[0].message` 里有回答就通了。服务是 OpenAI 兼容接口，地址 `http://127.0.0.1:30000/v1`，客户端都能接。
+第一次请求要等半分钟左右（还有内核要现编），之后就快了。返回 JSON，`choices[0].message` 里有回答就通了（思考过程在 `reasoning_content`）。服务是 OpenAI 兼容接口，地址 `http://127.0.0.1:30000/v1`，客户端都能接。
 
 ## 6. 确认结果是对的（可选，约 2 分钟）
 

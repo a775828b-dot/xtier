@@ -49,7 +49,7 @@ with cf.ThreadPoolExecutor(A.concurrency) as ex:
         o = out.strip('\n')
         if o.startswith('```'):
             o = o.split('\n', 1)[1].rsplit('```', 1)[0].strip('\n')
-        src = c
+        src = c.strip('\n')   # as the output: a window can start or end on an empty line
         if A.ignore_first_indent:
             src, o = src.lstrip(' '), o.lstrip(' ')
         diffs = [op for op in difflib.SequenceMatcher(None, src, o, autojunk=False).get_opcodes() if op[0] != 'equal']

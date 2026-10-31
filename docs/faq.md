@@ -30,6 +30,10 @@ FlashInfer 的内核在加载权重之前编译，好过在第一个请求里现
 
 一般是 `ninja` 变了：FlashInfer 靠 ninja 判断要不要重编，虚拟环境里的 ninja 和系统的版本不同，切换一次就全部重编。启动服务时 `PATH` 要保持一致，不要有时激活虚拟环境、有时不激活。
 
+### 日志有 `post-warmup freeze_gc failed`，请求返回 502 或空内容
+
+环境里设了 `http_proxy`：服务发给自己的请求和本机的 curl 都走了代理。启动服务和发请求之前 `export no_proxy=127.0.0.1,localhost`。
+
 ## 内存和显存
 
 ### 日志有 `mem_guard: MemAvailable ... killing process group`

@@ -85,7 +85,9 @@ DATA=$DATA configs/qwen38-rtx4090-3090/run-qwen.sh > $DATA/qwen.log 2>&1 &
 tail -f $DATA/qwen.log
 ```
 
-It is ready at `The server is fired up`. The first start compiles kernels first (the log stays at `building FlashInfer modules`) and then loads the weights: several minutes to over ten in all; later starts are much faster.
+It is ready at `The server is fired up`. The first start compiles kernels first (the log stays at `building FlashInfer modules`) and then loads the weights: about 6 minutes here (1 of them compiling), then about 3 on later starts, longer with slower disks and CPUs.
+
+**Behind a proxy (`http_proxy` set)**, run `export no_proxy=127.0.0.1,localhost` before starting; otherwise the server's requests to itself and the curl below go through the proxy and return 502 or nothing.
 
 Defaults: 48 hot-expert slots per layer, 128K context, port 30000. For two GPUs add `TP=2 CUDA_VISIBLE_DEVICES=0,1`, for speculative decoding `MTP=1`; the rest is in the [configuration notes](../configs/qwen38-rtx4090-3090/README.md).
 
@@ -99,7 +101,7 @@ curl -s http://127.0.0.1:30000/v1/chat/completions -H 'Content-Type: application
 }'
 ```
 
-If the JSON has an answer in `choices[0].message`, it works. The API is OpenAI-compatible at `http://127.0.0.1:30000/v1`, so any client can connect.
+The first request takes about half a minute (some kernels still compile), later ones are quick. If the JSON has an answer in `choices[0].message`, it works (the reasoning is in `reasoning_content`). The API is OpenAI-compatible at `http://127.0.0.1:30000/v1`, so any client can connect.
 
 ## 6. Check the results (optional, about 2 minutes)
 
@@ -125,6 +127,7 @@ The [FAQ](faq.md) is in Chinese, but its headings quote the log messages, so you
 | `hooks not applied`, `has no run_scheduler_process` | This SGLang does not match XTier, so the server stops instead of silently losing the speedups. Same fix |
 | `settings XTier does not know are ignored` | A misspelled or removed `XTIER_*` setting, see [xtier/config.py](../xtier/config.py) |
 | `building FlashInfer modules` | Normal on a first start. If it happens on every start, the `ninja` in `PATH` keeps changing (a venv's and the system's): keep `PATH` the same |
+| `post-warmup freeze_gc failed`, a 502 or an empty answer | `http_proxy` is set: `export no_proxy=127.0.0.1,localhost` |
 | `mem_guard: MemAvailable ... killing process group` | Host memory ran low; `largest` names the biggest processes. See [cold experts](README.en.md#cold-experts-on-nvme) if the model does not fit |
 | `the checkpoint no longer holds its experts` | The checkpoint was punched by `tools/cold_punch.py` and can only load from the cold store: needs `XTIER_COLD=1`, `XTIER_FAST_LOAD=1` and the same `XTIER_COLD_PATHS`. `--restore` writes the experts back |
 
