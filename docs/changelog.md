@@ -2,6 +2,13 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-01（v0.1.0）：全面代码审计后的修复。稳定性：DeepSeek 的 CUTLASS 内核在加载权重前编译（不再在第一个请求里现编、被内存守护杀掉）；换槽序号回绕；split
+  prefill、混合 prefill、冷专家写盘的线程报错不再被吞；专家没加载全、钩子没生效、调度入口改名都在启动时报错；未知的 `XTIER_*` 启动时警告；测试 FAIL 一律非零退出，加
+  `tools/repo_check.py` 和 CI。查明同一提示词重算 logprob 摆动来自 top-k 输出顺序，不是 bug；几项换槽参数和提示词预热 A/B 没有收益，默认不变。详见[文档](reports/2026-11-01-audit-fixes.md)。
+  冷专家：池子换到 4 块 PCIe 5.0 盘，DeepSeek 卸载 10 / 20 / 30 / 40 / 50% 时 decode 每步 31.6 / 34.4 / 37.9 / 44.5 / 53.5 ms（不卸载 30.0）；`tools/cold_punch.py` 让大模型的专家只存一份
+  （逐字节核对后在模型文件里打洞，DeepSeek 的副本 290 → 21 GiB，`--restore` 写回）。详见[文档](reports/2026-11-01-cold-pcie5.md)。
+  文档：新增[文档目录](README.md)、[快速开始](quickstart.md)（从空机器到第一次请求，新环境实跑过）、[支持情况](support.md)（实际验证到什么程度）、[常见问题](faq.md)、[发布前检查清单](release-checklist.md)和英文版 [README](README.en.md)、[快速开始](quickstart.en.md)；
+  `constraints.txt` 固定依赖版本，`tools/check_sglang.py --strict`；测速表的“官方 main”改叫“基线”，它带着 XTier 的混合推理，不是原版 SGLang。
 - 2026-10-31：第二张卡可以不放模型、纯当热专家池（可选，`XTIER_GPU2_SLOTS=N|auto`，默认关；`TP=1`），给显存或速度不一样的两张卡用：
   主卡不变，信箱调度线程把主卡没命中、第二张卡有的专家交给它，结果经内存加回 CPU 输出，每次调用分给它多少专家自动调整。双 RTX 4090
   模拟 24 + 16 GiB：Qwen3.8 decode 57.3 / 55.9 tok/s（32K / 120K），同样配置的 TP 51.1 / 49.4，单卡 41.0 / 43.6；第二张卡约慢 1.2 倍时
