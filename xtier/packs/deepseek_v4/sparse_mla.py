@@ -3,7 +3,7 @@ FlashMLA.
 
 Off SM100 SGLang keeps DeepSeek V4's KV layout (per token 448 FP8 E4M3 values with one UE8M0 scale per 64, then the 64
 rope values in BF16) and its DeepSeek V4 backend sends every attention call (decode, DSpark verify, prefill) to
-``sgl_kernel.flash_mla.flash_mla_with_kvcache``, prefill chunks above _LARGE_INDEXER_QUERY_THRESHOLD tokens to
+``sglang.kernels.ops.attention.flash_mla_interface.flash_mla_with_kvcache`` (the sgl-flash-mla wheel), prefill chunks above _LARGE_INDEXER_QUERY_THRESHOLD tokens to
 ``flash_mla_sparse_fwd`` instead; only SM120 goes to FlashInfer's SM120 kernels (flash_mla_sm120). FlashMLA is built
 for SM90 / SM100 / SM103 only. SGLang's Triton fallback for SM120 (flash_mla_sm120_triton) runs one program per query
 row and head and rounds the window's and the compressed keys' partial outputs to BF16 before it merges them and applies
@@ -218,7 +218,7 @@ def sparse_mla(q, k_cache, indices, topk_length, attn_sink, softmax_scale, extra
 
 
 def flash_mla_with_kvcache(original, *args, **kwargs):
-    """AROUND hook of sgl_kernel.flash_mla.flash_mla_with_kvcache (registered below SM90): the DeepSeek V4 backend's
+    """AROUND hook of flash_mla_interface.flash_mla_with_kvcache (registered below SM90): the DeepSeek V4 backend's
     sparse FP8 calls on the V4 layout."""
     cache = kwargs.get('k_cache')
     if (args or kwargs.get('indices') is None or not kwargs.get('is_fp8_kvcache') or cache is None
