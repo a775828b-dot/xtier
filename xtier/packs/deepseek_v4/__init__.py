@@ -58,6 +58,7 @@
 """
 
 import functools
+import importlib
 import json
 import logging
 import os
@@ -314,6 +315,20 @@ def _mxfp8_linear(original, input, *args, **kwargs):
     return original(input, *args, **kwargs)
 
 
+def _hookable(target):
+    """Whether a dotted target resolves right now.
+
+    HookRegistry.register() stores the name without looking it up, and apply_hooks() logs a
+    failed hook -- with a traceback -- for every name that does not resolve.  A pack that has
+    to work across SGLang versions therefore asks before it registers.
+    """
+    module, _, attr = target.rpartition('.')
+    try:
+        return hasattr(importlib.import_module(module), attr)
+    except ImportError:
+        return False
+
+
 def install(registry, hook_type):
     from xtier.packs.deepseek_v4 import paged_indexer, wo_a
 
@@ -326,7 +341,16 @@ def install(registry, hook_type):
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
     if torch.cuda.get_device_capability()[0] < 9:
         from xtier.packs.deepseek_v4 import mhc_splitk, sparse_mla
-        registry.register(FLASH_MLA, sparse_mla.flash_mla_with_kvcache, hook_type.AROUND)
+        # FlashMLA left sgl-kernel for the sgl-flash-mla wheel, behind
+        # sglang.kernels.ops.attention.flash_mla_interface.  DeepseekV4AttnBackend binds that name in
+        # __init__ (functools.partial of the module attribute), so hooking sgl_kernel alone leaves this
+        # pack's kernel unused on the versions that have the interface.  Hook whichever one exists.
+        for _target in (FLASH_MLA,
+                        'sglang.kernels.ops.attention.flash_mla_interface.flash_mla_with_kvcache'):
+            if _hookable(_target):
+                registry.register(_target, sparse_mla.flash_mla_with_kvcache, hook_type.AROUND)
+            else:
+                logger.info('xtier: %s is not in this SGLang, not hooked', _target)
         registry.register(SPARSE_PREFILL, sparse_mla.no_sparse_prefill, hook_type.AROUND)
         registry.register(mhc_splitk.MHC_PRE, mhc_splitk.mhc_pre, hook_type.AROUND)
     from xtier.arch import HW_FP8
