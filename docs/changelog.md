@@ -2,7 +2,7 @@
 
 按日期倒序，README 只列最近 5 条。
 
-- 2026-11-01（晚）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩（`Unsupported architecture for sparse decode fwd`）。SGLang 10-23 把 V4 后端改成
+- 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩（`Unsupported architecture for sparse decode fwd`）。SGLang 10-23 把 V4 后端改成
   经 `flash_mla_interface` 调 FlashMLA，XTier 10-30 跟进 6162b07 后，`packs/deepseek_v4` 的钩子还挂在旧入口上；旧入口还在，所以启动检查查不出
   （iounstone 发现，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。修复后在 RTX PRO 5000 上模拟 SM86 跑整模型：照抄 0 错，NLL 1.19735（升级前 1.19867）。真卡还要等他确认。
   发布前清单加了模拟 SM86 这一步。

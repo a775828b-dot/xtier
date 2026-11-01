@@ -259,7 +259,7 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
-- 2026-11-01（晚）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩：跟进 SGLang 6162b07 后注意力钩子挂空了（感谢 iounstone，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
+- 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩：跟进 SGLang 6162b07 后注意力钩子挂空了（感谢 iounstone，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
 - 2026-11-01（v0.1.0）：全面代码审计后修了换槽序号回绕、后台线程报错被吞、首个请求现编内核被内存守护杀掉等问题，失效的加速项启动时直接报错；
   冷专家池换到 4 块 PCIe 5.0 盘（卸载 30% 时 decode −21%），大模型的专家可以只存一份。详见[修复](docs/reports/2026-11-01-audit-fixes.md)、[冷专家](docs/reports/2026-11-01-cold-pcie5.md)。
 - 2026-10-31：第二张卡可以不放模型、纯当热专家池（可选，`XTIER_GPU2_SLOTS`，默认关），给显存或速度不一样的两张卡用：双 RTX 4090 模拟 24 + 16 GiB 时 Qwen3.8 decode 比同样配置的 TP 快 12–13%，比单卡快约 28%。详见[文档](docs/reports/2026-10-31-second-gpu-pool.md)。

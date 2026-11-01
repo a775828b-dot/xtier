@@ -39,7 +39,7 @@ ln -s lib $CU/lib64
 ## 2. XTier and the tested SGLang
 
 ```bash
-git clone -b v0.1.0 https://github.com/a775828b-dot/xtier $DATA/src/xtier
+git clone -b v0.1.1 https://github.com/a775828b-dot/xtier $DATA/src/xtier
 git clone https://github.com/sgl-project/sglang $DATA/src/sglang
 git -C $DATA/src/sglang checkout 6162b07199
 

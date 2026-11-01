@@ -22,7 +22,7 @@
 | RTX 5090 32 GB（SM120） | 未验证 | 未验证 | 模拟（32 GB 显存 + 128 GB 内存，[报告](reports/2026-10-27-ds41-minimal.md)） | 和 RTX PRO 5000 同架构，真卡没跑过 |
 | 其他显卡 | 未验证 | 未验证 | 未验证 | 架构低于 SM86 不支持 |
 
-上表 DeepSeek 在 RTX 30 / 40 系的结果都早于 SGLang 6162b07。v0.1.0 在这两代卡上第一个请求会崩（[#10](https://github.com/a775828b-dot/xtier/pull/10)），2026-11-01 已修；
+上表 DeepSeek 在 RTX 30 / 40 系的结果都早于 SGLang 6162b07。v0.1.0 在这两代卡上第一个请求会崩（[#10](https://github.com/a775828b-dot/xtier/pull/10)），v0.1.1 已修；
 修复后只在 RTX PRO 5000 上模拟 SM86 跑过整模型（照抄 0 错，NLL 1.197），真卡结果要等作者确认。
 
 MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 分支，2026-10-26 起暂停开发，新版本没有再测。
@@ -66,7 +66,7 @@ MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 
 | 未命中专家 GPU 代算 | 三个模型能跑；本机反而变慢，弱 CPU 只模拟过（8 线程 +6–7%） | 关 |
 | 投机解码 | DeepSeek DSpark、GLM EAGLE、Qwen MTP，都是整模型 | 启动台按模型 |
 
-## v0.1.0 的测试环境
+## v0.1.1 的测试环境
 
 | 项目 | 版本 |
 |---|---|
