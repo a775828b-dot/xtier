@@ -116,10 +116,114 @@ def _fastdec_enabled():
     return os.environ.get('XTIER_DS_WO_A_FASTDEC', '1') != '0'
 
 
+# --- decode GEMV with split-K -------------------------------------------------
+# T=1 makes the operation a GEMV: read R*D FP8 bytes, scale, multiply by one vector,
+# reduce. The tl.dot path above is bound by CTA count there, not by math, so this
+# path trades tensor cores for CTAs.
+GB_R = int(os.environ.get('XTIER_DS_WO_A_GB_R', '8'))
+GB_H = int(os.environ.get('XTIER_DS_WO_A_GB_H', '256'))
+_scratch_f32 = {}
+_SM_COUNT = [0]
+
+
+def _sm_count():
+    """SM count of this device; the split-K grid is sized against it."""
+    if not _SM_COUNT[0]:
+        _SM_COUNT[0] = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return _SM_COUNT[0]
+
+
+@triton.jit
+def _gemv_kernel(o_ptr, w_ptr, s_ptr, out_ptr, o_sg, o_sh, w_sg, w_sr, w_sh, s_stride, out_sg, out_sr,
+                 R: tl.constexpr, D: tl.constexpr, FP8: tl.constexpr,
+                 SCALE_BN: tl.constexpr, SCALE_BK: tl.constexpr,
+                 BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr, SPLIT: tl.constexpr):
+    pid_r = tl.program_id(0)
+    g = tl.program_id(1)
+    sp = tl.program_id(2)
+    r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    r_mask = r < R
+    acc = tl.zeros((BLOCK_R,), tl.float32)
+    span = (D + SPLIT - 1) // SPLIT
+    d_lo = ((span * sp) // BLOCK_H) * BLOCK_H
+    # non-final splits end on a BLOCK_H boundary too, otherwise their tail overlaps
+    # the next split's aligned start and those elements get summed twice
+    d_hi = D if sp == SPLIT - 1 else min(D, (span * (sp + 1) // BLOCK_H) * BLOCK_H)
+    for h0 in range(d_lo, d_hi, BLOCK_H):
+        h = h0 + tl.arange(0, BLOCK_H)
+        h_mask = h < d_hi
+        a = tl.load(o_ptr + g * o_sg + h * o_sh, mask=h_mask, other=0.0)
+        w = tl.load(w_ptr + g * w_sg + r[:, None] * w_sr + h[None, :] * w_sh,
+                    mask=r_mask[:, None] & h_mask[None, :], other=0.0)
+        if FP8:
+            k = h0 // SCALE_BK + tl.arange(0, BLOCK_H // SCALE_BK)
+            s = tl.load(s_ptr + ((g * R + r) // SCALE_BN)[:, None] * s_stride + k[None, :],
+                        mask=r_mask[:, None] & (k * SCALE_BK < D)[None, :], other=0.0)
+            w = tl.reshape(tl.reshape(_e4m3_fast(w), (BLOCK_R, BLOCK_H // SCALE_BK, SCALE_BK)) * s[:, :, None],
+                           (BLOCK_R, BLOCK_H)).to(tl.bfloat16)
+        acc += tl.sum(w.to(tl.float32) * a[None, :].to(tl.float32), axis=1)
+    if SPLIT == 1:
+        tl.store(out_ptr + g * out_sg + r * out_sr, acc.to(out_ptr.dtype.element_ty), mask=r_mask)
+    else:
+        tl.atomic_add(out_ptr + g * out_sg + r * out_sr, acc, mask=r_mask)
+
+
+@triton.jit
+def _cast_kernel(src, dst, n, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < n
+    tl.store(dst + i, tl.load(src + i, mask=m, other=0.0).to(dst.dtype.element_ty), mask=m)
+
+
+def _split_k_enabled():
+    return os.environ.get('XTIER_DS_WO_A_SPLIT_K', '1') != '0'
+
+
+def _gemv(o, w, scale):
+    T, G, D = o.shape
+    if T != 1:
+        raise NotImplementedError('split-K GEMV reduces one activation row; use the tl.dot path for T > 1')
+    R = w.shape[1]
+    fp8 = scale is not None
+    ctas = triton.cdiv(R, GB_R) * G
+    split = max(1, min(8, -(-4 * _sm_count() // max(ctas, 1))))
+    out = torch.empty((T, G, R), dtype=o.dtype, device=o.device)
+    if split == 1:
+        tgt, otgt = out, out
+    else:
+        # Keyed by shape, not by numel: two shapes with the same number of elements would
+        # otherwise share this buffer and, through it, each other's strides. Decode sees one
+        # shape, so the dict holds one entry per device.
+        key = (o.device, T, G, R)
+        buf = _scratch_f32.get(key)
+        if buf is None:
+            buf = torch.zeros((T, G, R), dtype=torch.float32, device=o.device)
+            _scratch_f32[key] = buf
+        buf.zero_()
+        tgt, otgt = buf, out
+    _gemv_kernel[(triton.cdiv(R, GB_R), G, split)](
+        o, w.view(torch.uint8) if fp8 else w, scale if fp8 else w, tgt,
+        o.stride(1), o.stride(2), w.stride(0), w.stride(1), w.stride(2),
+        scale.stride(0) if fp8 else 1, tgt.stride(1), tgt.stride(2),
+        R=R, D=D, FP8=fp8,
+        SCALE_BN=G * R // scale.shape[0] if fp8 else 1,
+        SCALE_BK=D // scale.shape[1] if fp8 else 1,
+        BLOCK_R=GB_R, BLOCK_H=GB_H, SPLIT=split, num_warps=4, num_stages=3)
+    if split > 1:
+        n = out.numel()
+        _cast_kernel[(triton.cdiv(n, 4096),)](tgt, otgt, n, BLOCK=4096, num_warps=4)
+    return otgt
+
+
 def einsum(o, w, scale=None):
     """o [T, G, D] BF16 x w [G, R, D] (FP8 with FP32 block scales [G R / bn, D / bk], or BF16) -> [T, G, R] BF16."""
     T, G, D = o.shape
     R = w.shape[1]
+    # T == 1 only: _gemv_kernel reduces a single activation row, it has no T dimension.
+    # Dispatching T == 2 here returned the first row and left the rest of the output untouched.
+    if (T == 1 and _split_k_enabled()
+            and triton.cdiv(R, BLOCK_R) * G < 3 * _sm_count()):
+        return _gemv(o, w, scale)
     out = torch.empty((T, G, R), dtype=o.dtype, device=o.device)
     fp8 = scale is not None
     s = scale if fp8 else w
