@@ -213,11 +213,11 @@ About 25% of the normal configuration, bound by the drives.
 
 All changes: [changelog](changelog.md) (in Chinese).
 
+- 2026-11-01: DeepSeek on RTX 30 / 40 series no longer dies on the first request: the attention hook missed SGLang 6162b07's entry point (thanks to iounstone, [#10](https://github.com/a775828b-dot/xtier/pull/10)).
 - 2026-11-01 (v0.1.0): fixes after a full code audit (swap sequence wrap, swallowed thread errors, kernels compiled during the first request and killed by the memory guard); acceleration features that fail to apply now stop the start. The cold pool moved to four PCIe 5.0 drives (decode −21% at 30% cold); a big model's experts can be kept in one copy.
 - 2026-10-31: a second GPU can hold only hot experts (optional, `XTIER_GPU2_SLOTS`) for GPUs of different memory or speed.
 - 2026-10-30: follows SGLang main 6162b07; fast load with MoE tensor parallelism; NVIDIA's GLM NVFP4 checkpoint no longer crashes with MTP.
 - 2026-10-30: `TP=2` measured on two RTX 3090s: Qwen3.8 decode +42–48%.
-- 2026-10-29: RTX 30 series (SM86) and RTX 40 series (SM89) supported.
 
 ## License
 

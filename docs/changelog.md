@@ -2,6 +2,10 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-01（晚）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩（`Unsupported architecture for sparse decode fwd`）。SGLang 10-23 把 V4 后端改成
+  经 `flash_mla_interface` 调 FlashMLA，XTier 10-30 跟进 6162b07 后，`packs/deepseek_v4` 的钩子还挂在旧入口上；旧入口还在，所以启动检查查不出
+  （iounstone 发现，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。修复后在 RTX PRO 5000 上模拟 SM86 跑整模型：照抄 0 错，NLL 1.19735（升级前 1.19867）。真卡还要等他确认。
+  发布前清单加了模拟 SM86 这一步。
 - 2026-11-01（v0.1.0）：全面代码审计后的修复。稳定性：DeepSeek 的 CUTLASS 内核在加载权重前编译（不再在第一个请求里现编、被内存守护杀掉）；换槽序号回绕；split
   prefill、混合 prefill、冷专家写盘的线程报错不再被吞；专家没加载全、钩子没生效、调度入口改名都在启动时报错；未知的 `XTIER_*` 启动时警告；测试 FAIL 一律非零退出，加
   `tools/repo_check.py` 和 CI。查明同一提示词重算 logprob 摆动来自 top-k 输出顺序，不是 bug；几项换槽参数和提示词预热 A/B 没有收益，默认不变。详见[文档](reports/2026-11-01-audit-fixes.md)。

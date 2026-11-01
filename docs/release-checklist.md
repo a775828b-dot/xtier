@@ -56,6 +56,9 @@ export CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 PATH=$CUDA_HOME
 - 2× RTX 3090 或 4090：`TP=2` 和第二张卡当热专家池，Qwen3.8 照抄和速度（[配置](../configs/qwen38-rtx4090-3090/README.md)）。
 - RTX 4090 / 3090 单卡：`tools/arch_check.py` 查内核能不能编译，真卡跑 Qwen3.8 整模型。
 
+跟进了 SGLang 的话，不租卡也要模拟 SM86 跑一次 DeepSeek 整模型（`tools/arch_check.py sm86 --emulate sm86 -- 启动脚本`，去掉 SM120 专用的参数），
+发请求并跑照抄。SM90 以下的钩子在 RTX PRO 5000 上不注册，`check_sglang.py` 查不到；目标还在、但调用方换了入口时，只有这样才能发现（[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
+
 ## 5. 发布
 
 1. 更新版本号（`pyproject.toml`、`xtier/__init__.py`）、[README 的版本更新](../README.md#版本更新)（只留 5 条）、[changelog](changelog.md)、新报告，并把报告加进[文档目录](README.md)。
