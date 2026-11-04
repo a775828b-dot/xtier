@@ -10,6 +10,8 @@ listens on 127.0.0.1 by default; from another machine use an SSH tunnel (ssh -L 
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,7 +20,10 @@ from urllib.parse import parse_qs, urlparse
 
 from . import core, ui
 
-API = {'start': 'api/start', 'stop': 'api/stop', 'status': 'api/status', 'job': 'api/job'}
+API = {'start': 'api/start', 'stop': 'api/stop', 'status': 'api/status', 'job': 'api/job',
+       'install': 'api/install', 'installJob': 'api/install-job'}
+
+REPO = core.REPO
 
 
 class Jobs:
@@ -66,7 +71,73 @@ class Jobs:
         return self.console.stop('手动停止')
 
 
-def make_handler(console, jobs):
+class Actions:
+    """A card's extra action (configs/*/console.py 'actions') in the background: the command runs, the page follows its
+    output. Separate from Jobs so a long profile does not block a launch, and one action at a time so two runs do not
+    fight over the same output file."""
+
+    TAIL = 40   # output lines kept for the page
+
+    def __init__(self, console):
+        self.console = console
+        self.lock = threading.Lock()
+        self.job = {'id': 0, 'state': 'idle', 'output': []}
+
+    def start(self, model, key):
+        definition = self.console.action(self.console.models[model], key)
+        if definition is None:
+            return None, '未知的安装动作'
+        with self.lock:
+            if self.job['state'] == 'running':
+                return None, '已有安装任务在进行，等它结束'
+            self.job = {'id': self.job['id'] + 1, 'state': 'running', 'label': definition.get('label', key),
+                        'model': model, 'key': key, 'message': '', 'error': '', 'output': [], 'cancelled': False}
+            job = self.job
+        argv = definition['argv']
+        if callable(argv):
+            argv = argv(self.console.validate(model, {}))
+        threading.Thread(target=self._run, args=(job, [str(a) for a in argv], definition),
+                         name='xtier-action', daemon=True).start()
+        return job, ''
+
+    def _run(self, job, argv, definition):
+        try:
+            done = definition.get('done_when')
+            if done and done():
+                job.update(state='done', message=definition.get('done_text', '已完成'))
+                return
+            env = {**os.environ, 'PYTHONUNBUFFERED': '1', 'NO_COLOR': '1'}
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+                                    cwd=str(REPO))
+            for line in proc.stdout:
+                line = line.rstrip()
+                with self.lock:
+                    job['output'] = (job['output'] + [line])[-self.TAIL:]
+                if job['cancelled']:
+                    proc.terminate()
+                    break
+            code = proc.wait()
+            if job['cancelled']:
+                raise RuntimeError('已手动停止')
+            if code != 0:
+                tail = ' | '.join(job['output'][-4:]) or f'退出码 {code}'
+                raise RuntimeError(f'{job["label"]}失败（退出码 {code}）：{tail}')
+            if done and not done():
+                raise RuntimeError(f'{job["label"]}结束了，但没有生成产物')
+            job.update(state='done', message=definition.get('done_text', '已完成'))
+        except FileNotFoundError:
+            job.update(state='failed', error=f'找不到命令：{argv[0]}')   # the page shows it
+        except Exception as exc:
+            job.update(state='failed', error=str(exc))
+
+    def stop(self):
+        with self.lock:
+            if self.job['state'] == 'running':
+                self.job['cancelled'] = True
+        return True
+
+
+def make_handler(console, jobs, actions):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'xtier-console'
 
@@ -95,6 +166,8 @@ def make_handler(console, jobs):
                 return self._json(console.status())
             if path == '/api/job':
                 return self._json({k: v for k, v in jobs.job.items() if k != 'cancelled'})
+            if path == '/api/install-job':
+                return self._json({k: v for k, v in actions.job.items() if k != 'cancelled'})
             self._json({'error': 'not found'}, 404)
 
         def do_POST(self):
@@ -118,6 +191,16 @@ def make_handler(console, jobs):
                 label = console.read_state().get('label') or 'XTier'
                 ok = jobs.stop()
                 return self._json({'ok': ok, 'message': f'已停止 {label}' if ok else '', 'error': '' if ok else '停止超时'})
+            if path == '/api/install':
+                # a card's extra action: an install / profile command run in the background (see configs/*/console.py)
+                model = (form.get('model') or [''])[0]
+                key = (form.get('action') or [''])[0]
+                if model not in console.models or console.action(console.models[model], key) is None:
+                    return self._json({'ok': False, 'error': '该模型没有这个安装动作'}, 404)
+                job, err = actions.start(model, key)
+                if job is None:
+                    return self._json({'ok': False, 'error': err}, 409)
+                return self._json({'ok': True, 'job': job['id'], 'label': job['label']})
             self._json({'ok': False, 'error': 'not found'}, 404)
 
     return Handler
@@ -142,7 +225,7 @@ def main(argv=None):
     if not models:
         sys.exit(f'no console entries (configs/*/console.py) under {core.CONFIGS}')
     console = core.Console(models, args.state_dir, runner=args.runner, unit=args.unit, guard_gib=args.mem_guard_gib)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(console, Jobs(console)))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(console, Jobs(console), Actions(console)))
     if args.host not in ('127.0.0.1', 'localhost', '::1'):
         print(f'warning: listening on {args.host} - anyone who can reach it can start and stop model servers')
     print(f"XTier console on http://{args.host}:{args.port}/ ({', '.join(models)}; runner {console.runner}; "

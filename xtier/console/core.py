@@ -340,6 +340,30 @@ class Console:
         u = option.get('unavailable')
         return dict((u() if callable(u) else u) or {})
 
+    @staticmethod
+    def action(model_def, key):
+        """A card's 'action' entry: an extra button on this model's panel that runs a command in the background (a
+        profiler, a download), the page showing its output. None when the card has no such action.
+
+        {key, label, help, done_when, argv}: done_when() says whether the artefact already exists (the page then says
+        so instead of offering the run), argv the command (a list, or a callable taking the validated options)."""
+        for a in model_def.get('actions') or ():
+            if a['key'] == key:
+                return a
+        return None
+
+    def action_state(self, model):
+        """Every action of a model with whether its artefact is already there, for the page."""
+        out = []
+        for a in self.models[model].get('actions') or ():
+            try:
+                done = bool(a['done_when']())
+            except OSError:
+                done = False
+            out.append({'key': a['key'], 'label': a.get('label', a['key']), 'help': a.get('help', ''),
+                        'done': done, 'done_text': a.get('done_text', '已完成')})
+        return out
+
     def defaults(self, model):
         return {o['key']: o['default'] for o in self.models[model]['options']}
 
@@ -380,10 +404,12 @@ class Console:
         return 'XTier · ' + ' / '.join(parts)
 
     def console_data(self):
-        """What the page renders: the models' card fields, their options and defaults, the saved choices."""
+        """What the page renders: the models' card fields, their options and defaults, the saved choices, and the
+        extra actions each card offers."""
         return {'models': {k: {f: m[f] for f in PUBLIC if f in m} for k, m in self.models.items()},
                 'options': {k: [{**{f: v for f, v in o.items() if f != 'unavailable'}, 'unavailable': self.unavailable(o)}
                                 for o in m['options']] for k, m in self.models.items()},
+                'actions': {k: self.action_state(k) for k in self.models},
                 'defaults': {k: self.defaults(k) for k in self.models},
                 'saved': self.load_settings()}
 
@@ -498,7 +524,7 @@ class Console:
 
     def wait_ready(self, state, timeout):
         """Until /health passes and the warm-up requests ran (True, ''), the server exits or timeout seconds pass
-        (False, why). The page shows the warm-up as the last loading phase ("预热")."""
+        (False, why). A failed warm-up is not ready even while its process is still alive. The page shows the warm-up as the last loading phase ("预热")."""
         deadline = time.monotonic() + timeout
         self._waiting.add(state['port'])
         try:
@@ -512,6 +538,8 @@ class Console:
                                             f'{time.monotonic() - t0:.1f} s{": " + why if why else ""}')
                     if not self.active(state):   # the warm-up took the server down (out of memory, a crash)
                         return False, '服务在预热时退出：' + ' | '.join(log_tail(state.get('log'), 6))
+                    if why:
+                        return False, '服务预热失败：' + why
                     state['ready_at'] = time.time()
                     self.write_state(state)
                     return True, ''

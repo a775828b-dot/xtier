@@ -145,6 +145,9 @@ box-shadow:0 0 24px rgba(62,230,255,.45);text-shadow:0 1px 0 rgba(255,255,255,.3
 .xt-log div:last-child::after{content:"▋";margin-left:3px;color:var(--c);animation:xt-blink 1s steps(2) infinite}
 .xt-msg{margin-top:10px;font-size:12.5px;color:var(--d)}
 .xt-msg.err{color:var(--r)}.xt-msg.ok{color:var(--g)}
+.xt-out[hidden]{display:none}.xt-out{margin:10px 0 0;padding:10px 12px;max-height:220px;overflow:auto;font-size:11.5px;line-height:1.5;
+  color:#9fb0cc;background:rgba(8,14,26,.72);border:1px solid var(--line);border-radius:6px;white-space:pre-wrap;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .xt-foot{padding:0 22px 14px;font-size:11.5px;color:#5d6b86;letter-spacing:.04em}
 /* by the console's own width (a host page may give it less than the window) */
 @container xt (max-width:1199px){.xt-body{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)}.xt-rail{grid-column:1/-1}
@@ -195,8 +198,10 @@ def card_html(data):
       <button type=submit class="xt-btn xt-engage" id=xt-engage>启动 · ENGAGE</button>
       <button type=button class="xt-btn xt-abort" id=xt-abort disabled>停止 · ABORT</button>
       <button type=button class=xt-btn id=xt-reset>恢复实测默认</button>
+      <span id=xt-install></span>
     </div>
     <div class=xt-msg id=xt-msg aria-live=polite></div>
+    <pre class=xt-out id=xt-out hidden></pre>
   </form>
   <div class=xt-panel>
     <h4>TELEMETRY · 运行状态</h4>
@@ -231,7 +236,8 @@ JS = r"""
   if (!root) return;
   const data = JSON.parse(root.dataset.xtier);
   const T = data.texts || {};
-  const API = Object.assign({start: 'api/start', stop: 'api/stop', status: 'api/status', job: 'api/job'}, data.api || {});
+  const API = Object.assign({start: 'api/start', stop: 'api/stop', status: 'api/status', job: 'api/job',
+    install: 'api/install', installJob: 'api/install-job'}, data.api || {});
   const hooks = window.xtierConsoleHooks || {};
   const $ = id => document.getElementById(id);
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -245,6 +251,7 @@ JS = r"""
   let model = data.saved.model && data.models[data.saved.model] ? data.saved.model : models[0];
   let live = {state: 'offline'};
   let busy = false;
+  let actBusy = false;   // an install / profile action is running: its button stays disabled
 
   const tabs = root.querySelector('.xt-models');
   // bench: the README speeds as text (dec, pre), how they were measured (kind: agent / text) and a tooltip (title)
@@ -294,6 +301,7 @@ JS = r"""
       return `<label class=xt-field data-key="${esc(o.key)}" title="${esc(o.hint || '')}">${esc(o.label)}<select name="${esc(o.key)}">${opts}</select></label>`;
     }).join('');
     for (const sel of host.querySelectorAll('select')) sel.addEventListener('change', () => { chosen[model][sel.name] = sel.value; paintOptions(); });
+    renderActions();
     for (const box of host.querySelectorAll('.xt-switch input')) box.addEventListener('change', () => {
       const c = data.options[model].find(o => o.key === box.name).choices[box.checked ? 0 : 1];
       chosen[model][box.name] = c[0];
@@ -322,6 +330,65 @@ JS = r"""
   $('xt-reset').addEventListener('click', () => { chosen[model] = {...data.defaults[model]}; renderOptions(); });
 
   const msg = (text, kind = '') => { const el = $('xt-msg'); el.className = 'xt-msg ' + kind; el.textContent = text; };
+
+  // --- the card's extra actions: an install / profile command the console runs and follows (e.g. DSpark's SPS table) ---
+
+  function renderActions() {
+    const acts = data.actions[model] || [];
+    $('xt-install').innerHTML = acts.map(a =>
+      `<button type=button class="xt-btn xt-act" data-action="${esc(a.key)}" title="${esc(a.help || '')}">` +
+      `${esc(a.label)}${a.done ? ' · ' + esc(a.done_text) : ''}</button>`).join(' ');
+    for (const b of $('xt-install').querySelectorAll('.xt-act')) {
+      b.disabled = actBusy;
+      b.addEventListener('click', () => runAction(b.dataset.action));
+    }
+  }
+
+  async function runAction(key) {
+    if (actBusy) return;
+    const a = (data.actions[model] || []).find(x => x.key === key);
+    if (!a) return;
+    const note = a.done ? `\n\n上次已经成功过一次，重新运行会覆盖结果。` : '';
+    if (!confirm(`${a.label}？\n\n${a.help || ''}${note}`)) return;
+    actBusy = true; renderActions();
+    $('xt-out').hidden = false; $('xt-out').textContent = '正在启动…';
+    msg(`正在运行${a.label}…`);
+    try {
+      const res = await post(API.install, new URLSearchParams({model, action: key}));
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      pollAction();
+    } catch (err) {
+      actBusy = false; renderActions();
+      msg(`${a.label}没能启动：${err.message}`, 'err');
+      $('xt-out').hidden = true;
+    }
+  }
+
+  async function pollAction() {
+    let job;
+    try {
+      const res = await fetch(url(API.installJob), {headers: {'Accept': 'application/json'}});
+      job = await res.json();
+    } catch { return setTimeout(pollAction, 2000); }
+    const el = $('xt-out');
+    if (job.output && job.output.length) { el.hidden = false; el.textContent = job.output.join('\n'); el.scrollTop = el.scrollHeight; }
+    if (job.state === 'running') {
+      if (job.label) msg(`正在运行${job.label}…`);
+      return setTimeout(pollAction, 1500);
+    }
+    actBusy = false;
+    if (job.state === 'done') {
+      msg(job.message || '已完成', 'ok');
+      const a = (data.actions[model] || []).find(x => x.key === job.key);
+      if (a) a.done = true;   // the artefact exists now: the button says so
+    } else if (job.state === 'failed') {
+      msg(`${job.label || '操作'}失败：${job.error}`, 'err');
+    }
+    renderActions();
+  }
 
   $('xt-form').addEventListener('submit', async e => {
     e.preventDefault();

@@ -136,7 +136,8 @@ assert 'id=xtier-console' in page and 'xtierConsoleHooks' in page and 'build' no
 assert 'xt-switch' in page and 'role=switch' in page
 
 # the standalone server
-httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.make_handler(console, server.Jobs(console)))
+httpd = ThreadingHTTPServer(('127.0.0.1', 0),
+                            server.make_handler(console, server.Jobs(console), server.Actions(console)))
 threading.Thread(target=httpd.serve_forever, daemon=True).start()
 base = f'http://127.0.0.1:{httpd.server_address[1]}'
 
@@ -157,6 +158,11 @@ assert call('/api/start', b'model=qwen38')[0] == 403   # no X-Requested-With: re
 status, body = call('/api/start', b'model=nope', {'X-Requested-With': 'fetch'})
 assert status == 400 and not json.loads(body)['ok']
 status, body = call('/api/job')
+assert status == 200 and json.loads(body)['state'] == 'idle'
+# a card's extra action: unknown action 404s, and a real one with a harmless argv runs and its output reaches the page
+status, body = call('/api/install', b'model=qwen38&action=nope', {'X-Requested-With': 'fetch'})
+assert status == 404 and not json.loads(body)['ok']
+status, body = call('/api/install-job')
 assert status == 200 and json.loads(body)['state'] == 'idle'
 httpd.shutdown()
 
@@ -194,6 +200,13 @@ core.health, core.warm_up = (lambda port: True), (lambda *a: 'the connection dro
 log = Path(tempfile.mkdtemp(prefix='xtier-console-')) / 'server.log'
 log.write_text('mem_guard: killing\n')
 ok, why = console.wait_ready(dict(port=1, served='Some-Model', log=str(log)), 60)
+assert not ok and '预热' in why, (ok, why)
+# A crashing worker's scope can remain alive briefly after its HTTP connection closes.
+console.active = lambda state: True
+state = dict(port=1, served='Some-Model', log=str(log))
+ok, why = console.wait_ready(state, 60)
+assert not ok and 'the connection dropped' in why, (ok, why)
+assert 'ready_at' not in state
 core.health, core.warm_up = health, warm
 assert not ok and '预热' in why, (ok, why)
 print(f'console ok: {len(models)} models, {combos} option combinations built, warm-up requests checked')

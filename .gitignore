@@ -3,3 +3,11 @@ __pycache__/
 build/
 dist/
 *.so
+
+# machine-local configuration: never commit credentials or per-host overrides
+.env
+.env.local
+*.local.sh
+configs/**/local.sh
+.venv/
+venv/
