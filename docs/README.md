@@ -50,6 +50,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 | [glm53-2x5070ti-zen2](../configs/glm53-2x5070ti-zen2/README.md) | GLM-5.3 Flash，2× RTX 5070 Ti + 2× EPYC 7642 | 已准备，还没有在这类机器上跑过 |
 | [qwen38-pro5000-nps4](../configs/qwen38-pro5000-nps4/README.md) | Qwen3.8 Flash Next，RTX PRO 5000 | 测速用的配置 |
 | [qwen38-rtx4090-3090](../configs/qwen38-rtx4090-3090/README.md) | Qwen3.8 Flash Next，1–2 张 RTX 4090 / 3090 | 路径和选项都走环境变量，改起来最省事 |
+| [kimi-k31-pro5000-nps4](../configs/kimi-k31-pro5000-nps4/) | Kimi K3.1 Pro，RTX PRO 5000 + 6 块 NVMe | kimi-k31 分支的实验（[报告](reports/2026-11-05-kimi-k31.md)） |
 | [minimax-m31-pro5000-nps4](../configs/minimax-m31-pro5000-nps4/) | MiniMax-M3.1-Flash，RTX PRO 5000 | 暂停开发 |
 
 **常用工具**（[tools/](../tools/)）：
@@ -97,6 +98,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-05 Kimi K3.1 Pro](reports/2026-11-05-kimi-k31.md) | kimi-k31 分支：2.8T 模型、6 块盘冷存储、尾部跳过的速度和精度 |
 | [2026-11-01 PCIe 5.0 冷专家池和只存一份](reports/2026-11-01-cold-pcie5.md) | 卸载 10–50% 实测、打洞和恢复 |
 | [2026-10-27 最小化运行](reports/2026-10-27-ds41-minimal.md) | 模拟 32 GB 显存 + 128 GB 内存跑 DeepSeek |
 | [2026-10-27 快速加载](reports/2026-10-27-fast-load.md) | 专家直接从模型文件或冷存储读进引擎 |

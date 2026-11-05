@@ -2,6 +2,13 @@
 
 [中文](../README.md) · [Quick start](quickstart.en.md)
 
+> **Branch kimi-k31: the Kimi K3.1 Pro experiment, not merged into main** ([report, in Chinese](reports/2026-11-05-kimi-k31.md); launch configuration [configs/kimi-k31-pro5000-nps4](../configs/kimi-k31-pro5000-nps4/))
+>
+> - 2.8T parameters on one RTX PRO 5000 with 384 GiB of RAM; 78% of the experts live only on six NVMe drives.
+> - About 10 tok/s decode on code prompts, about 90 tok/s prefill.
+> - The route tail skip is on at R = 9 by default (`XTIER_TAIL_SKIP=9`; it changes the output).
+> - **The accuracy cost of R = 9**: take no skip as the original (think Q8); R = 9 then sits between Q5_K_M and Q4_K_M. Its KL is 0.024; in llama.cpp's Llama 3 8B table, Q5_K_M is 0.011 and Q4_K_M 0.031.
+
 This is the English version of the README. The other documents ([index](README.md)) are in Chinese, except the quick start.
 
 **Cross-tier CPU/GPU hybrid MoE inference for [SGLang](https://github.com/sgl-project/sglang).** XTier is a plugin for upstream SGLang (tracking `main`): MoE experts live in GPU memory and host DRAM, are placed by how often they are used and computed where they are, while NVMe holds only the rows of large embedding tables (DeepSeek's Engram, Qwen's PLE). When host memory cannot hold all experts, an optional cold-expert pool keeps the rarely used ones on NVMe and reads them back when they are routed; its size and speed are bound by the drives' speed and type.

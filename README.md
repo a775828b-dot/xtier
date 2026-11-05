@@ -2,6 +2,13 @@
 
 [English](docs/README.en.md) · [文档目录](docs/README.md) · [快速开始](docs/quickstart.md) · [支持情况](docs/support.md)
 
+> **kimi-k31 分支：Kimi K3.1 Pro 实验，不合进 main**（[报告](docs/reports/2026-11-05-kimi-k31.md)，启动配置 [configs/kimi-k31-pro5000-nps4](configs/kimi-k31-pro5000-nps4/)）
+>
+> - 2.8T 参数，单张 RTX PRO 5000 加 384 GiB 内存，78% 的专家只放在 6 块 NVMe 上。
+> - 代码题 decode 约 10 tok/s，prefill 约 90 tok/s。
+> - 默认开尾部跳过 R = 9（`XTIER_TAIL_SKIP=9`，会改变输出）。
+> - **R = 9 的精度损失**：把不跳过当作原版（好比 Q8），R = 9 相当于 Q5_K_M 和 Q4_K_M 之间。R = 9 的 KL 是 0.024，llama.cpp 的 Llama 3 8B 表里 Q5_K_M 是 0.011、Q4_K_M 是 0.031。
+
 XTier 是官方 [SGLang](https://github.com/sgl-project/sglang) 的插件（跟 main 分支），做 CPU/GPU 分层 MoE 推理：专家分布在显存和内存两层，按热度放置、按需调度；NVMe 只放大嵌入表的行（DeepSeek 的 Engram、Qwen 的 PLE）。内存放不下全部专家时，可选的冷专家池把少用的专家放到硬盘、用到时读回内存，池子大小和速度受限于硬盘速度和类型。
 
 **状态：早期开发**（[工作计划](docs/PLAN.md)）。Qwen3.8 Flash Next、GLM-5.3 Flash、DeepSeek V4.1 Flash 1017 跑在 SGLang main 上；MiniMax-M3.1-Flash 跑在 SGLang 的 M3.1 分支（PR #45925），已暂停开发（本机太慢、智力不强）。
