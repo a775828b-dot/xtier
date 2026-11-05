@@ -296,6 +296,17 @@ def log_tail(path, n=5):
 
 def _progress(text):
     """(phase, label, percent) of a loading server from its log: the latest phase reached wins."""
+    # The sampling server uses a private port and is not a ready production server.
+    stages = [(text.rfind(f'[xtier-sps] {i}/3'), i) for i in (1, 2, 3)]
+    position, stage = max(stages)
+    if position >= 0:
+        if stage == 1:
+            return 'sps-start', 'SPS 1/3：启动采样服务', 10
+        if stage == 2:
+            return 'sps-profile', 'SPS 2/3：测量并生成表', 55
+        text = text[position:]  # Discard the sampling server's old ready/graph messages.
+        if 'Load weight begin' not in text:
+            return 'sps-restart', 'SPS 3/3：加载表并重启', 65
     if 'The server is fired up' in text:   # HTTP is up, the first /health generation still to pass
         return 'graphs', '预热', 97
     if 'Capturing batches' in text or 'CUDA graph begin' in text:

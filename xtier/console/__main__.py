@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import core, ui
+from .perf_jobs import Performance
 
 API = {'start': 'api/start', 'stop': 'api/stop', 'status': 'api/status', 'job': 'api/job',
        'install': 'api/install', 'installJob': 'api/install-job'}
@@ -47,6 +48,7 @@ class Jobs:
     def _run(self, job, model, values):
         c, m = self.console, self.console.models[model]
         try:
+            c.build(model, values)  # Reject incompatible options before stopping a healthy server.
             c.stop()
             if not c.wait_gpu_free():
                 raise RuntimeError(f"GPU 上还有 {core.gpus().get('mem_used')} GiB 被其他进程占用，先停掉再启动")
@@ -138,6 +140,7 @@ class Actions:
 
 
 def make_handler(console, jobs, actions):
+    performance = Performance(console)
     class Handler(BaseHTTPRequestHandler):
         server_version = 'xtier-console'
 
@@ -162,6 +165,15 @@ def make_handler(console, jobs, actions):
             if path == '/':
                 data = {**console.console_data(), 'status': console.status(), 'api': API}
                 return self._send(200, ui.page_html(data), 'text/html; charset=utf-8')
+            if path == '/api/performance':
+                return self._json(performance.snapshot(
+                    management_busy=jobs.job['state'] == 'running' or actions.job['state'] == 'running'))
+            if path == '/api/performance/report':
+                try:
+                    key = parse_qs(urlparse(self.path).query).get('id', [''])[0]
+                    return self._json(performance.report(key))
+                except (ValueError, OSError) as exc:
+                    return self._json({'error': str(exc)}, 404)
             if path == '/api/status':
                 return self._json(console.status())
             if path == '/api/job':
@@ -171,12 +183,32 @@ def make_handler(console, jobs, actions):
             self._json({'error': 'not found'}, 404)
 
         def do_POST(self):
+            with performance.gate:
+                self._post()
+
+        def _post(self):
             # a custom header no cross-site form can send: a page elsewhere cannot start or stop servers here
             if self.headers.get('X-Requested-With') != 'fetch':
                 return self._json({'ok': False, 'error': 'forbidden'}, 403)
             length = min(int(self.headers.get('Content-Length') or 0), 65536)
             form = parse_qs(self.rfile.read(length).decode('utf-8', 'replace'))
             path = urlparse(self.path).path
+            if path == '/api/performance/cancel':
+                return self._json(performance.cancel())
+            if path in ('/api/performance/start', '/api/performance/command'):
+                try:
+                    if jobs.job['state'] == 'running' or actions.job['state'] == 'running':
+                        raise ValueError('请等待启动或安装任务结束')
+                    if path.endswith('/command'):
+                        argv, _ = performance.command(form, performance.directory/'preview.json')
+                        return self._json({'command': __import__('shlex').join(argv)})
+                    return self._json(performance.start(form))
+                except (ValueError, OSError) as exc:
+                    return self._json({'error': str(exc)}, 400)
+            if path in ('/api/start', '/api/install') and performance.running():
+                return self._json({'ok': False, 'error': '请先停止性能测试，再修改服务'}, 409)
+            if path == '/api/stop':
+                performance.cancel()
             if path == '/api/start':
                 model = (form.get('model') or [''])[0]
                 try:

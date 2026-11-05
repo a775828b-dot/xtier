@@ -210,3 +210,18 @@ assert 'ready_at' not in state
 core.health, core.warm_up = health, warm
 assert not ok and '预热' in why, (ok, why)
 print(f'console ok: {len(models)} models, {combos} option combinations built, warm-up requests checked')
+
+# Private SPS calibration must not look ready just because its temporary server is up.
+assert core._progress('[xtier-sps] 1/3 start\nThe server is fired up')[0] == 'sps-start'
+assert core._progress('[xtier-sps] 2/3 profile\nThe server is fired up')[0] == 'sps-profile'
+assert core._progress('The server is fired up\n[xtier-sps] 3/3 restart')[0] == 'sps-restart'
+assert core._progress('[xtier-sps] 3/3 restart\nLoad weight begin\nThe server is fired up')[1] == '预热'
+# An invalid option combination must preserve a currently running server.
+from unittest.mock import Mock
+invalid_console = Mock()
+invalid_console.models = {'local': {}}
+invalid_console.build.side_effect = ValueError('incompatible options')
+job = {}
+server.Jobs(invalid_console)._run(job, 'local', {})
+assert job['state'] == 'failed'
+invalid_console.stop.assert_not_called()

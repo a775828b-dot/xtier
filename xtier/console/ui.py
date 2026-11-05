@@ -10,6 +10,8 @@ data['api']); page_html() is the standalone page of `python -m xtier.console`.
 import html
 import json
 
+from . import perf_ui
+
 SUBTITLE = '官方 SGLang main + XTier 插件 · 专家分布在显存 / 内存两层，NVMe 只放大嵌入表（Engram / PLE） · 每个模型在自己的端口上提供 OpenAI 兼容接口'
 FOOT = '默认参数 = configs/*/console.py 里的实测配置，改动过的项会标出。一次只跑一个模型：启动新的模型前会先停掉当前的。'
 
@@ -143,6 +145,12 @@ box-shadow:0 0 24px rgba(62,230,255,.45);text-shadow:0 1px 0 rgba(255,255,255,.3
 .xt-log{margin-top:10px;padding:8px 10px;max-height:104px;overflow:hidden;border-radius:9px;border:1px solid rgba(127,144,173,.18);background:rgba(2,5,12,.85);font-size:11px;line-height:1.55;color:#8ea2c2}
 .xt-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .xt-log div:last-child::after{content:"▋";margin-left:3px;color:var(--c);animation:xt-blink 1s steps(2) infinite}
+.xt-confirm{box-sizing:border-box;width:min(520px,calc(100vw - 32px));max-height:calc(100vh - 32px);padding:24px;border:1px solid var(--line);border-radius:14px;background:#080f20;color:var(--t);box-shadow:0 24px 80px rgba(0,0,0,.55)}
+.xt-confirm::backdrop{background:rgba(0,0,0,.7);backdrop-filter:blur(3px)}
+.xt-confirm h3{margin:0 0 14px;color:var(--c);font-size:18px}
+.xt-confirm p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65;font-size:14px}
+.xt-confirm .xt-confirm-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;margin-top:24px}
+.xt-confirm button:focus-visible{outline:2px solid var(--c);outline-offset:3px}
 .xt-msg{margin-top:10px;font-size:12.5px;color:var(--d)}
 .xt-msg.err{color:var(--r)}.xt-msg.ok{color:var(--g)}
 .xt-out[hidden]{display:none}.xt-out{margin:10px 0 0;padding:10px 12px;max-height:220px;overflow:auto;font-size:11.5px;line-height:1.5;
@@ -226,6 +234,15 @@ def card_html(data):
     <div class="xt-log xt-mono" id=xt-log></div>
   </div>
 </div>
+<dialog class=xt-confirm id=xt-confirm aria-labelledby=xt-confirm-title aria-describedby=xt-confirm-message>
+  <h3 id=xt-confirm-title>确认操作</h3>
+  <p id=xt-confirm-message></p>
+  <div class=xt-confirm-actions>
+    <button type=button class=xt-btn id=xt-confirm-cancel autofocus>取消</button>
+    <button type=button class="xt-btn xt-engage" id=xt-confirm-accept>确认</button>
+  </div>
+</dialog>
+{perf_ui.HTML}
 <div class=xt-foot>{html.escape(texts.get('foot', FOOT))}</div>
 </section>"""
 
@@ -251,6 +268,8 @@ JS = r"""
   let model = data.saved.model && data.models[data.saved.model] ? data.saved.model : models[0];
   let live = {state: 'offline'};
   let busy = false;
+  let stopBusy = false;
+  let confirmationPending = false;
   let actBusy = false;   // an install / profile action is running: its button stays disabled
 
   const tabs = root.querySelector('.xt-models');
@@ -297,8 +316,8 @@ JS = r"""
       // a choice unavailable on this machine (o.unavailable: value -> reason) is greyed out, the reason in its tooltip
       const un = o.unavailable || {};
       const opts = o.choices.map(([v, label]) => `<option value="${esc(v)}"${chosen[model][o.key] === v ? ' selected' : ''}` +
-        `${un[v] ? ` disabled title="${esc(un[v])}"` : ''}>${esc(label)}${un[v] ? ' · 本机不可用' : ''}</option>`).join('');
-      return `<label class=xt-field data-key="${esc(o.key)}" title="${esc(o.hint || '')}">${esc(o.label)}<select name="${esc(o.key)}">${opts}</select></label>`;
+        `${un[v] ? ` disabled title="${esc(un[v])}"` : ''}>${esc(label)}${un[v] ? ' · 不可用' : ''}</option>`).join('');
+      return `<label class=xt-field data-key="${esc(o.key)}" title="${esc(o.hint || '')}">${esc(o.label)}<select name="${esc(o.key)}" aria-label="${esc(o.label)}">${opts}</select></label>`;
     }).join('');
     for (const sel of host.querySelectorAll('select')) sel.addEventListener('change', () => { chosen[model][sel.name] = sel.value; paintOptions(); });
     renderActions();
@@ -331,6 +350,40 @@ JS = r"""
 
   const msg = (text, kind = '') => { const el = $('xt-msg'); el.className = 'xt-msg ' + kind; el.textContent = text; };
 
+  const confirmation = $('xt-confirm');
+  $('xt-confirm-cancel').addEventListener('click', () => confirmation.close('cancel'));
+  $('xt-confirm-accept').addEventListener('click', () => confirmation.close('confirm'));
+  confirmation.addEventListener('cancel', e => { e.preventDefault(); confirmation.close('cancel'); });
+
+  // A single modal owns confirmation; cancelling or Escape never submits an operation.
+  async function confirmAction(title, message, acceptLabel) {
+    if (confirmationPending) return false;
+    confirmationPending = true;
+    const opener = document.activeElement;
+    $('xt-confirm-title').textContent = title;
+    $('xt-confirm-message').textContent = message;
+    $('xt-confirm-accept').textContent = acceptLabel;
+    confirmation.returnValue = 'cancel';
+    try {
+      return await new Promise(resolve => {
+        const closed = () => resolve(confirmation.returnValue === 'confirm');
+        confirmation.addEventListener('close', closed, {once: true});
+        try {
+          confirmation.showModal();
+          $('xt-confirm-cancel').focus();
+        } catch (err) {
+          confirmation.removeEventListener('close', closed);
+          msg('无法打开确认窗口：' + (err.message || err), 'err');
+          resolve(false);
+        }
+      });
+    } finally {
+      confirmationPending = false;
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus({preventScroll: true});
+    }
+  }
+
+
   // --- the card's extra actions: an install / profile command the console runs and follows (e.g. DSpark's SPS table) ---
 
   function renderActions() {
@@ -349,7 +402,7 @@ JS = r"""
     const a = (data.actions[model] || []).find(x => x.key === key);
     if (!a) return;
     const note = a.done ? `\n\n上次已经成功过一次，重新运行会覆盖结果。` : '';
-    if (!confirm(`${a.label}？\n\n${a.help || ''}${note}`)) return;
+    if (!await confirmAction(a.label, `${a.help || ''}${note}`, '确认运行')) return;
     actBusy = true; renderActions();
     $('xt-out').hidden = false; $('xt-out').textContent = '正在启动…';
     msg(`正在运行${a.label}…`);
@@ -396,7 +449,7 @@ JS = r"""
     const d = data.models[model];
     const ask = (hooks.confirmPrefix ? hooks.confirmPrefix() : '') +
       fill(T.confirm || '启动 XTier · {name}？\n会先停掉正在运行的 XTier 模型；就绪后在 127.0.0.1:{port} 提供 OpenAI 兼容接口（模型名 {served}）。', d, false);
-    if (!confirm(ask)) return;
+    if (!await confirmAction('启动 XTier 服务', ask, '确认启动')) return;
     busy = true; $('xt-engage').disabled = true;
     msg('正在提交启动任务…');
     try {
@@ -425,7 +478,9 @@ JS = r"""
   }
 
   $('xt-abort').addEventListener('click', async () => {
-    if (!confirm('停止 XTier 服务？正在加载的启动也会中止。')) return;
+    if (stopBusy) return;
+    if (!await confirmAction('停止 XTier 服务', '正在加载的启动也会中止。', '确认停止')) return;
+    stopBusy = true;
     $('xt-abort').disabled = true;
     msg('正在停止…');
     try {
@@ -433,6 +488,7 @@ JS = r"""
       const out = await res.json().catch(() => ({ok: false, error: '接口返回非 JSON'}));
       msg(out.ok ? (out.message || '已停止') : ('停止失败：' + (out.error || res.status)), out.ok ? '' : 'err');
     } catch (err) { msg('停止失败：' + (err.message || err), 'err'); }
+    finally { stopBusy = false; }
     poll();
   });
 
@@ -483,7 +539,7 @@ JS = r"""
     }
     $('xt-log').innerHTML = (s.tail || []).map(l => `<div>${esc(l)}</div>`).join('') || '<div>— 等待指令 —</div>';
     const runningHere = s.state === 'loading' || s.state === 'online';
-    $('xt-abort').disabled = !runningHere;
+    $('xt-abort').disabled = stopBusy || !runningHere;
     $('xt-engage').disabled = busy || s.state === 'loading';
     $('xt-engage').textContent = runningHere && s.model === model ? '重启 · 应用参数' : '启动 · ENGAGE';
     paintTabs();
@@ -515,3 +571,6 @@ def page_html(data, title='XTier Console'):
             f'<title>{html.escape(title)}</title><style>html,body{{margin:0;background:#03050c;color:#dcecff}}'
             'body{padding:24px 16px}.xt-page{max-width:1360px;margin:0 auto}' + CSS + '</style></head><body>'
             f'<main class=xt-page>{card_html(data)}</main><script>{JS}</script></body></html>')
+
+# Keep the performance panel independently scoped from launch controls.
+JS += perf_ui.JS
