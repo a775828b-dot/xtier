@@ -61,7 +61,7 @@ def _unpack_all(W, S, D, ROWS: tl.constexpr, COLS: tl.constexpr, B: tl.constexpr
 def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
           K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, UNPACKED: tl.constexpr,
           HID: tl.constexpr, INT: tl.constexpr, LIMIT: tl.constexpr, MX: tl.constexpr = False,
-          ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
+          ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, SITU: tl.constexpr = 0.0, SITU_LIN: tl.constexpr = 0.0):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)  # expert offsets exceed 2**31 for DeepSeek V4.1
     ew = e - E0  # index inside the staged expert chunk; global scales use e
@@ -89,7 +89,12 @@ def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
         # Clamped SwiGLU (DeepSeek V4): up to [-L,L], gate to (-inf,L].
         up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
         gate = tl.minimum(gate, LIMIT)
-    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+    if SITU > 0:   # SiTU-GLU (Kimi K3): SITU*tanh(g/SITU)*sigmoid(g) * up, up soft-clipped by SITU_LIN (tanh = 2*sigmoid(2x)-1)
+        gate = SITU * (2. / (1. + tl.exp(-2. * gate / SITU)) - 1.) / (1. + tl.exp(-gate))
+        if SITU_LIN > 0:
+            up = SITU_LIN * (2. / (1. + tl.exp(-2. * up / SITU_LIN)) - 1.)
+        value = gate * up
+    elif ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
         value = gate / (1. + tl.exp(-ALPHA * gate)) * (up + BETA)
     else:
         value = gate / (1. + tl.exp(-gate)) * up
@@ -277,7 +282,7 @@ class Prefill:
     """
 
     def __init__(self, experts, pointers, native=None, hidden=2560, inter=640, swiglu_limit=0.0, swiglu_alpha=1.0,
-                 swiglu_beta=0.0):
+                 swiglu_beta=0.0, situ_beta=0.0, situ_linear=0.0):
         self.mxfp4 = getattr(native, 'scale_format', 'nvfp4') == 'mxfp4'
         if self.mxfp4 and os.environ.get('XTIER_PREFILL_FROM_SHARDS', '1') != '1':
             raise ValueError('MXFP4 requires native scale shards')
@@ -286,6 +291,8 @@ class Prefill:
         self.hidden, self.inter, self.swiglu_limit = int(hidden), int(inter), float(swiglu_limit)
         # GPT-OSS SwiGLU (MiniMax M3): gate * sigmoid(alpha * gate) * (up + beta); 1 / 0 = plain SiLU
         self.swiglu_alpha, self.swiglu_beta = float(swiglu_alpha), float(swiglu_beta)
+        # SiTU-GLU (Kimi K3): beta > 0 replaces SiLU; linear soft-clips up (0: unclipped)
+        self.situ_beta, self.situ_linear = float(situ_beta), float(situ_linear)
         H, I = self.hidden, self.inter
         self.layout = _shard_layout(H, I, group=self.scale_group)
         # Experts per uploaded chunk. Default: the whole layer while its unpacked BF16
@@ -462,7 +469,7 @@ class Prefill:
 
     def _run(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16):
         global _slots, _unpacked, _pending, _copy_stream
-        if m < 1 or not 1 <= k <= 10:
+        if m < 1 or not 1 <= k <= 16:
             raise ValueError('Invalid prefill shape')
         H, I, E, CH = self.hidden, self.inter, self.experts, self.chunk
         n_chunks = (E + CH - 1) // CH
@@ -617,7 +624,8 @@ class Prefill:
                     _gate[(t1 - t0, I // gbn)](Pointer(x+start*H*2, torch.bfloat16), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, e0, r0,
                                              k, tm, gbn, gbk, unpacked, H, I, self.swiglu_limit, MX=self.mxfp4,
-                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, **gate_opts)
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, SITU=self.situ_beta,
+                                             SITU_LIN=self.situ_linear, **gate_opts)
                     stamp('gate')
                     if self.down_tile128:
                         _down[(t1 - t0, H // 128)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
@@ -688,7 +696,7 @@ class Prefill:
         ok = getattr(self, '_fp4_ok', None)
         if ok is None:
             g13, g2 = self.weights[-2], self.weights[-1]
-            ok = (torch.cuda.get_device_capability()[0] >= 10 and self.mxfp4
+            ok = (torch.cuda.get_device_capability()[0] >= 10 and self.mxfp4 and self.situ_beta == 0
                   and self.experts % self.chunk == 0 and self.experts // self.chunk > 1
                   and bool((g13 == 1).all()) and bool((g2 == 1).all()))
             self._fp4_ok = ok
@@ -1080,7 +1088,8 @@ class Prefill:
                     _gate[(t1 - t0, I // gbn)](Pointer(x, torch.bfloat16), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, j * CH, r0,
                                              k, tm, gbn, gbk, True, H, I, self.swiglu_limit, MX=self.mxfp4,
-                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, **gate_opts)
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, SITU=self.situ_beta,
+                                             SITU_LIN=self.situ_linear, **gate_opts)
                     _down[(t1 - t0, H // dbn)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                               meta[2, t0:t1], routes, j * CH, r0,
                                               tm, dbn, dbk, precision, True, H, I, True, MX=self.mxfp4, **down_opts)

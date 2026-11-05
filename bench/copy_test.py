@@ -35,7 +35,7 @@ url = f'http://127.0.0.1:{A.port}/v1/chat/completions'
 
 def run(c):
     body = dict(model=A.model, temperature=A.temperature, max_tokens=4000, stream=False,
-                chat_template_kwargs={'enable_thinking': False},
+                chat_template_kwargs={'enable_thinking': False, 'thinking': False},   # Kimi K3: thinking
                 messages=[{'role': 'user', 'content': '把 <src> 和 </src> 之间的内容逐字原样输出，不要增删改任何字符，'
                            '不要加代码块标记，不要解释。\n<src>\n' + c + '\n</src>'}])
     req = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})

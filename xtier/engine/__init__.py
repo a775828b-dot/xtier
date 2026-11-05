@@ -31,6 +31,8 @@ def engine() -> C.CDLL:
         lib.xtier_create3.restype = _P
         lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
         lib.xtier_set_swiglu.restype = _I
+        lib.xtier_set_situ.argtypes = [_P, C.c_float, C.c_float]
+        lib.xtier_set_situ.restype = _I
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
         lib.xtier_forward.restype = _I
         lib.xtier_destroy.argtypes = [_P]
@@ -82,7 +84,7 @@ class CpuPlan:
     and left to the caller to fill (shards / slot_pieces) before the first forward."""
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
-                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None):
+                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, situ_beta=0.0, situ_linear=0.0):
         if scale_format not in SCALE_FORMATS:
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
@@ -103,6 +105,11 @@ class CpuPlan:
         # GPT-OSS SwiGLU (MiniMax M3): gate * sigmoid(alpha * gate) * (up + beta); 1 / 0 keep the plain SiLU path
         if (swiglu_alpha, swiglu_beta) != (1.0, 0.0):
             if self.lib.xtier_set_swiglu(self.plan, swiglu_alpha, swiglu_beta):
+                raise RuntimeError(self.lib.xtier_last_error().decode())
+        # SiTU-GLU (Kimi K3): beta * tanh(gate / beta) * sigmoid(gate) * up, up soft-clipped by linear (0: unclipped)
+        self.situ_beta, self.situ_linear = float(situ_beta), float(situ_linear)
+        if self.situ_beta > 0:
+            if self.lib.xtier_set_situ(self.plan, self.situ_beta, self.situ_linear):
                 raise RuntimeError(self.lib.xtier_last_error().decode())
         self._localized = False
 
@@ -186,10 +193,12 @@ class CpuPlan:
         return [(pointers[j], sizes[j]) for j in range(6)]
 
     def attach_cold(self, store, files, offsets, scores, half_life):
-        """Cold experts handled by the forwards: files / offsets of every expert's node parts ([e * nodes + n];
-        -1: never leaves RAM), initial decayed use counts, their half-life in forwards (xtier_cold_attach)."""
-        if len(files) != self.experts * self.nodes() or len(offsets) != len(files):
-            raise ValueError('xtier: cold files / offsets need one entry per expert and node part')
+        """Cold experts handled by the forwards: files / offsets of every expert's node parts, each in XTIER_COLD_UNITS
+        units ([(e * nodes + n) * units + t]; -1: never leaves RAM), initial decayed use counts, their half-life in
+        forwards (xtier_cold_attach; the engine reads XTIER_COLD_UNITS too)."""
+        units = 3 if (os.environ.get('XTIER_COLD_UNITS') or '1').strip() == '3' else 1
+        if len(files) != self.experts * self.nodes() * units or len(offsets) != len(files):
+            raise ValueError(f'xtier: cold files / offsets need one entry per expert, node part and unit ({units})')
         f = (C.c_int32 * len(files))(*files)
         o = (C.c_longlong * len(offsets))(*offsets)
         sc = (C.c_float * self.experts)(*scores)
@@ -198,8 +207,9 @@ class CpuPlan:
             raise RuntimeError(self.lib.xtier_last_error().decode())
 
     def cold_stats(self):
-        """(forwards, experts read from NVMe, seconds spent reading; the same for forwards of at most 8 tokens)."""
-        out = (C.c_double * 6)()
+        """(forwards, experts read from NVMe, seconds spent reading; the same for forwards of at most 8 tokens;
+        experts XTIER_TAIL_SKIP left out)."""
+        out = (C.c_double * 7)()
         self.lib.xtier_cold_plan_stats(self.plan, C.cast(out, _P))
         return tuple(out)
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from layers import PRESETS, load  # noqa: E402
+from layers import PRESETS, SITU, load  # noqa: E402
 
 P = argparse.ArgumentParser()
 P.add_argument('--preset', choices=sorted(PRESETS), required=True)
@@ -35,9 +35,12 @@ from xtier.engine import CpuPlan  # noqa: E402
 
 weights = load(A.preset)
 pointers = [t.data_ptr() for t in weights]
-plan = CpuPlan(E, A.threads, pointers, hidden=H, inter=I, swiglu_limit=LIMIT, scale_format=FMT)
+SITU_BETA, SITU_LIN = SITU.get(A.preset, (0.0, 0.0))
+plan = CpuPlan(E, A.threads, pointers, hidden=H, inter=I, swiglu_limit=LIMIT, scale_format=FMT, situ_beta=SITU_BETA,
+               situ_linear=SITU_LIN)
 plan.pool = None
-prefill = Prefill(E, pointers, native=plan, hidden=H, inter=I, swiglu_limit=LIMIT)
+prefill = Prefill(E, pointers, native=plan, hidden=H, inter=I, swiglu_limit=LIMIT, situ_beta=SITU_BETA,
+                  situ_linear=SITU_LIN)
 arena = [torch.empty(s, dtype=torch.uint8, device='cuda') for s in prefill.shapes[:4]]
 stream = torch.cuda.current_stream()
 prefill._upload_chunk(arena, 0, E, stream.cuda_stream)

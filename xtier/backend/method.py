@@ -26,6 +26,7 @@ Numerics are the engine's or the GPU prefill's (BF16 operands, FP32 accumulation
 input dtype.
 """
 
+import contextlib
 import dataclasses
 import logging
 import os
@@ -38,12 +39,28 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from xtier import config, platform
 from xtier.backend import direct, formats, kernels
 from xtier.backend.prefill import Prefill
+from xtier.cache import tail
 from xtier.engine import CpuPlan, Mailbox, placement
 
 logger = logging.getLogger(__name__)
 SLOT_TOKENS = 8      # tokens per mailbox slot (engine DECODE_M)
-MAX_TOP_K = 10
+MAX_TOP_K = 16       # Kimi K3.1: 16 (mailbox MAX_TOP_K, engine MAX_K, pool MAX_ROUTES = 8 x 16)
 DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured graphs keep its address)
+
+
+@contextlib.contextmanager
+def _uninitialized():
+    """The GPU method's torch.zeros / torch.full allocate uninitialized host memory instead. Its bulk parameters are
+    written by the loader (copy) or never read (direct, store), and SGLang's MXFP4 MoE method (Kimi K3 / K3.1) zero-fills
+    them: at model construction that commits every layer's experts at once (Kimi K3.1 Pro: 92 x 15.7 GB, 11-05: 240 GB
+    and climbing before the first weight was read). Padding the zeros would have filled is refused (formats)."""
+    zeros, full = torch.zeros, torch.full
+    torch.zeros = lambda *size, **kw: torch.empty(*size, **kw)
+    torch.full = lambda size, fill_value, **kw: torch.empty(size, **kw)
+    try:
+        yield
+    finally:
+        torch.zeros, torch.full = zeros, full
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,7 +97,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
                        **extra_weight_attrs):
         rc = layer.moe_runner_config
         unsupported = [what for what, bad in (
-            ('activation', rc.activation != 'silu'), ('non-gated experts', not rc.is_gated),
+            ('activation', rc.activation not in ('silu', 'situ')), ('non-gated experts', not rc.is_gated),
             ('expert bias', bool(extra_weight_attrs.get('with_bias'))),
             ('router weight on input', rc.apply_router_weight_on_input),
             ('fused shared experts', layer.num_fused_shared_experts > 0),
@@ -89,12 +106,18 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if unsupported:
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
         self.hidden, self.inter, self.experts = hidden_size, intermediate_size_per_partition, num_experts
-        self.swiglu_limit = float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
+        self.situ_beta = self.situ_linear = 0.0
+        if rc.activation == 'situ':
+            # SiTU-GLU (Kimi K3): SGLang passes beta as gemm1_alpha and linear_beta as gemm1_clamp_limit
+            # (kimi_k3.KimiK3MoE); here they are no SwiGLU clamp or GPT-OSS alpha
+            self.situ_beta = float(rc.gemm1_alpha or 1.0)
+            self.situ_linear = float(rc.gemm1_clamp_limit or 0.0)
+        self.swiglu_limit = 0.0 if self.situ_beta else float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
         # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta)
-        self.swiglu_alpha = 1.0 if rc.gemm1_alpha is None else float(rc.gemm1_alpha)
-        self.swiglu_beta = 0.0 if rc.gemm1_beta is None else float(rc.gemm1_beta)
+        self.swiglu_alpha = 1.0 if rc.gemm1_alpha is None or self.situ_beta else float(rc.gemm1_alpha)
+        self.swiglu_beta = 0.0 if rc.gemm1_beta is None or self.situ_beta else float(rc.gemm1_beta)
         extra_weight_attrs['weight_loader'] = self._tracking_loader(layer, extra_weight_attrs['weight_loader'])
-        with torch.device('cpu'):
+        with torch.device('cpu'), _uninitialized():
             self.gpu_method.create_weights(layer, num_experts, hidden_size, intermediate_size_per_partition,
                                            params_dtype, **extra_weight_attrs)
         for name in self.format.derived:   # derived from the empty tensors at creation, never used
@@ -236,6 +259,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self.plan = CpuPlan(self.experts, self.cfg.threads, pointers, hidden=self.hidden, inter=self.inter,
                             swiglu_limit=self.swiglu_limit, scale_format=self.format.name,
                             swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
+                            situ_beta=self.situ_beta, situ_linear=self.situ_linear,
                             resident=lp.resident if lp else None)
         how = ''
         if source == 'direct':   # read while the loader goes on; done and checked at the end of loading (direct.finish)
@@ -250,7 +274,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
-                               swiglu_beta=self.swiglu_beta)
+                               swiglu_beta=self.swiglu_beta, situ_beta=self.situ_beta, situ_linear=self.situ_linear)
         self.prefill.order = self.cfg.layer_id   # the cross-layer prefetch links layers in this order
         self.prefill.cold = prefill_cold
         del inputs, pointers
@@ -317,6 +341,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         capturing = torch.cuda.is_current_stream_capturing()
         if not capturing and XTierMoEMethod._registered < len(XTierMoEMethod.layers):
             XTierMoEMethod._register_all()
+        if not capturing and m > config.decode_max() and tail.eval_rank():   # XTIER_TAIL_SKIP_EVAL: measuring only
+            weights = tail.prefill_mask(getattr(self, 'plan', None), ids, weights, tail.eval_rank())
         if not capturing and m > config.decode_max() and self.pool is not None and not self.pool.full:
             from xtier.cache import pool as cache_pool
             cache_pool.record_prompt(self.pool, ids)   # XTIER_CACHE_PROMPT=1: the prompt warms the expert cache

@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 MAX_M = 16             # token tile of the GPU kernels (decode slots hold <= 8 tokens)
 MAX_LAYERS = 128       # rows of the global residency table
 RING = 4096            # command ring entries (csrc/mailbox POOL_RING)
-MAX_ROUTES = 128       # m*k per call (8 tokens x top-k <= 10)
+MAX_ROUTES = 128       # m*k per call (8 tokens x top-k <= 16)
 MISS_CHUNK = 8192      # words (8 bytes) per program of _miss_copy
 BLOCK = 1024
 CONFIG = dict(gbn=32, dbn=64, bk=256, gw=4, gs=2, dw=4, ds=2)
@@ -169,7 +169,8 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
 @triton.jit
 def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False):
+             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False,
+             SITU: tl.constexpr = 0.0, SITU_LIN: tl.constexpr = 0.0):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -199,7 +200,12 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
     if LIMIT > 0:
         u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
         g = tl.minimum(g, LIMIT)
-    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+    if SITU > 0:   # SiTU-GLU (Kimi K3): SITU*tanh(g/SITU)*sigmoid(g) * up, up soft-clipped by SITU_LIN (tanh = 2*sigmoid(2x)-1)
+        g = SITU * (2. / (1. + tl.exp(-2. * g / SITU)) - 1.) / (1. + tl.exp(-g))
+        if SITU_LIN > 0:
+            u = SITU_LIN * (2. / (1. + tl.exp(-2. * u / SITU_LIN)) - 1.)
+        val = g * u
+    elif ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
@@ -425,6 +431,7 @@ class LayerPool:
         H, I, E = prefill.hidden, prefill.inter, prefill.experts
         self.H, self.I, self.E, self.limit = H, I, E, float(prefill.swiglu_limit)
         self.alpha, self.beta = prefill.swiglu_alpha, prefill.swiglu_beta
+        self.situ, self.situ_lin = prefill.situ_beta, prefill.situ_linear
         self.full = self.S >= E
         self.S = min(self.S, E)
         self.bk_h, self.bk_i = _tile_k(H), _tile_k(I)   # gate/up reduce over H, down over I
@@ -521,7 +528,7 @@ class LayerPool:
         xb = Pointer(x, torch.bfloat16)
         _gate_up[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], self.arena[0], self.arena[2], g13,
                                         sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
-                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
+                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, SITU=self.situ, SITU_LIN=self.situ_lin,
                                         num_warps=cfg['gw'], num_stages=cfg['gs'])
         _down[(nk, H // cfg['dbn'])](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
                                      sc['part'], m, H, I, MAX_M, cfg['dbn'], self.bk_i,
@@ -533,7 +540,7 @@ class LayerPool:
                 MISS_CHUNK, 1024)
             _gate_up[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], stage[0], stage[2], g13, sc['mid'], m, H, I,
                                              self.limit, MAX_M, cfg['gbn'], self.bk_h, MX=self.prefill.mxfp4,
-                                             ALPHA=self.alpha, BETA=self.beta, STAGED=True, num_warps=cfg['gw'],
+                                             ALPHA=self.alpha, BETA=self.beta, SITU=self.situ, SITU_LIN=self.situ_lin, STAGED=True, num_warps=cfg['gw'],
                                              num_stages=cfg['gs'])
             _down[(cap, H // cfg['dbn'])](sc['mid'], _miss['r'], _miss['e'], stage[1], stage[3], g2, sc['part'], m, H,
                                           I, MAX_M, cfg['dbn'], self.bk_i, MX=self.prefill.mxfp4, STAGED=True,

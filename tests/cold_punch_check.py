@@ -25,7 +25,7 @@ os.environ.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(map(str, DRIVES)), X
 from xtier.cache import cold  # noqa: E402
 
 H, I, E, NODES, FORMAT, THREADS = 2048, 1024, 4, 2, 'mxfp4', 2
-KEY = f'test-model-E{E}-H{H}-I{I}-{FORMAT}-n{NODES}'
+KEY = f'test-model-E{E}-H{H}-I{I}-{FORMAT}-n{NODES}' + ('-u3' if os.environ.get('XTIER_COLD_UNITS') == '3' else '')
 TOOL = [sys.executable, str(Path(__file__).resolve().parents[1] / 'tools' / 'cold_punch.py'), str(MODEL)]
 PATHS = ['--paths', ':'.join(map(str, DRIVES))]
 sizes, part, record = cold._layout(H, I, NODES, FORMAT)
@@ -70,22 +70,26 @@ for number, chunk in enumerate((order[:len(order) // 2], order[len(order) // 2:]
         f.write(rng.randbytes(777))
 (MODEL / 'config.json').write_text('{}')
 
-# the records, as attach writes them, and the manifest
-counts, drive_of = cold._drive_parts(NODES, len(DRIVES))
-where = cold.where_records(drive_of, counts, part)
+# the records, as attach writes them (XTIER_COLD_UNITS=3: each node part in three units), and the manifest
+units, unit_bytes, counts, drive_of = cold._unit_layout(sizes, NODES, len(DRIVES))
+U = len(units)
+where = cold.where_records(drive_of, unit_bytes)
 fds = [os.open(d / f'{KEY}.cold', os.O_CREAT | os.O_RDWR) for d in DRIVES]
 manifest = {'version': 2, 'layers': {}}
-share = [c * part for c in counts]
+share = where.share
 for number, lid in enumerate((0, 1)):
     starts = [number * E * s for s in share]
     stored = [3, 1, 0, 2]
     for i, e in enumerate(stored):
         for n in range(NODES):
-            d, offset = where(starts, i, n)
-            body = b''.join(tensors[lid, e, k][n * sizes[k]:(n + 1) * sizes[k]] for k in range(6))
-            os.pwrite(fds[d], body, offset)
+            body, at = b''.join(tensors[lid, e, k][n * sizes[k]:(n + 1) * sizes[k]] for k in range(6)), 0
+            for t in range(U):   # a part's units, one after another, are the part
+                d, offset = where(starts, i, n * U + t)
+                os.pwrite(fds[d], body[at:at + unit_bytes[t]], offset)
+                at += unit_bytes[t]
     manifest['layers'][str(lid)] = dict(record=record, stored=stored, starts=starts, parts=counts,
-                                        ends=[s + E * z for s, z in zip(starts, share)], source=cold.source())
+                                        ends=[s + E * z for s, z in zip(starts, share)], source=cold.source(),
+                                        **({'units': U, 'map': drive_of} if U > 1 else {}))
 for fd in fds:
     os.fsync(fd)
 (DRIVES[0] / f'{KEY}.json').write_text(json.dumps(manifest))

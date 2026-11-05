@@ -234,7 +234,7 @@ for x in A.x:
     lib.xtier_cold_stats(store, stats1)
     asked = stats1[0] - stats0[0]
     if A.mode == 'engine':   # the plan's own count of the experts it read and the time it waited
-        ps = (C.c_double * 6)()
+        ps = (C.c_double * 7)()   # xtier_cold_plan_stats writes seven
         lib.xtier_cold_plan_stats(plan, ps)
         loads, load_s = int(ps[1]), ps[2]
         misses_per_call = [loads / len(calls)]

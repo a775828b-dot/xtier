@@ -21,7 +21,8 @@ from xtier.cache.pool import _halves, _tile_k
 @triton.jit
 def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13, MID, K: tl.constexpr, H: tl.constexpr,
                    I: tl.constexpr, LIMIT, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr,
-                   ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
+                   ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, SITU: tl.constexpr = 0.0,
+                   SITU_LIN: tl.constexpr = 0.0):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)
     s = tl.load(TILE_S + tile).to(tl.int64)   # slot of the tile's expert (expert e for a fully cached layer)
@@ -47,7 +48,12 @@ def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13
     if LIMIT > 0:
         u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
         g = tl.minimum(g, LIMIT)
-    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+    if SITU > 0:   # SiTU-GLU (Kimi K3): SITU*tanh(g/SITU)*sigmoid(g) * up, up soft-clipped by SITU_LIN (tanh = 2*sigmoid(2x)-1)
+        g = SITU * (2. / (1. + tl.exp(-2. * g / SITU)) - 1.) / (1. + tl.exp(-g))
+        if SITU_LIN > 0:
+            u = SITU_LIN * (2. / (1. + tl.exp(-2. * u / SITU_LIN)) - 1.)
+        val = g * u
+    elif ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
@@ -123,7 +129,8 @@ def resident_prefill(prefill, arena, x, ids, weights):
         nt = len(tiles)
         _gate_up_tiles[(nt, I // gbn)](x[start:start + size], order, meta[0], meta[0], meta[1], meta[2], arena[0], arena[2], g13,
                                        mid, k, H, I, prefill.swiglu_limit, bm, gbn, bkh, MX=prefill.mxfp4,
-                                       ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                       ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta, SITU=prefill.situ_beta,
+                                       SITU_LIN=prefill.situ_linear,
                                        num_warps=gw, num_stages=gs)
         _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[0], meta[1], meta[2], arena[1], arena[3], g2, routes, H, I, bm,
                                     dbn, bki, MX=prefill.mxfp4, num_warps=dw, num_stages=ds)
@@ -190,7 +197,8 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
             nt = len(tiles)
             _gate_up_tiles[(nt, I // gbn)](x, order, meta[0], meta[1], meta[2], meta[3], pool.arena[0], pool.arena[2], g13,
                                            mid, k, H, I, prefill.swiglu_limit, bm, gbn, _tile_k(H), MX=prefill.mxfp4,
-                                           ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                           ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta, SITU=prefill.situ_beta,
+                                       SITU_LIN=prefill.situ_linear,
                                            num_warps=gw, num_stages=gs)
             _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], meta[3], pool.arena[1], pool.arena[3], g2,
                                         routes, H, I, bm, dbn, _tile_k(I), MX=prefill.mxfp4, num_warps=dw, num_stages=2)

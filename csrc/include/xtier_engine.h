@@ -24,7 +24,7 @@ extern "C" {
 // swiglu_limit > 0 clamps up to [-L,L] and gate to (-inf,L] before SiLU (DeepSeek V4);
 // 0 disables the clamp. create owns an explicitly NUMA-bound, sharded copy (overrides
 // inherited interleave policy for its own mappings only). The input buffers can be
-// released after create returns. experts=10..512; threads<=128, divisible by the node count.
+// released after create returns. experts=10..1024; threads<=128, divisible by the node count.
 // scale_format: 0=NVFP4 (E4M3/16), 1=MXFP4 (UE8M0/32).
 // MXFP4 globals must be arrays of 1. Shard scales retain compact 32-wide UE8M0
 // blocks; packed weights are unchanged. NVFP4 retains its original layout.
@@ -68,11 +68,14 @@ int xtier_slot_pieces(void *plan,int slot,int node,void **pointers,size_t *bytes
 // GPT-OSS SwiGLU (MiniMax M3): gate*sigmoid(alpha*gate)*(up+beta) after the clamp. The defaults 1 / 0 keep the
 // plain SiLU path; set before the first forward. 0 on success.
 int xtier_set_swiglu(void *plan, float alpha, float beta);
+// SiTU-GLU (Kimi K3): beta*tanh(gate/beta)*sigmoid(gate)*up, up soft-clipped to linear*tanh(up/linear) when linear > 0.
+// beta > 0 replaces SiLU (GPT-OSS SwiGLU is ignored then); set before the first forward. 0 on success.
+int xtier_set_situ(void *plan, float beta, float linear);
 // Four ints: hidden, inter, experts, largest decode batch per CUDA slot (8).
 int xtier_shape(void *plan, int *shape);
 
 // x: BF16 bits [m,H], ids: int32 [m,k], routing: float32 [m,k].
-// y: float32 [m,H]. m=1..2048, k=1..10. Buffers must not alias.
+// y: float32 [m,H]. m=1..2048, k=1..16. Buffers must not alias.
 // FP32 intermediate and accumulation; no BF16 rounding after SiLU.
 // One caller per plan; different plans serialize on a process-wide shared pool.
 // All active plans must request the same thread count. Create after worker spawn;

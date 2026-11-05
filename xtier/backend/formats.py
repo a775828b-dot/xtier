@@ -111,6 +111,27 @@ class Fp8Fp4Experts(Format):
         return torch.ones((E, 2), dtype=torch.float32), torch.ones((E,), dtype=torch.float32)
 
 
+class Mxfp4Experts(Format):
+    """SGLang's MXFP4 MoE method (``Mxfp4MoEMethod``; Kimi K3 / K3.1, whose compressed-tensors MXFP4 experts SGLang
+    loads through ``Mxfp4Config`` on CUDA): E2M1 weights, UE8M0 scales per 32 as bytes, no global scales. Some of its
+    runners pad H or I at creation; the engine takes the checkpoint's sizes only (checked in engine_inputs)."""
+    name = 'mxfp4'
+    required = {'w13_weight': 'w13', 'w2_weight': 'w2', 'w13_weight_scale': 'w13', 'w2_weight_scale': 'w2'}
+    bulk = ('w13_weight', 'w2_weight', 'w13_weight_scale', 'w2_weight_scale')
+
+    def engine_inputs(self, layer, up_first):
+        w13, w2 = layer.w13_weight.data.view(torch.uint8), layer.w2_weight.data.view(torch.uint8)
+        E, I2, H2 = w13.shape
+        if tuple(w2.shape) != (E, 2 * H2, I2 // 4):
+            raise NotImplementedError(f'xtier: padded MXFP4 expert layout (w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)})')
+        return (_gate_up(w13, up_first), w2.contiguous(), _gate_up(_ue8m0_bytes(layer.w13_weight_scale.data), up_first),
+                _ue8m0_bytes(layer.w2_weight_scale.data)) + self.globals(layer)
+
+    def globals(self, layer):
+        E = layer.w13_weight.data.shape[0]
+        return torch.ones((E, 2), dtype=torch.float32), torch.ones((E,), dtype=torch.float32)
+
+
 E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)   # midpoints of the E2M1 magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6
 
 
@@ -168,6 +189,8 @@ def detect(gpu_method, draft=False) -> Format:
         return Fp8Fp4Experts()
     if name == 'Mxfp4FlashinferCutlassMoEMethod' and getattr(getattr(gpu_method, '_fp8', None), 'is_fp4_expert', False):
         return Fp8Fp4Experts()   # SGLang's SM90 / SM120 choice for these experts: Fp8MoEMethod's parameters, E8M0 scales
+    if name == 'Mxfp4MoEMethod':
+        return Mxfp4Experts()   # Kimi K3 / K3.1 (compressed-tensors MXFP4 loaded through Mxfp4Config)
     if name == 'CompressedTensorsFusedMoEMethod':
         return CompressedTensorsNvFp4()   # the scheme sits on the layer: checked once the parameters exist
     if name == 'UnquantizedFusedMoEMethod' and draft:

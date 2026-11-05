@@ -131,7 +131,7 @@ class SecondLayer:
                 x = Pointer(base + CONTROL, torch.bfloat16)
                 _gate_up[(nk, I // cfg['gbn'])](x, slot_list, slot_exp, self.arena[0], self.arena[2], self.g13, s['mid'], m,
                                                 H, I, pool.limit, MAX_M, cfg['gbn'], pool.bk_h, MX=pool.prefill.mxfp4,
-                                                ALPHA=pool.alpha, BETA=pool.beta, num_warps=cfg['gw'], num_stages=cfg['gs'])
+                                                ALPHA=pool.alpha, BETA=pool.beta, SITU=pool.situ, SITU_LIN=pool.situ_lin, num_warps=cfg['gw'], num_stages=cfg['gs'])
                 # XTIER_GPU2_SLOW=n, test only: a slower GPU, n more times the same work (the same result)
                 for _ in range(1 + int(os.environ.get('XTIER_GPU2_SLOW', '0'))):
                     _down[(nk, H // cfg['dbn'])](s['mid'], slot_list, slot_exp, self.arena[1], self.arena[3], self.g2,

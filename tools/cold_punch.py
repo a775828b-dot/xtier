@@ -59,6 +59,15 @@ def read(fd, offset, nbytes, slot):
     return addr + offset - a0
 
 
+def scratch(slot, nbytes):
+    """The address of the thread's buffer `slot` of at least nbytes (not read into)."""
+    buffers = _local.__dict__.setdefault('buffers', {})
+    if slot not in buffers or len(buffers[slot][0]) < nbytes:
+        buf = mmap.mmap(-1, -(-nbytes // ALIGN) * ALIGN)
+        buffers[slot] = buf, C.addressof(C.c_char.from_buffer(buf))
+    return buffers[slot][1]
+
+
 class Layer:
     """One layer's records (manifest) and the checkpoint tensors they hold (KEY.ranges)."""
 
@@ -67,9 +76,11 @@ class Layer:
         self.part = sum(self.sizes)
         self.at = [sum(self.sizes[:k]) for k in range(len(self.sizes))]   # a piece's place in a node part
         self.nodes = entry['record'] // self.part
-        if self.nodes * self.part != entry['record'] or self.nodes != sum(entry['parts']):
+        self.units = entry.get('units', 1)   # XTIER_COLD_UNITS of the store that wrote them
+        if self.nodes * self.part != entry['record'] or self.nodes * self.units != sum(entry['parts']):
             stop(f'layer {layer_id}: {self.part}-byte node parts do not make its {entry["record"]}-byte records')
-        self.where = cold.where_records(cold.hand_out(entry['parts']), entry['parts'], self.part)
+        self.unit_bytes = [sum(b for _, _, b in u) for u in cold._unit_pieces(self.sizes, self.units)]
+        self.where = cold.where_records(entry.get('map') or cold.hand_out(entry['parts']), self.unit_bytes)
         self.starts, self.stored = entry['starts'], entry['stored']
         self.tensors = {}   # expert -> [(piece, file number, offset, bytes)]
         for e, piece, f, offset, nbytes in noted['reads']:
@@ -82,9 +93,20 @@ class Layer:
             stop(f'layer {layer_id}: the noted tensors are not the six pieces of each stored expert')
 
     def parts(self, i, fds):
-        """The addresses of the i-th stored record's node parts, read."""
-        return [read(fds[d], offset, self.part, n)
-                for n, (d, offset) in enumerate(self.where(self.starts, i, n) for n in range(self.nodes))]
+        """The addresses of the i-th stored record's node parts, read (a part in units: its units one after another,
+        which is the part's own layout)."""
+        if self.units == 1:
+            return [read(fds[d], offset, self.part, n)
+                    for n, (d, offset) in enumerate(self.where(self.starts, i, n) for n in range(self.nodes))]
+        out = []
+        for n in range(self.nodes):
+            whole, at = scratch(('part', n), self.part), 0
+            for t, nbytes in enumerate(self.unit_bytes):
+                d, offset = self.where(self.starts, i, n * self.units + t)
+                C.memmove(whole + at, read(fds[d], offset, nbytes, (n, t)), nbytes)
+                at += nbytes
+            out.append(whole)
+        return out
 
 
 class Store:

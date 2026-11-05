@@ -32,6 +32,8 @@ P.add_argument('--tokens', type=int, default=4096)
 P.add_argument('--corpus', action='append', help='NAME=PATH, repeatable (default: the baseline corpora)')
 P.add_argument('--prefix', default='', help='text before every segment, not scored (e.g. a document-start token)')
 P.add_argument('--out', default='bench/results/ppl')
+P.add_argument('--top', type=int, default=0, help='also keep the N most likely tokens of every scored position in '
+               'OUT/TAG.top.json, for the KL between two runs (bench/kl_compare.py)')
 A = P.parse_args()
 tok = AutoTokenizer.from_pretrained(A.tokenizer, trust_remote_code=True)
 prefix = tok.encode(A.prefix, add_special_tokens=False) if A.prefix else []
@@ -46,18 +48,26 @@ for name, path in corpora.items():
         s = ids[i * stride: i * stride + A.tokens]
         if len(s) == A.tokens:
             segs.append((name, i, s))
-rows = []
+rows, tops = [], []
 for name, i, s in segs:
     urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{A.port}/flush_cache', b''), timeout=60)
     # the segment's first token stays unscored, as without a prefix
-    body = json.dumps(dict(input_ids=prefix + s, sampling_params=dict(max_new_tokens=1, temperature=0),
-                           return_logprob=True, logprob_start_len=len(prefix) + 1 if prefix else 0)).encode()
-    req = urllib.request.Request(f'http://127.0.0.1:{A.port}/generate', body, {'Content-Type': 'application/json'})
+    body = dict(input_ids=prefix + s, sampling_params=dict(max_new_tokens=1, temperature=0),
+                return_logprob=True, logprob_start_len=len(prefix) + 1 if prefix else 0)
+    if A.top:
+        body['top_logprobs_num'] = A.top
+    req = urllib.request.Request(f'http://127.0.0.1:{A.port}/generate', json.dumps(body).encode(),
+                                 {'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=1800) as r:
         meta = json.loads(r.read())['meta_info']
-    lps = [x[0] for x in meta['input_token_logprobs'] if x[0] is not None]
+    scored = [j for j, x in enumerate(meta['input_token_logprobs']) if x[0] is not None]
+    lps = [meta['input_token_logprobs'][j][0] for j in scored]
     nll = -sum(lps) / len(lps)
     rows.append(dict(corpus=name, seg=i, n=len(lps), nll=nll))
+    if A.top:   # per scored position: [token id, log probability] of the most likely tokens
+        top = meta['input_top_logprobs']
+        tops.append(dict(corpus=name, seg=i, lp=[round(x, 6) for x in lps],
+                         top=[[[t, round(lp, 6)] for lp, t, *_ in top[j]] for j in scored]))
     print(json.dumps(rows[-1]), flush=True)
 summary = {}
 for name in list(corpora) + ['all']:
@@ -68,3 +78,5 @@ for name in list(corpora) + ['all']:
 print('SUMMARY', json.dumps(summary), flush=True)
 os.makedirs(A.out, exist_ok=True)
 json.dump(dict(tag=A.tag, rows=rows, summary=summary), open(os.path.join(A.out, f'{A.tag}.json'), 'w'), indent=1)
+if A.top:
+    json.dump(dict(tag=A.tag, top=A.top, segments=tops), open(os.path.join(A.out, f'{A.tag}.top.json'), 'w'))

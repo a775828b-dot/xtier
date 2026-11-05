@@ -25,8 +25,9 @@ Safety, so that a model never runs out of memory because of the extra slots:
 - XTIER_CACHE_ELASTIC_RESERVE_GIB (2): free device memory never given to slots (lazy kernel loads, workspaces);
 - before every forward that allocates (prefill, mixed, draft extend) the deficit to its predicted need x
   XTIER_CACHE_ELASTIC_MARGIN (1.25) plus the reserve is released;
-- every XTIER_CACHE_ELASTIC_CHECK (16) decode forwards: free memory under XTIER_CACHE_ELASTIC_CRITICAL_GIB (1)
-  releases every extra slot and stops growing for XTIER_CACHE_ELASTIC_COOLDOWN_S (600);
+- every XTIER_CACHE_ELASTIC_CHECK (16) decode forwards: free memory under XTIER_CACHE_ELASTIC_CRITICAL_GIB (1), also
+  once the allocator's cache is emptied, releases every extra slot and stops growing for
+  XTIER_CACHE_ELASTIC_COOLDOWN_S (600);
 - an out-of-memory error in a forward while extra slots are held releases them all, empties the allocator's cache,
   turns the elastic cache off for the process and runs the forward once more. That keeps the server up, but the second
   run is not the first run: the layers before the error have already updated what a forward updates in place (with an
@@ -363,7 +364,9 @@ class Governor:
         self.decodes += 1
         if self.decodes % self.every:
             return
-        if self.extra > 0 and self.free_bytes() < self.critical:
+        # the allocator's cached blocks count as free here: a speculative decode's eager steps (Kimi K3.1 with DFlash2)
+        # leave some cached after every window, and with a small reserve that alone took every slot (11-05)
+        if self.extra > 0 and self.free_bytes() < self.critical and self.free_bytes(empty=True) < self.critical:
             self.emergency(f'free memory under {self.critical / GIB:.1f} GiB')
             return
         # not before a request's prefill has been seen: the decode-sized forwards of SGLang's start-up (CUDA graph

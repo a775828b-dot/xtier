@@ -19,9 +19,14 @@ PRESETS = {
     # compressed-tensors NVFP4 W4A4 (weight_packed, weight_global_scale = 1 / scale_2)
     'minimax_m31': ('/data/fast/nvme2/models/modelscope/MiniMax/MiniMax-M3.1-Flash', 'language_model.model.layers.{layer}.block_sparse_moe.experts.{e}.',
                     ('w1', 'w3', 'w2'), 6144, 3072, 128, 4, 7.0, 20, 8, 'nvfp4', {'SPIN_COUNT': '1048576'}),
+    # compressed-tensors MXFP4 (weight_packed, UE8M0 weight_scale per 32, no global scale); SiTU-GLU; layer 1: shard 2
+    'kimi_k31': ('/data/fast/nvme1/models/moonshotai/Kimi-K3.1-Pro', 'language_model.model.layers.{layer}.block_sparse_moe.experts.{e}.',
+                 ('w1', 'w3', 'w2'), 3584, 3072, 896, 16, 0.0, 1, 6, 'mxfp4', {'SPIN_COUNT': '1048576'}),
 }
 # GPT-OSS SwiGLU (alpha, beta) of a preset: gate * sigmoid(alpha * gate) * (up + beta); the others (1, 0) = SiLU
 SWIGLU = {'minimax_m31': (1.702, 1.0)}
+# SiTU-GLU (beta, linear_beta) of a preset: beta * tanh(gate / beta) * sigmoid(gate) * linear * tanh(up / linear)
+SITU = {'kimi_k31': (4.0, 25.0)}
 
 
 def load(preset, layer=None):
@@ -38,8 +43,8 @@ def load(preset, layer=None):
     w13 = torch.empty((E, 2 * I, H // 2), dtype=torch.uint8); w2 = torch.empty((E, H, I // 2), dtype=torch.uint8)
     s13 = torch.empty((E, 2 * I, H // G), dtype=torch.uint8); s2 = torch.empty((E, H, I // G), dtype=torch.uint8)
     g13 = torch.ones((E, 2), dtype=torch.float32); g2 = torch.ones((E,), dtype=torch.float32)
-    scale_suffix = '.scale' if FMT == 'mxfp4' else '.weight_scale'
     packed = KEY.format(layer=layer, e=0) + NAMES[0] + '.weight_packed' in index   # compressed-tensors naming
+    scale_suffix = '.scale' if FMT == 'mxfp4' and not packed else '.weight_scale'   # DeepSeek V4 MXFP4: .scale
     weight_suffix = '.weight_packed' if packed else '.weight'
     grouped = {}
     for e in range(E):
@@ -53,7 +58,7 @@ def load(preset, layer=None):
                                  'down': (w2[e], s2[e], g2[e], slice(None))}[role]
                 w[rows].copy_(f.get_tensor(p + n + weight_suffix).view(torch.uint8))
                 s[rows].copy_(f.get_tensor(p + n + scale_suffix).view(torch.uint8))
-                if packed:
+                if packed and FMT == 'nvfp4':
                     g.copy_(f.get_tensor(p + n + '.weight_global_scale').float().reciprocal().reshape(()))
                 elif FMT == 'nvfp4':
                     g.copy_(f.get_tensor(p + n + '.weight_scale_2'))

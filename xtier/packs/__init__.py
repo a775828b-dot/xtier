@@ -8,7 +8,7 @@ resolved): ``install_serving``.
 import importlib
 import os
 
-PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4', 'minimax_m3', 'speculative')
+PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4', 'minimax_m3', 'kimi_k3', 'speculative')
 
 
 def selected() -> list[str]:
@@ -33,7 +33,7 @@ def install(registry, hook_type) -> list[str]:
 
 # packs with hooks in the process that serves the API (prompt tokenization, argument resolution), installed there
 # and nowhere else
-SERVING = ('minimax_m3',)
+SERVING = ('minimax_m3', 'kimi_k3')
 
 
 def install_serving(registry, hook_type) -> list[str]:
