@@ -1,8 +1,8 @@
 """The console page: markup, style and script (core.Console holds the logic).
 
 A model rail (small cards: name, port, README decode / prefill speeds; it scrolls when the models outgrow it, so the
-console keeps its height), the launch options of the chosen model (defaults = the measured configuration, changed
-ones are marked) and a HUD that follows the loading phases and, once online, the server's decode telemetry. Always
+console keeps its height), the launch options of the chosen model (changes from its last accepted apply
+are marked) and a HUD that follows the loading phases and, once online, the server's decode telemetry. Always
 dark, scoped under .xt, so a host page can embed card_html() with its own texts and routes (data['texts'],
 data['api']); page_html() is the standalone page of `python -m xtier.console`.
 """
@@ -13,7 +13,7 @@ import json
 from . import perf_ui
 
 SUBTITLE = '官方 SGLang main + XTier 插件 · 专家分布在显存 / 内存两层，NVMe 只放大嵌入表（Engram / PLE） · 每个模型在自己的端口上提供 OpenAI 兼容接口'
-FOOT = '默认参数 = configs/*/console.py 里的实测配置，改动过的项会标出。一次只跑一个模型：启动新的模型前会先停掉当前的。'
+FOOT = '高亮表示相对上次应用的参数变更。保存／读取配置不会自动重启服务。一次只跑一个模型：启动新的模型前会先停掉当前的。'
 
 CSS = r"""
 .xt{--c:#3ee6ff;--v:#a78bfa;--p:#f472b6;--g:#9cf06b;--a:#fbbf24;--r:#fb7185;--t:#dcecff;--d:#7f90ad;--line:rgba(62,230,255,.22);
@@ -84,7 +84,7 @@ background:rgba(3,8,20,.9) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.o
 .xt-field select:focus{outline:none;border-color:var(--c);box-shadow:0 0 0 3px rgba(62,230,255,.18)}
 .xt-field select:disabled{opacity:.42}
 .xt-field.changed select{border-color:var(--v);box-shadow:0 0 0 1px rgba(167,139,250,.35)}
-.xt-field.changed::after{content:"已改动 · 非实测默认";font-size:10.5px;color:var(--v)}
+.xt-field.changed::after{content:"待应用 · 与上次应用不同";font-size:10.5px;color:var(--v)}
 .xt-switch .sw{position:relative;display:flex;align-items:center;gap:10px;min-height:36px;padding:7px 10px;border-radius:9px;border:1px solid rgba(62,230,255,.28);background:rgba(3,8,20,.9);cursor:pointer;transition:border-color .15s,box-shadow .15s}
 .xt-switch .sw:hover{border-color:rgba(62,230,255,.55)}
 .xt-switch input{position:absolute;opacity:0;width:1px;height:1px;margin:0;pointer-events:none}
@@ -203,6 +203,7 @@ def card_html(data):
     <div class=xt-grid id=xt-options></div>
     <div class=xt-notes id=xt-notes></div>
     <div class=xt-actions>
+      <button type=button class="xt-btn" id=xt-presets>保存/读取</button>
       <button type=submit class="xt-btn xt-engage" id=xt-engage>启动 · ENGAGE</button>
       <button type=button class="xt-btn xt-abort" id=xt-abort disabled>停止 · ABORT</button>
       <button type=button class=xt-btn id=xt-reset>恢复实测默认</button>
@@ -263,6 +264,7 @@ JS = r"""
   const post = (p, body) => fetch(url(p), {method: 'POST', headers: {'Accept': 'application/json', 'X-Requested-With': 'fetch'}, body});
   const matches = (cond, v) => Object.entries(cond || {}).every(([k, x]) => v[k] === x);
   const models = Object.keys(data.models);
+  const applied = data.applied || {};
   const chosen = {};
   for (const m of models) chosen[m] = {...data.defaults[m], ...(data.saved[m] || {})};
   let model = data.saved.model && data.models[data.saved.model] ? data.saved.model : models[0];
@@ -332,19 +334,74 @@ JS = r"""
 
   // an option without effect under the others (off_when) is disabled; notes say what a combination does
   function paintOptions() {
-    const v = chosen[model], d = data.defaults[model], notes = [];
+    const v = chosen[model], d = applied[model], notes = [];
     let changed = 0;
     for (const o of data.options[model]) {
       const f = $('xt-options').querySelector(`.xt-field[data-key="${o.key}"]`);
       const off = (o.off_when || []).some(c => matches(c, v));
       f.querySelector('select, input').disabled = off;
-      f.classList.toggle('changed', !off && v[o.key] !== d[o.key]);
-      if (!off && v[o.key] !== d[o.key]) changed++;
+      f.classList.toggle('changed', !!d && v[o.key] !== d[o.key]);
+      if (!!d && v[o.key] !== d[o.key]) changed++;
     }
     for (const n of data.models[model].notes || []) if (matches(n.when, v)) notes.push(n.warn ? `<b>${esc(n.text)}</b>` : esc(n.text));
-    notes.push(changed ? `<b>${changed} 项不同于实测默认</b>` : '全部为实测默认配置');
+    notes.push(!d ? '尚无已应用快照' : changed ? `<b>${changed} 项与上次应用不同</b>` : '与上次应用参数一致');
     $('xt-notes').innerHTML = notes.join(' · ');
   }
+
+  const presetDialog = document.createElement('dialog');
+  presetDialog.className = 'xt-confirm'; presetDialog.id = 'xt-presets-dialog';
+  presetDialog.setAttribute('aria-labelledby', 'xt-presets-title');
+  presetDialog.innerHTML = '<h3 id="xt-presets-title">保存/读取配置</h3><p>读取只更新待应用参数，不会重启服务。</p><label class="xt-field">配置名称<input id="xt-preset-name" maxlength="80"></label><div class="xt-actions"><button class="xt-btn" id="xt-preset-save">保存当前配置</button></div><label class="xt-field">已保存配置<select id="xt-preset-list"></select></label><div id="xt-preset-preview" style="max-height:35vh;overflow:auto"></div><p id="xt-preset-message" role="status"></p><div class="xt-actions"><button class="xt-btn" id="xt-preset-load">读取所选配置</button><button class="xt-btn" id="xt-preset-close">关闭</button></div>';
+  root.append(presetDialog);
+  let presets = [], presetModel, presetValues, presetBusy = false;
+  const presetMessage = text => $('xt-preset-message').textContent = text;
+  function previewPreset() {
+    const entry = presets.find(p => p.id === $('xt-preset-list').value);
+    $('xt-preset-load').disabled = !entry || presetBusy;
+    $('xt-preset-preview').innerHTML = entry ? '<p>'+esc(data.models[entry.model]?.name || entry.model)+'</p><dl>'+Object.entries(entry.options).map(([k,v])=>{
+      const option = data.options[entry.model]?.find(o=>o.key===k);
+      return '<dt>'+esc(option?.label || k)+'</dt><dd>'+esc(option?.choices.find(c=>c[0]===v)?.[1] || v)+'</dd>';
+    }).join('')+'</dl>' : '<p>尚未保存配置</p>';
+  }
+  async function presetRequest(path, body) {
+    const response = body ? await post(path, body) : await fetch(url(path), {cache:'no-store'});
+    const result = await response.json();
+    if(!response.ok) throw Error(result.error || response.statusText);
+    return result;
+  }
+  async function refreshPresets(selected) {
+    presets = (await presetRequest('api/profiles')).profiles;
+    $('xt-preset-list').innerHTML = presets.map(p=>'<option value="'+esc(p.id)+'">'+esc(p.name)+' · '+esc(data.models[p.model]?.name || p.model)+'</option>').join('');
+    if(selected) $('xt-preset-list').value = selected;
+    previewPreset();
+  }
+  $('xt-presets').onclick = async () => {
+    presetModel = model; presetValues = {...chosen[model]};
+    $('xt-preset-name').value = ''; presetMessage('正在读取…');
+    $('xt-preset-load').disabled = true; presetDialog.showModal();
+    try { await refreshPresets(); presetMessage('保存对象：'+data.models[presetModel].name+' 的当前待应用参数'); }
+    catch(e) { presetMessage(e.message); }
+  };
+  $('xt-preset-list').onchange = previewPreset;
+  $('xt-preset-close').onclick = () => presetDialog.close();
+  async function presetAction(action) {
+    if(presetBusy) return; presetBusy = true;
+    $('xt-preset-save').disabled = true; $('xt-preset-load').disabled = true;
+    try {
+      if(action==='save') {
+        const entry = await presetRequest('api/profiles/save', new URLSearchParams({name:$('xt-preset-name').value, model:presetModel, options:JSON.stringify(presetValues)}));
+        await refreshPresets(entry.id); presetMessage('已保存。运行配置未改变。');
+      } else {
+        const entry = await presetRequest('api/profiles/load', new URLSearchParams({id:$('xt-preset-list').value}));
+        model = entry.model; chosen[model] = {...entry.options};
+        paintTabs(); renderOptions(); presetDialog.close();
+        msg('已读取配置“'+entry.name+'”；点击应用参数后生效。');
+      }
+    } catch(e) { presetMessage(e.message); }
+    finally { presetBusy = false; $('xt-preset-save').disabled = false; previewPreset(); }
+  }
+  $('xt-preset-save').onclick = () => presetAction('save');
+  $('xt-preset-load').onclick = () => presetAction('load');
 
   $('xt-reset').addEventListener('click', () => { chosen[model] = {...data.defaults[model]}; renderOptions(); });
 
@@ -446,16 +503,18 @@ JS = r"""
   $('xt-form').addEventListener('submit', async e => {
     e.preventDefault();
     if (busy) return;
-    const d = data.models[model];
+    const submittedModel = model, submitted = {...chosen[model]};
+    const d = data.models[submittedModel];
     const ask = (hooks.confirmPrefix ? hooks.confirmPrefix() : '') +
       fill(T.confirm || '启动 XTier · {name}？\n会先停掉正在运行的 XTier 模型；就绪后在 127.0.0.1:{port} 提供 OpenAI 兼容接口（模型名 {served}）。', d, false);
     if (!await confirmAction('启动 XTier 服务', ask, '确认启动')) return;
     busy = true; $('xt-engage').disabled = true;
     msg('正在提交启动任务…');
     try {
-      const res = await post(API.start, new URLSearchParams({model, ...chosen[model]}));
+      const res = await post(API.start, new URLSearchParams({model: submittedModel, ...submitted}));
       const out = await res.json().catch(() => ({ok: false, error: '接口返回非 JSON'}));
       if (!res.ok || !out.ok) throw new Error(out.error || `HTTP ${res.status}`);
+      applied[submittedModel] = submitted; paintOptions();
       msg(`已开始：${out.label}。后台启动中，可以关闭页面。`, 'ok');
       watchJob(out.job);
     } catch (err) {
@@ -528,10 +587,9 @@ JS = r"""
     $('xt-gpu-text').textContent = g.mem_total ? `${g.name || 'GPU'}${g.count > 1 ? ' ×' + g.count : ''} · 显存 ${g.mem_used} / ${g.mem_total} GiB · 利用率 ${g.util}% · ${g.power} W` : 'GPU --';
     $('xt-gpu-bar').style.width = g.mem_total ? (g.mem_used / g.mem_total * 100).toFixed(1) + '%' : '0';
     if (s.state === 'online' || s.state === 'loading') {
-      const opts = s.options ? Object.entries(s.options).filter(([k, v]) => data.defaults[s.model] && data.defaults[s.model][k] !== v).length : 0;
       $('xt-end').innerHTML = fill(T.endpoint || '<span>OpenAI 兼容接口</span><code>http://127.0.0.1:{port}/v1</code><span>模型名</span><code>{served}</code>', s, true) +
         (s.version ? `<span>XTier</span><code>${esc(s.version)}</code>` : '') + (s.load_s ? `<span>加载用时 ${esc(s.load_s)} s</span>` : '') +
-        `<span>${opts ? opts + ' 项非默认参数' : '实测默认参数'}</span>`;
+        '<span>当前运行参数已应用</span>';
     } else if (s.state === 'failed') {
       $('xt-end').innerHTML = `<span>${esc(s.error || '')}</span>`;
     } else {

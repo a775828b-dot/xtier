@@ -161,5 +161,10 @@ class Performance:
         else:
             report = {'pending': True, 'rounds': [], 'note': '结果尚未生成' if snapshot['state'] in ('running', 'cancelling')
                       else '测试未产生完整结果；配置快照已保留。'}
+        # Older reports only retained the copy counts; recover details from this run's own artifact.
+        if report.get('copy_results') and 'rows' not in report['copy_results']:
+            raw = self.directory / 'copy' / (key + '-c1.json')
+            if raw.is_file():
+                report['copy_results'] = perf.copy_summary(json.loads(raw.read_text()))
         report['launch_snapshot'] = snapshot
         return report

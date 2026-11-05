@@ -44,6 +44,29 @@ JS = r'''
  el('xp-run').onclick=()=>action('start');el('xp-stop').onclick=()=>action('cancel');el('xp-view').onclick=()=>showReport(latestId);
  el('xp-close').onclick=()=>el('xp-dialog').close();el('xp-dialog').addEventListener('close',()=>{dialogId=null;});
  function configGrid(config){return '<dl class="xp-config">'+Object.entries(config||{}).map(([k,v])=>'<div><dt>'+esc(labels[k]||k)+'</dt><dd>'+esc(k==='kind'?(kinds[v]||v):typeof v==='object'?JSON.stringify(v):v)+'</dd></div>').join('')+'</dl>';}
+ function resultTable(headers, rows){return '<div class="xp-scroll"><table><thead><tr>'+headers.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+row.map(cell=>'<td>'+esc(cell)+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';}
+ function agentResult(agent){
+  const rows=agent.rows||[], total=rows.reduce((n,r)=>n+(r.output_tokens||0),0);
+  const failures=agent.args?.failures||[];
+  let html='<h4>Agent 多轮结果</h4>'+configGrid({'完成请求':rows.length,'输出 token':total,'总墙钟秒':fmt(agent.wall_s),'请求失败':failures.length,'任务准确率':'未评分：此测试没有标准答案或任务验收器'});
+  html+='<p>下表逐轮展示性能和工具调用。工具调用次数、无 HTTP 错误均不代表任务正确。</p>';
+  html+=resultTable(['会话 / 步骤','输入 / 缓存 / 输出 token','TTFT 秒','decode tok/s','验证步数','接受长度','每验证步 ms','工具调用'],rows.map(r=>[
+   r.session+' / '+r.step,[r.prompt_tokens??'—',r.cached_tokens??'—',r.output_tokens??'—'].join(' / '),fmt(r.ttft_s),fmt(r.decode_tps),r.verify_steps||'—',r.verify_steps?fmt(r.accept):'—',r.verify_steps?fmt(r.step_ms):'—',(r.tool_calls||[]).join(', ')||'无'
+  ]));
+  if(failures.length) html+='<h4>未完成请求</h4>'+resultTable(['会话','步骤','HTTP 状态'],failures.map(r=>[r.session,r.step,r.http_status]));
+  if(!rows.length) html+='<p>没有完成的请求，不能据此评估性能。</p>';
+  return html;
+ }
+ function copyResult(result){
+  const rows=result.rows||[], total=result.total||0, correct=result.correct??(total-(result.different||0));
+  const accuracy=result.accuracy??(total?correct/total:null);
+  let html='<h4>照抄正确性</h4>'+configGrid({'归一化完全匹配准确率':accuracy==null?'—':fmt(accuracy*100)+'%','严格原文匹配率':result.strict_accuracy==null?'—':fmt(result.strict_accuracy*100)+'%','通过 / 总例数':correct+' / '+total,'请求错误':result.errors??'未记录'});
+  html+='<p>准确率 = 完全匹配的例数 / 总例数。归一化沿用照抄脚本：去除首尾换行及外层代码围栏；严格匹配不做归一化。请求错误计为未通过。两段样本只能作为冒烟检查。</p>';
+  html+=resultTable(['样例','结果','差异片段数','结束原因','请求错误'],rows.map((r,i)=>[r.case||i+1,r.exact?'完全匹配':'未通过',r.diffs.length,r.finish_reason||'未记录',r.error||'无']));
+  rows.forEach((r,i)=>{html+='<details><summary>样例 '+(r.case||i+1)+' · 查看原文、输出与差异位置</summary><h4>原文</h4><pre>'+esc(r.src)+'</pre><h4>模型输出</h4><pre>'+esc(r.out)+'</pre>'+resultTable(['操作','原文字符范围 [起,止)','输出字符范围 [起,止)'],r.diffs.map(d=>[d[0],d[1]+'–'+d[2],d[3]+'–'+d[4]]))+'<p>差异位置以归一化后的字符为准。</p></details>';});
+  if(!rows.length) html+='<p>该历史结果没有逐例数据。</p>';
+  return html;
+ }
  async function showReport(id){
   if(!id)return;dialogId=id;if(!el('xp-dialog').open)el('xp-dialog').showModal();el('xp-dialog-body').textContent='正在读取保存的配置和结果…';
   try{const response=await fetch('/api/performance/report?id='+encodeURIComponent(id),{signal:AbortSignal.timeout(15000)});const r=await response.json();if(!response.ok)throw Error(r.error||response.statusText);if(dialogId!==id)return;
@@ -56,8 +79,8 @@ JS = r'''
     for(const row of r.rounds)body+='<tr><td>'+esc('并发 '+(row.concurrency||1)+' · '+(row.context_target||row.context||'短')+' · '+({cold:'冷前缀',warm:'热前缀',independent:'独立请求'}[row.phase]||'')+' #'+((row.repeat??0)+1))+'</td><td>'+fmt(row.aggregate_tps)+'</td><td>'+fmt(row.decode_tps_median)+'</td><td>'+fmt(row.ttft_p50_s)+' / '+fmt(row.ttft_p95_s)+'</td><td>'+fmt(row.latency_p95_s)+'</td><td>'+esc((row.requests||[]).map(q=>[q.prompt_tokens??'—',q.cached_tokens??'—',q.output_tokens??'—'].join('/')).join(', '))+'</td><td>'+esc(row.skipped||(row.queued?'含排队；':'')+(row.errors??0))+'</td></tr>';
     body+='</tbody></table></div>';}
    if(r.observations)body+='<p>采样平均功耗 '+fmt(r.observations.sampled_gpu_mean_w)+' W · 采样能量 '+fmt(r.observations.sampled_gpu_energy_j)+' J · 覆盖 '+fmt(r.observations.sampled_duration_s)+' 秒（非完整请求能耗）</p>';
-   if(r.agent)body+='<h4>Agent 汇总</h4><pre>'+esc(JSON.stringify(r.agent.summary,null,2))+'</pre>';
-   if(r.copy_results)body+='<h4>照抄正确性</h4><pre>'+esc(JSON.stringify(r.copy_results,null,2))+'</pre>';
+   if(r.agent)body+=agentResult(r.agent);
+   if(r.copy_results)body+=copyResult(r.copy_results);
    body+='<p>小样本 P95 仅作参考。CPU 窗口和调度阶段可能重叠；纯 GPU / Engram 独立耗时未采集。</p><a href="/api/performance/report?id='+encodeURIComponent(id)+'" download="'+esc(id)+'.json">导出完整结果 JSON</a>';
    el('xp-dialog-body').innerHTML=body;
   }catch(e){if(dialogId===id)el('xp-dialog-body').textContent='读取结果失败：'+e.message;}

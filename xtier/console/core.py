@@ -422,7 +422,7 @@ class Console:
                                 for o in m['options']] for k, m in self.models.items()},
                 'actions': {k: self.action_state(k) for k in self.models},
                 'defaults': {k: self.defaults(k) for k in self.models},
-                'saved': self.load_settings()}
+                'saved': self.load_settings(), 'applied': self.applied_settings()}
 
     # --- saved options and state ---
 
@@ -435,6 +435,19 @@ class Console:
             except ValueError:
                 out[model] = self.defaults(model)
         return out
+
+    def applied_settings(self):
+        """Last accepted apply per model; migrate existing launch settings without inventing defaults."""
+        saved = _read_json(self.settings_file)
+        applied = _read_json(self.state_dir / 'xtier-applied.json')
+        return {model: applied.get(model, saved.get(model)) for model in self.models
+                if isinstance(applied.get(model, saved.get(model)), dict)}
+
+    def save_applied(self, model, values):
+        path = self.state_dir / 'xtier-applied.json'
+        saved = _read_json(path)
+        saved[model] = dict(values)
+        _write_json(path, saved)
 
     def save_settings(self, model, values):
         saved = _read_json(self.settings_file)   # entries of models not loaded here stay

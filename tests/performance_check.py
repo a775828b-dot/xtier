@@ -34,6 +34,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b'data: [DONE]\n\n')
 
 
+class CopyAccuracyTests(unittest.TestCase):
+    def test_exact_match_counts_cases_not_matching_characters(self):
+        result = perf.copy_summary([
+            {'src': 'a', 'out': 'a', 'diffs': []},
+            {'src': 'b', 'out': '\nb\n', 'diffs': []},
+            {'src': 'cd', 'out': 'c', 'diffs': [['delete', 1, 2, 1, 1]]},
+            {'src': 'e', 'out': '', 'diffs': [], 'error': 'HTTP 500'},
+        ])
+        self.assertEqual(result['accuracy'], .5)
+        self.assertEqual(result['strict_accuracy'], .25)
+        self.assertEqual(result['errors'], 1)
+        self.assertFalse(result['rows'][-1]['exact'])
+
+    def test_empty_samples_are_unscored(self):
+        self.assertIsNone(perf.copy_summary([])['accuracy'])
+
+
 class Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

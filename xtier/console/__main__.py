@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import core, ui
 from .perf_jobs import Performance
+from .profiles import Profiles
 
 API = {'start': 'api/start', 'stop': 'api/stop', 'status': 'api/status', 'job': 'api/job',
        'install': 'api/install', 'installJob': 'api/install-job'}
@@ -39,6 +40,8 @@ class Jobs:
         with self.lock:
             if self.job['state'] == 'running':
                 return None, '已有启动任务在进行，等它结束或先停止'
+            self.console.build(model, values)
+            self.console.save_applied(model, values)
             self.job = {'id': self.job['id'] + 1, 'state': 'running', 'label': self.console.describe(model, values),
                         'message': '', 'error': '', 'cancelled': False}
             job = self.job
@@ -141,6 +144,7 @@ class Actions:
 
 def make_handler(console, jobs, actions):
     performance = Performance(console)
+    profiles = Profiles(console)
     class Handler(BaseHTTPRequestHandler):
         server_version = 'xtier-console'
 
@@ -174,6 +178,11 @@ def make_handler(console, jobs, actions):
                     return self._json(performance.report(key))
                 except (ValueError, OSError) as exc:
                     return self._json({'error': str(exc)}, 404)
+            if path == '/api/profiles':
+                try:
+                    return self._json({'profiles': profiles.list()})
+                except (ValueError, OSError) as exc:
+                    return self._json({'error': str(exc)}, 400)
             if path == '/api/status':
                 return self._json(console.status())
             if path == '/api/job':
@@ -193,6 +202,16 @@ def make_handler(console, jobs, actions):
             length = min(int(self.headers.get('Content-Length') or 0), 65536)
             form = parse_qs(self.rfile.read(length).decode('utf-8', 'replace'))
             path = urlparse(self.path).path
+            if path in ('/api/profiles/save', '/api/profiles/load'):
+                try:
+                    if path.endswith('/load'):
+                        entry = profiles.load(form.get('id', [''])[0])
+                    else:
+                        entry = profiles.save(form.get('name', [''])[0], form.get('model', [''])[0],
+                                              json.loads(form.get('options', ['{}'])[0]))
+                    return self._json(entry)
+                except (ValueError, OSError) as exc:
+                    return self._json({'error': str(exc)}, 400)
             if path == '/api/performance/cancel':
                 return self._json(performance.cancel())
             if path in ('/api/performance/start', '/api/performance/command'):
@@ -215,7 +234,10 @@ def make_handler(console, jobs, actions):
                     values = console.validate(model, form)
                 except ValueError as exc:
                     return self._json({'ok': False, 'error': str(exc)}, 400)
-                job, err = jobs.launch(model, values)
+                try:
+                    job, err = jobs.launch(model, values)
+                except (ValueError, OSError, RuntimeError) as exc:
+                    return self._json({'ok': False, 'error': str(exc)}, 400)
                 if job is None:
                     return self._json({'ok': False, 'error': err}, 409)
                 return self._json({'ok': True, 'job': job['id'], 'label': job['label']})

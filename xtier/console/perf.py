@@ -29,6 +29,22 @@ ADVICE = [
 ]
 
 
+def copy_summary(copies):
+    """Case-level exact match after the copy benchmark's normalization; errors count as failures."""
+    rows = []
+    for index, item in enumerate(copies):
+        error = item.get('error')
+        exact = not error and not item['diffs']
+        rows.append({**item, 'case': index + 1, 'exact': bool(exact),
+                     'strict_exact': not error and item['src'] == item['out']})
+    total = len(rows)
+    correct = sum(row['exact'] for row in rows)
+    strict = sum(row['strict_exact'] for row in rows)
+    return dict(total=total, correct=correct, different=total-correct,
+                accuracy=correct/total if total else None, strict_accuracy=strict/total if total else None,
+                errors=sum(bool(row.get('error')) for row in rows), rows=rows)
+
+
 def get(url):
     """Fetch local server JSON with a bounded timeout."""
     with OPENER.open(url, timeout=8) as r:
@@ -183,14 +199,15 @@ def run(args):
                         '--model', args.model, '--source', str(source), '--chunks', '2', '--tag', Path(args.out).stem,
                         '--out', str(Path(args.out).parent/'copy')]
             print('COMMAND', __import__('shlex').join(argv), flush=True)
-            subprocess.run(argv, check=True)
+            completed = subprocess.run(argv, check=False)
             if args.kind == 'agent':
-                report['agent'] = json.loads(Path(out).read_text())
+                if Path(out).is_file():
+                    report['agent'] = json.loads(Path(out).read_text())
             else:
                 copy_file = Path(args.out).parent/'copy'/(Path(args.out).stem+'-c1.json')
-                copies = json.loads(copy_file.read_text())
-                report['copy_results'] = {'file': str(copy_file), 'total': len(copies),
-                                          'different': sum(bool(c['diffs']) for c in copies)}
+                if copy_file.is_file():
+                    report['copy_results'] = copy_summary(json.loads(copy_file.read_text()))
+            completed.check_returncode()
         else:
             levels = [1, 2, 4, 8, 16] if args.kind == 'concurrency' else [1]
             lengths = [1024, 8192, 32768, 65536] if args.kind == 'context' else [1024]
