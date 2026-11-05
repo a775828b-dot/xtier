@@ -22,9 +22,10 @@ MODEL = {
     # no packs option (the kimi_k3 pack is what runs DSA on SM120) and no context option (96K)
     'options': [o for o in common_options('DFlash2') if o['key'] in ('spec', 'threads')] + [
         {'key': 'tail', 'label': '尾部跳过', 'default': '9',
-         'choices': [['9', 'R = 9 · 实测'], ['10', 'R = 10'], ['11', 'R = 11'], ['0', '关']],
+         'choices': [['9', 'R = 9 · 实测'], ['8', 'R = 8 · 试用'], ['10', 'R = 10'], ['11', 'R = 11'], ['0', '关']],
          'hint': '不在内存、每个 token 都排在第 R 名以后的专家不读不算，会改变输出。代码题 decode：R = 9 10.3、'
-                 'R = 10 9.4、R = 11 8.3、关 4.9 tok/s；精度：不跳过好比 Q8，R = 9 在 Q5_K_M 和 Q4_K_M 之间'},
+                 'R = 10 9.4、R = 11 8.3、关 4.9 tok/s，R = 8 没实测（估约 11）；精度：不跳过好比 Q8，R = 9 在 Q5_K_M '
+                 '和 Q4_K_M 之间，R = 8 估计约等于 Q4_K_M'},
     ],
 }
 

@@ -17,6 +17,10 @@ DRAFT=${DRAFT_MODEL:-/data/fast/nvme1/models/RadixArk/Kimi-K3.1-Dflash2-Preview}
 export CUDA_HOME=$D/env-k31/lib/python3.12/site-packages/nvidia/cu13
 export PATH=$CUDA_HOME/bin:$PATH PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# the working directory off sys.path: started next to an SGLang checkout (the console starts its servers in xtier-dev),
+# python -m makes sglang a namespace package of that directory and SGLang's __init__ never runs: no cache redirect
+# (FlashInfer and Triton compile again) and, 11-05, about 1.2 GiB more GPU memory held, one elastic slot level fewer
+export PYTHONSAFEPATH=1
 export FLASHINFER_CUDA_ARCH_LIST=12.0 TVM_FFI_GPU_BACKEND=cuda TVM_FFI_CUDA_ARCH_LIST=12.0
 export XTIER=${XTIER:-1} XTIER_THREADS=${XTIER_THREADS:-112} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
 # engine switches as for DeepSeek V4.1 (production lkqmoe 0.5.6 values)
