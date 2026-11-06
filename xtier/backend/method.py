@@ -63,6 +63,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
     _localized = False
     _registered = 0      # layers whose shards are pinned and caches filled
     _copy_noted = False  # a layer XTIER_FAST_LOAD could not read was logged
+    _tail_checked = False   # per layer: its top-k checked against XTIER_TAIL_SKIP=K/N (tail.check)
 
     def __init__(self, gpu_method, layer_config: LayerConfig):
         self.gpu_method = gpu_method
@@ -315,11 +316,15 @@ class XTierMoEMethod(FusedMoEMethodBase):
         k = ids.shape[1]
         if not 1 <= k <= MAX_TOP_K:
             raise ValueError(f'xtier: top-k {k} not supported')
+        if not self._tail_checked:   # the draft model's layers (DSpark's: top-3) keep every route: the engine skips
+            if not self.cfg.draft:   # only in calls of top-k N
+                tail.check(k)
+            self._tail_checked = True
         capturing = torch.cuda.is_current_stream_capturing()
         if not capturing and XTierMoEMethod._registered < len(XTierMoEMethod.layers):
             XTierMoEMethod._register_all()
-        if not capturing and m > config.decode_max() and tail.eval_rank():   # XTIER_TAIL_SKIP_EVAL: measuring only
-            weights = tail.prefill_mask(getattr(self, 'plan', None), ids, weights, tail.eval_rank())
+        if not capturing and m > config.decode_max() and tail.eval_rank() and not self.cfg.draft:   # measuring only
+            weights = tail.prefill_mask(self.pool, ids, weights, tail.eval_rank())
         if not capturing and m > config.decode_max() and self.pool is not None and not self.pool.full:
             from xtier.cache import pool as cache_pool
             cache_pool.record_prompt(self.pool, ids)   # XTIER_CACHE_PROMPT=1: the prompt warms the expert cache

@@ -529,9 +529,10 @@ void CUDART_CB execute(void *p) noexcept {
     int active=0;bool holes=false;
     for(int t=0;t<m;t++)if(live(t)){holes|=active!=t;active++;}
     int rc=0;
-    if(active==m)rc=xtier_forward(b->plan,m,k,s->x,s->ids,s->routing,s->out);
+    // xtier_forward_decode: the decode path's forward (XTIER_TAIL_SKIP applies to these calls only)
+    if(active==m)rc=xtier_forward_decode(b->plan,m,k,s->x,s->ids,s->routing,s->out);
     else if(!holes) {
-        if(active)rc=xtier_forward(b->plan,active,k,s->x,s->ids,s->routing,s->out);
+        if(active)rc=xtier_forward_decode(b->plan,active,k,s->x,s->ids,s->routing,s->out);
         std::fill(s->out+size_t(active)*H,s->out+size_t(m)*H,0.f);
     } else {
         s->cx.resize(size_t(m)*H);s->cids.resize(m*k);s->croute.resize(m*k);s->cout.resize(size_t(m)*H);
@@ -541,7 +542,7 @@ void CUDART_CB execute(void *p) noexcept {
             std::copy(s->ids+t*k,s->ids+(t+1)*k,s->cids.data()+n*k);
             std::copy(s->routing+t*k,s->routing+(t+1)*k,s->croute.data()+n*k);n++;
         }
-        rc=xtier_forward(b->plan,n,k,s->cx.data(),s->cids.data(),s->croute.data(),s->cout.data());
+        rc=xtier_forward_decode(b->plan,n,k,s->cx.data(),s->cids.data(),s->croute.data(),s->cout.data());
         n=0;
         for(int t=0;t<m;t++) {
             float *row=s->out+size_t(t)*H;
@@ -601,6 +602,17 @@ void CUDART_CB execute(void *p) noexcept {
             std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far, %ld prompts%s\n",
                          every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds,pm.prompts,slots);
             win_n=win_hit=win_wall=win_calls=0;
+            // XTIER_TAIL_SKIP (the engine's counts, summed over the layers; their forwards all run on this thread)
+            static double tail_last[3]{};
+            double tail_now[3]{};
+            for(auto &L:pm.layers)if(L&&L->bridge){double t[3]{};xtier_tail_stats(L->bridge->plan,t);for(int j=0;j<3;j++)tail_now[j]+=t[j];}
+            if(tail_now[0]>tail_last[0]) {
+                const double calls=tail_now[0]-tail_last[0],seen=tail_now[1]-tail_last[1],out=tail_now[2]-tail_last[2];
+                static const char *keep=std::getenv("XTIER_TAIL_SKIP");   // K/N (the engine counts only when it is set)
+                std::fprintf(stderr,"[xtier] tail skip %s: %ld windows, %.2f of %.2f CPU experts per layer call left out (%.1f%%)\n",
+                             keep?keep:"?",every,out/calls,seen/calls,100.*out/std::max(seen,1.0));
+                std::copy(tail_now,tail_now+3,tail_last);
+            }
             auto &G=g2_state();
             if(G.device>=0&&G.n>0) {
                 std::fprintf(stderr,"[xtier] second GPU: %.0f%% of calls, %.1f experts, %.0f us launch, %.0f us total, %.0f us waited for after the CPU; cap %d; %ld swaps so far\n",

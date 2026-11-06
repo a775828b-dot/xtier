@@ -560,7 +560,7 @@ def _start_reporter():
             stats = [p.cold_stats() for _, p, _, _ in _layers]
             now = [sum(s[i] for s in stats) for i in (1, 2, 3, 4, 5)]   # loads, s, small forwards, small loads, s
             now += [sum(pc.reads for _, _, pc, _ in _layers), sum(pc.read_s for _, _, pc, _ in _layers)]
-            now += [sum(s[6] for s in stats)]   # experts XTIER_TAIL_SKIP left out
+            now += [sum(s[6] for s in stats)]   # experts not in RAM XTIER_TAIL_SKIP left out (reads saved)
             d = [a - b for a, b in zip(now, last)]
             record = _layers[0][3] if _layers else 0
             if d[0] or d[5] or d[7]:
@@ -569,7 +569,7 @@ def _start_reporter():
                             '%.1f s), CPU prefill read %d (%.1f GB, %.1f s), GPU prefill %d (%.1f GB, uploads waited '
                             '%.1f s)%s', every, steps, d[3], d[3] / steps if steps else 0, d[3] * record / 1e9, d[4],
                             d[0] - d[3], (d[0] - d[3]) * record / 1e9, d[1] - d[4], d[5], d[5] * record / 1e9, d[6],
-                            f', tail skip left out {d[7]:.0f} ({d[7] / steps:.1f} per step)' if d[7] and steps else '')
+                            f', tail skip saved {d[7]:.0f} reads ({d[7] / steps:.1f} per step)' if d[7] and steps else '')
             last = now
 
     _reporter = threading.Thread(target=run, name='xtier-cold-log', daemon=True)

@@ -51,6 +51,7 @@ def engine() -> C.CDLL:
                                 ('cold_attach', [_P, _P, _P, _P, _P, C.c_float], _I),
                                 ('slot_pin', [_P, _I], _I), ('slot_unpin', [_P, _I], None),
                                 ('cold_plan_stats', [_P, _P], None),
+                                ('forward_decode', [_P, _I, _I] + [_P] * 4, _I), ('tail_stats', [_P, _P], None),
                                 ('cold_open', [_P, _I, _I, _I], _P), ('cold_write', [_P, _I, C.c_longlong, _P, _P, _I], _I),
                                 ('cold_read', [_P, _I, _P, _P, _P, _P, _I], _I), ('cold_stats', [_P, _P], None),
                                 ('cold_submit', [_P, _I, _P, _P, _P, _P, _I, _P, _I], _P),
@@ -150,6 +151,15 @@ class CpuPlan:
             raise RuntimeError(self.lib.xtier_last_error().decode())
         return rc
 
+    def forward_decode(self, m, k, x, ids, routing, out):
+        """forward as the decode path calls it (the CUDA bridge; XTIER_TAIL_SKIP applies), one pass (tests)."""
+        if not self.plan:
+            raise RuntimeError('Plan is closed')
+        rc = self.lib.xtier_forward_decode(self.plan, m, k, x, ids, routing, out)
+        if rc < 0:
+            raise RuntimeError(self.lib.xtier_last_error().decode())
+        return rc
+
     def localize(self):
         """Move shard pages placed on another NUMA node back to their node (once, before pinning)."""
         if self._localized:
@@ -201,9 +211,15 @@ class CpuPlan:
 
     def cold_stats(self):
         """(forwards, experts read from NVMe, seconds spent reading; the same for forwards of at most 8 tokens;
-        experts XTIER_TAIL_SKIP left out)."""
+        experts not in RAM XTIER_TAIL_SKIP left out: reads saved)."""
         out = (C.c_double * 7)()
         self.lib.xtier_cold_plan_stats(self.plan, C.cast(out, _P))
+        return tuple(out)
+
+    def tail_stats(self):
+        """XTIER_TAIL_SKIP: (decode-path calls it looked at, distinct experts they routed to here, experts left out)."""
+        out = (C.c_double * 3)()
+        self.lib.xtier_tail_stats(self.plan, C.cast(out, _P))
         return tuple(out)
 
     def close(self):

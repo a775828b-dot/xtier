@@ -576,6 +576,7 @@ struct ColdIO {ColdRead read;ColdSubmit submit;ColdFinish finish;};
 struct PlanBase {
     virtual ~PlanBase()=default;
     virtual int forward(int,int,const uint16_t*,const int32_t*,const float*,float*)=0;
+    virtual int forward_decode(int,int,const uint16_t*,const int32_t*,const float*,float*)=0;
     virtual void set_read_only(bool)=0;
     virtual void timings(double*)=0;
     virtual void shape(int*) const=0;
@@ -591,6 +592,7 @@ struct PlanBase {
     virtual int pin(int expert)=0;
     virtual void unpin(int slot)=0;
     virtual void cold_stats(double *out)=0;
+    virtual void tail_stats(double *out)=0;
 };
 template<bool MX> class Plan: public PlanBase {
     static constexpr int scale_format=MX?1:0,scale_shift=MX?5:4;
@@ -629,9 +631,10 @@ template<bool MX> class Plan: public PlanBase {
     std::vector<int32_t> cold_file,pins;   // cold_file, cold_offset: per expert, node part and unit
     int cold_units=1;                      // XTIER_COLD_UNITS: a node part's units on the drives (1 or 3)
     bool stored(int e) const {return cold_file[size_t(e)*nodes*cold_units]>=0;}
-    // XTIER_TAIL_SKIP (0: off; changes the output): see tail_skip
-    int tail_rank=0,tail_tokens=8;
-    long long cold_tail_skipped=0;
+    // XTIER_TAIL_SKIP (0: off; changes the output): see tail_skip. Counts: decode-path calls it looked at, the distinct
+    // experts they routed to here, the ones it left out, of those the ones not in RAM (reads saved)
+    int tail_rank=0,tail_total=0,tail_tokens=8;   // K, N of XTIER_TAIL_SKIP=K/N
+    long long tail_calls=0,tail_experts=0,tail_skipped=0,cold_tail_skipped=0;
     std::vector<int32_t> tail_ids;
     std::vector<int> tail_min;
     std::vector<long long> cold_offset,cold_mark,cold_stamp;
@@ -1160,6 +1163,18 @@ public:
         if(const char *v=std::getenv("XTIER_DOWN_GRAIN"))down_grain=std::stoi(v);
         if(gate_grain<2||gate_grain%2||down_grain<4||down_grain%4)
             throw std::runtime_error("XTIER_GATE_GRAIN must be even, XTIER_DOWN_GRAIN a multiple of 4");
+        // XTIER_TAIL_SKIP=K/N (keep/total, see tail_skip); unset, empty or 0: off
+        if(const char *v=std::getenv("XTIER_TAIL_SKIP");v&&*v&&std::string(v)!="0") {
+            // digits/digits, nothing else (xtier/cache/tail.py setting: the same rule)
+            const std::string s(v);const size_t slash=s.find('/');
+            bool ok=slash!=std::string::npos&&slash>=1&&slash<=4&&s.size()-slash-1>=1&&s.size()-slash-1<=4;
+            for(size_t j=0;ok&&j<s.size();j++)ok=j==slash||std::isdigit(static_cast<unsigned char>(s[j]));
+            if(ok){tail_rank=std::stoi(s.substr(0,slash));tail_total=std::stoi(s.substr(slash+1));}
+            if(!ok||tail_rank<1||tail_rank>=tail_total)
+                throw std::runtime_error("XTIER_TAIL_SKIP must be keep/total, e.g. 5/6 (got "+s+")");
+        }
+        // 0: never (XTIER_TAIL_SKIP_EVAL alone)
+        if(const char *v=std::getenv("XTIER_TAIL_SKIP_TOKENS"))tail_tokens=*v?std::max(0,std::atoi(v)):8;
         size_t decode_bytes=(size_t(DECODE_M)*MAX_K*I*sizeof(float)+63)/64*64;
         decode_mid.reset(static_cast<float*>(std::aligned_alloc(64,decode_bytes)));
         if(!decode_mid)throw std::bad_alloc();
@@ -1167,10 +1182,17 @@ public:
         std::lock_guard<std::mutex> lock(pool->call_lock);dispatch(0);
     }
     int forward(int tokens,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) {
+        return run(tokens,k,x,ids,rw,y,false);
+    }
+    // The decode path's forward (the CUDA bridge's slots: decode steps, verify windows, short prompts): XTIER_TAIL_SKIP
+    int forward_decode(int tokens,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) override {
+        return run(tokens,k,x,ids,rw,y,true);
+    }
+    int run(int tokens,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y,bool decode) {
         std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
         if(!guard.owns_lock())throw std::runtime_error("Plan does not permit concurrent callers");
         if(tokens<1||tokens>MAX_BATCH||k<1||k>MAX_K||!x||!ids||!rw||!y)throw std::runtime_error("Invalid input");
-        ids=tail_skip(tokens,k,ids,rw);
+        if(decode)ids=tail_skip(tokens,k,ids,rw);
         void *reads=cold_store?ensure_resident(tokens,k,ids):nullptr;
         if(!reads)return compute(tokens,k,x,ids,rw,y);
         // Experts being read (overlap): first the routes to the experts in RAM, then the others once their reads
@@ -1195,29 +1217,38 @@ public:
         last_times[0]+=phases[0];last_times[1]+=phases[1];
         return first+second;
     }
-    // XTIER_TAIL_SKIP=R (Strata's STRATA_ROUTE_TAIL_SKIP): in a call of at most XTIER_TAIL_SKIP_TOKENS tokens (8: a
-    // decode step, one request's speculative verify window), an expert outside RAM that every token of the call routes
-    // at rank R or lower (by weight within the token's top-k, 0 the largest) is neither read nor computed: its routes
-    // become -1 (computed elsewhere: they add nothing), the other routes keep their weights (no renormalisation).
-    // Returns ids, or a copy with those routes taken out.
+    // XTIER_TAIL_SKIP=K/N (keep/total; Strata's STRATA_ROUTE_TAIL_SKIP=K, which skips experts on NVMe only; N must be
+    // the call's top-k): a decode-path call (forward_decode) of at most XTIER_TAIL_SKIP_TOKENS tokens (8: a decode
+    // step, one request's speculative verify window) leaves out every expert it routes to that no token of the call
+    // has among its K largest routes (by weight within the token's top-N; ties: the earlier route first), in RAM or
+    // not: neither read nor computed, its routes become -1 (they add nothing), the other routes keep their weights (no
+    // renormalisation). Routes that come as -1 (the GPU's: the expert pool) are not computed here; their weights still
+    // count for the ranks. Returns ids, or a copy with those routes taken out.
     const int32_t *tail_skip(int tokens,int k,const int32_t *ids,const float *rw) {
-        if(tail_rank<=0||tail_rank>=k||tokens>tail_tokens||!cold_store)return ids;
+        if(tail_rank<=0||k!=tail_total||tokens>tail_tokens)return ids;
         tail_min.assign(experts,k);
+        int distinct=0;
         for(int t=0;t<tokens;t++)for(int q=0;q<k;q++) {
             const int e=ids[t*k+q];
             if(e<0||e>=experts)continue;
             const float w=rw[t*k+q];int r=0;
             for(int p=0;p<k;p++){const float v=rw[t*k+p];r+=v>w||(v==w&&p<q);}
+            distinct+=tail_min[e]==k;
             tail_min[e]=std::min(tail_min[e],r);
         }
+        tail_calls++;tail_experts+=distinct;
         bool any=false;
-        for(int t=0;t<tokens*k&&!any;t++){const int e=ids[t];any=e>=0&&e<experts&&slot_of[e]<0&&stored(e)&&tail_min[e]>=tail_rank;}
+        for(int t=0;t<tokens*k&&!any;t++){const int e=ids[t];any=e>=0&&e<experts&&tail_min[e]>=tail_rank;}
         if(!any)return ids;
         tail_ids.assign(ids,ids+size_t(tokens)*k);
         for(int j=0;j<tokens*k;j++) {
             const int e=tail_ids[j];
-            if(e<0||e>=experts||slot_of[e]>=0||!stored(e)||tail_min[e]<tail_rank)continue;
-            if(tail_min[e]<k){cold_tail_skipped++;tail_min[e]=k+1;}   // counted once a call
+            if(e<0||e>=experts||tail_min[e]<tail_rank)continue;
+            if(tail_min[e]<k) {   // counted once a call
+                tail_skipped++;
+                if(cold_store&&slot_of[e]<0)cold_tail_skipped++;
+                tail_min[e]=k+1;
+            }
             tail_ids[j]=-1;
         }
         return tail_ids.data();
@@ -1386,9 +1417,6 @@ public:
         // unit of the part's six pieces, or three units, see ensure_resident)
         const char *units=std::getenv("XTIER_COLD_UNITS");
         cold_units=units&&std::string(units)=="3"?3:1;
-        const char *tail=std::getenv("XTIER_TAIL_SKIP"),*tail_n=std::getenv("XTIER_TAIL_SKIP_TOKENS");
-        tail_rank=tail&&*tail?std::max(0,std::atoi(tail)):0;
-        tail_tokens=tail_n&&*tail_n?std::max(0,std::atoi(tail_n)):8;   // 0: never (XTIER_TAIL_SKIP_EVAL alone)
         const size_t entries=size_t(experts)*nodes*cold_units;
         cold_file.assign(files,files+entries);cold_offset.assign(offsets,offsets+entries);
         for(int e=0;e<experts;e++)if(slot_of[e]<0&&!stored(e))return -1;   // in neither RAM nor the store
@@ -1414,11 +1442,15 @@ public:
         if(slot>=0&&slot<int(pins.size())&&pins[slot]>0)pins[slot]--;
     }
     // forwards, experts read from NVMe, seconds spent reading; the same for the forwards of at most 8 tokens; experts
-    // XTIER_TAIL_SKIP left out (once a call)
+    // not in RAM XTIER_TAIL_SKIP left out (reads saved, once a call)
     void cold_stats(double *out) override {
         out[0]=double(cold_forwards);out[1]=double(cold_loads);out[2]=cold_seconds;
         out[3]=double(cold_small_forwards);out[4]=double(cold_small_loads);out[5]=cold_small_seconds;
         out[6]=double(cold_tail_skipped);
+    }
+    // XTIER_TAIL_SKIP: the decode-path calls it looked at, the distinct experts they routed to here, the ones left out
+    void tail_stats(double *out) override {
+        out[0]=double(tail_calls);out[1]=double(tail_experts);out[2]=double(tail_skipped);
     }
     // Placement, from the plan's one caller between forwards (the call lock guards it): expert into slot; the expert
     // the slot held, -1 if none; -2 invalid, -3 a forward in progress.
@@ -1561,6 +1593,11 @@ int XTIER_API(xtier_forward)(void *plan,int m,int k,const uint16_t *x,const int3
     try {if(!plan)throw std::runtime_error("Null plan");return static_cast<Handle*>(plan)->plan->forward(m,k,x,ids,rw,y);}
     catch(const std::exception &e){last_error=e.what();return -1;}
 }
+int XTIER_API(xtier_forward_decode)(void *plan,int m,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) {
+    try {if(!plan)throw std::runtime_error("Null plan");return static_cast<Handle*>(plan)->plan->forward_decode(m,k,x,ids,rw,y);}
+    catch(const std::exception &e){last_error=e.what();return -1;}
+}
+void XTIER_API(xtier_tail_stats)(void *plan,double *out) {if(plan&&out)static_cast<Handle*>(plan)->plan->tail_stats(out);}
 void *XTIER_API(xtier_retain)(void *plan) {
     try {if(!plan)throw std::runtime_error("Null plan");return new Handle{static_cast<Handle*>(plan)->plan};}
     catch(const std::exception&e){last_error=e.what();return nullptr;}

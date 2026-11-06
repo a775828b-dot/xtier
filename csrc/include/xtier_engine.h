@@ -54,16 +54,13 @@ int xtier_place(void *plan,int expert,int slot);
 // `half_life` forwards) that the call does not use and nobody pinned. With XTIER_COLD_OVERLAP=1 (default) the forward
 // computes the routes to the experts in RAM while those reads run, then the others (two FP32 sums, added: not bitwise
 // the one-pass order); 0: it waits for the reads first. Before the first forward. 0 or -1.
-// XTIER_TAIL_SKIP=R (read here; 0, the default, is off; changes the output): a forward of at most
-// XTIER_TAIL_SKIP_TOKENS (8) tokens leaves out an expert not in RAM that every one of its tokens routes at rank R or
-// lower (0 the largest weight of the token's top-k): neither read nor computed, the other routes keep their weights.
 int xtier_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,const float *scores,float half_life);
 // For readers on other threads (the GPU pool's copies): the slot holding `expert`, kept until xtier_slot_unpin;
 // -1 if it is not in RAM.
 int xtier_slot_pin(void *plan,int expert);
 void xtier_slot_unpin(void *plan,int slot);
 // out[7]: forwards, experts read from NVMe, seconds the forwards waited for reads; the same for the forwards of at
-// most 8 tokens (decode steps); experts XTIER_TAIL_SKIP left out (once a forward).
+// most 8 tokens (decode steps); experts not in RAM XTIER_TAIL_SKIP left out (reads saved, once a forward).
 void xtier_cold_plan_stats(void *plan,double *out);
 // table[0..experts): the slot of every expert, -1 if in none. Returns the slot count, or -1 (-3: a forward in progress).
 int xtier_slot_table(void *plan,int32_t *table);
@@ -93,6 +90,16 @@ int xtier_read_probe(void *plan, int m, int k, const uint16_t *x, const int32_t 
 int xtier_localize(void *plan);
 int xtier_forward(void *plan, int m, int k, const uint16_t *x, const int32_t *ids,
                    const float *routing, float *y);
+// xtier_forward on the decode path (the CUDA bridge's slots: decode steps, speculative verify windows, prompts of at
+// most XTIER_DECODE_MAX tokens). XTIER_TAIL_SKIP=K/N (keep/total, e.g. 5/6: read at create, a malformed value fails
+// it; unset or 0, the default, is off; changes the output): a call of top-k N and at most XTIER_TAIL_SKIP_TOKENS (8)
+// tokens leaves out every expert that no one of its tokens has among its K largest routes (by weight; ties: the
+// earlier route first), in RAM or not: neither read nor computed, the other routes keep their weights. Routes given
+// as -1 (served on the GPU) are not computed here; their weights still count for the ranks.
+int xtier_forward_decode(void *plan, int m, int k, const uint16_t *x, const int32_t *ids,
+                          const float *routing, float *y);
+// out[3]: the decode-path calls XTIER_TAIL_SKIP looked at, the distinct experts they routed to, the ones it left out.
+void xtier_tail_stats(void *plan, double *out);
 // Query only from the sequential caller after a completed forward, not concurrently.
 // Two wall-clock durations in microseconds: gate+SiLU barrier, down+reduce barrier.
 void xtier_last_timings(void *plan, double *times);

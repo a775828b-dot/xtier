@@ -31,6 +31,8 @@ struct Impl {
     int (*shape)(void*,int*);
     int (*read_probe)(void*,int,int,const uint16_t*,const int32_t*,const float*,float*);
     int (*forward)(void*,int,int,const uint16_t*,const int32_t*,const float*,float*);
+    int (*forward_decode)(void*,int,int,const uint16_t*,const int32_t*,const float*,float*);
+    void (*tail_stats)(void*,double*);
     void *(*retain)(void*);
     void (*destroy)(void*);
     void (*last_timings)(void*,double*);
@@ -86,7 +88,8 @@ const Impl *load(const char *isa) {
             bind(h,p,"xtier_create4",m.create4)&&bind(h,p,"xtier_place",m.place)&&
             bind(h,p,"xtier_slot_table",m.slot_table)&&bind(h,p,"xtier_slot_pieces",m.slot_pieces)&&
             bind(h,p,"xtier_cold_attach",m.cold_attach)&&bind(h,p,"xtier_slot_pin",m.slot_pin)&&
-            bind(h,p,"xtier_slot_unpin",m.slot_unpin)&&bind(h,p,"xtier_cold_plan_stats",m.cold_plan_stats);
+            bind(h,p,"xtier_slot_unpin",m.slot_unpin)&&bind(h,p,"xtier_cold_plan_stats",m.cold_plan_stats)&&
+            bind(h,p,"xtier_forward_decode",m.forward_decode)&&bind(h,p,"xtier_tail_stats",m.tail_stats);
     if(!ok)return nullptr;
     m.name=isa;
     return &m;
@@ -154,6 +157,10 @@ int xtier_read_probe(void *plan,int m,int k,const uint16_t *x,const int32_t *ids
 int xtier_forward(void *plan,int m,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) {
     auto p=impl();return p?p->forward(plan,m,k,x,ids,rw,y):-1;
 }
+int xtier_forward_decode(void *plan,int m,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) {
+    auto p=impl();return p?p->forward_decode(plan,m,k,x,ids,rw,y):-1;
+}
+void xtier_tail_stats(void *plan,double *out){if(auto p=impl())p->tail_stats(plan,out);}
 void *xtier_retain(void *plan){auto p=impl();return p?p->retain(plan):nullptr;}
 void xtier_destroy(void *plan){if(auto p=impl())p->destroy(plan);}
 void xtier_last_timings(void *plan,double *out){if(auto p=impl())p->last_timings(plan,out);}
