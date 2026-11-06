@@ -118,6 +118,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-06 DeepSeek 变长验证（compact）](reports/2026-11-06-ds-compact-verify.md) | 来自 #13：能跑对、照抄 0 错，但没有收益，默认仍是 static |
 | [2026-10-24 MiniMax 512K](reports/2026-10-24-minimax-512k.md) | NVFP4 KV、DSpark 按置信度截断（已暂停开发） |
 | [2026-10-24 Qwen NVFP4 KV、DeepSeek agent 实测](reports/2026-10-24-qwen-kv-ds-agent.md) | 省下的显存怎么用 |
 | [2026-10-24 DeepSeek decode、分词和 MiniMax](reports/2026-10-24-ds-woa-minimax.md) | FP8 wo_a、分页索引器、deepseek-recipe 分词 |

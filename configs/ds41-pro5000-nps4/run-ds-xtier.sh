@@ -38,7 +38,9 @@ export XTIER_DOWN_PRECISION=tf32 XTIER_PREFILL_TILE_M=64 XTIER_GATE_BN=128 XTIER
 BATCH=${BATCH:-22528}
 SPEC=()
 if [ "${DSPARK:-0}" = 1 ]; then
-  export SGLANG_RAGGED_VERIFY_MODE=static XTIER_DRAFT=${XTIER_DRAFT:-1}
+  # SGLANG_RAGGED_VERIFY_MODE=compact (variable-length verification) runs correctly but gives nothing here
+  # (docs/reports/2026-11-06-ds-compact-verify.md)
+  export SGLANG_RAGGED_VERIFY_MODE=${SGLANG_RAGGED_VERIFY_MODE:-static} XTIER_DRAFT=${XTIER_DRAFT:-1}
   SPEC=(--speculative-draft-model-path $P/draft --speculative-algorithm DSPARK --speculative-dspark-block-size 5
         --speculative-num-draft-tokens 6 --speculative-dspark-sps-table-path $P/overlay/sps-table.json)
 fi
