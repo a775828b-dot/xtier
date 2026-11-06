@@ -160,70 +160,57 @@ SGLang's M3.1 branch (PR #45925), fixed 512K, 64K session only; packs vs officia
 
 ## Cold experts on NVMe
 
-When host memory cannot hold all experts, each layer keeps only part of them in RAM; the others sit in a cold pool on NVMe and are read back when routed (`XTIER_COLD=1`, off by default). The store holds every expert, each cut by NUMA node into 2.35 MB parts spread over the drives, so a miss reads from all drives at once. The console's DeepSeek card has a cold-expert option (off / 10% / 20% / 30%).
+When host memory cannot hold all experts, each layer keeps only part of them in RAM; the others sit in a cold pool on NVMe and are read back when routed (`XTIER_COLD=1`, off by default, [design](design-cold-experts.md)). A miss reads from all drives at once, so the speed depends mostly on the drives. The console's DeepSeek card offers 10% / 20% / 30% cold.
 
-The store in these tests: **four PCIe 5.0 NVMe drives**, Samsung 9100 PRO 1TB, on one x16 adapter (50.6 GB/s reading all four). The regressions of the four models below ran earlier on four PCIe 4.0 drives.
+All four models passed an end-to-end regression at 30% cold (no copy-test errors, no failures in a 15-minute dsh session; on four PCIe 4.0 drives then):
 
-**All four models work.** Each passed an end-to-end regression at 30% cold (copy test, token-by-token logprobs with and without cold experts, a 15-minute dsh session):
-
-| Model | Experts in RAM per layer | Store per drive | Copy test / dsh 15 min | Host memory, no cold experts | Host memory, 30% cold |
-|---|---|---|---|---:|---:|
-| DeepSeek V4.1 Flash 1017 | 269 / 384 | 72.2 GB | 0 errors / 18 runs, 0 failures | about 298 GiB | about 224 GiB (−74) |
-| GLM-5.3 Flash | 202 / 288 | 42.8 GB | 0 errors / 15 runs, 0 failures | about 174 GiB | about 129 GiB (−45) |
-| Qwen3.8 Flash Next | 358 / 512 (the 18 layers on the CPU) | 6.4 GB | 0 errors / 65 runs, 0 failures | about 121 GiB | about 116 GiB (−5) |
-| MiniMax-M3.1-Flash | 90 / 128 | 58.1 GB | 0 errors / 10 runs, 0 failures | about 227 GiB | about 165 GiB (−62) |
-
-Host memory = the machine's idle available memory (369 GiB) minus the lowest available during the run including loading; GPU memory not included.
+| Model | Experts in RAM per layer | Host memory (none → 30% cold) |
+|---|---|---:|
+| DeepSeek V4.1 Flash 1017 | 269 / 384 | 298 → 224 GiB |
+| GLM-5.3 Flash | 202 / 288 | 174 → 129 GiB |
+| Qwen3.8 Flash Next | 358 / 512 (only the 18 layers on the CPU) | 121 → 116 GiB |
+| MiniMax-M3.1-Flash | 90 / 128 | 227 → 165 GiB |
 
 ### DeepSeek V4.1 Flash 1017: share on disk and speed
 
-Measured on the four PCIe 5.0 drives; the last column is the step time on the earlier four PCIe 4.0 drives. In tok/s.
+Four PCIe 5.0 drives (Samsung 9100 PRO, 50.6 GB/s reading all four), agent_bench's 64K session, single runs (±5–10%):
 
-| Cold | Experts on disk | Misses per step | Decode (per step / speed) | 64K cold prefill | Incremental prefill, first token | PCIe 4.0 per step |
-|---|---:|---:|---|---|---|---:|
-| None | 0 | — | 30.0 ms / 142 | 4,300 | 0.84 s | 30.5 ms |
-| 10% | 27 GiB | 2.5 | 31.6 ms / 135 (−5%) | 3,784 (−12%) | 1.06 s | 32.8 ms |
-| 20% | 54 GiB | 8.3 | 34.4 ms / 124 (−13%) | 3,742 (−13%) | 1.13 s | 37.8 ms |
-| 30% | 81 GiB | 17.2 | 37.9 ms / 112 (−21%) | 3,731 (−13%) | 1.70 s | 43.9 ms |
-| 40% | 108 GiB | 29.5 | 44.5 ms / 96 (−32%) | 3,672 (−15%) | 1.37 s | about 58 ms |
-| 50% | 134 GiB | 49.2 | 53.5 ms / 80 (−44%) | 3,537 (−18%) | 1.77 s | 73.8 ms |
+| Cold | On disk | Decode per step / tok/s | 64K cold prefill (tok/s) |
+|---|---:|---|---|
+| None | 0 | 30.0 ms / 142 | 4,300 |
+| 10% | 27 GiB | 31.6 ms / 135 (−5%) | 3,784 (−12%) |
+| 20% | 54 GiB | 34.4 ms / 124 (−13%) | 3,742 (−13%) |
+| 30% | 81 GiB | 37.9 ms / 112 (−21%) | 3,731 (−13%) |
+| 40% | 108 GiB | 44.5 ms / 96 (−32%) | 3,672 (−15%) |
+| 50% | 134 GiB | 53.5 ms / 80 (−44%) | 3,537 (−18%) |
 
-- agent_bench's 64K session. Decode is the step time of long replies, converted to speed at 4.26 tokens per DSpark verify step so that rows compare; incremental prefill is the median first-token time of later requests (about 300 new tokens each). Single runs, ±5–10%.
-- A miss costs about 0.5 ms (18.8 MB at 50 GB/s is 0.38 ms). Long prefill is 12% slower at 10% and only 18% slower at 50%: mostly the fixed cost of cold mode's per-layer synchronization, not the drives.
-- Test drives with several minutes of sustained reads: a DRAM-less HP FX700 collapsed to about 60 MB/s after about 100 s at full speed, and a miss waits for the slowest drive.
+Test the drives with several minutes of sustained reads: a DRAM-less drive (HP FX700) fell to about 60 MB/s after about 100 s at full speed and held up the whole pool. Details: [report](reports/2026-11-01-cold-pcie5.md) (in Chinese).
 
 ### One copy of a big model
 
-The store holds every expert, so the checkpoint's copy can go: after a first start with `XTIER_COLD=1` has written the store, stop the server and run `tools/cold_punch.py`. It compares every byte, then punches holes in the checkpoint files (their sizes, modification times, headers and other tensors stay). DeepSeek V4.1 Flash 1017, on a copy: disk use 290 → 21 GiB in 42 s; started from there, the layers' RAM contents match, the copy test has no errors, speed and accuracy are within noise. These layers then load only from the store: a wrong configuration stops the start instead of reading zeros. `--restore` writes the experts back (174 s, all sha256 sums match). The cost: the store is then the only copy, so losing any drive means downloading the model again, and SGLang without XTier cannot load the directory.
+The store holds every expert, so `tools/cold_punch.py` compares every byte and then punches the experts out of the checkpoint files (`--restore` writes them back): DeepSeek V4.1 Flash 1017 290 → 21 GiB. The cost: the store is then the only copy, a lost drive means downloading the model again, and SGLang without XTier cannot load the directory.
 
-### Drives other than four or of unequal speed (off by default)
+### Options (off by default)
 
-A record is cut into 8 node parts and a drive could only take whole parts, so six drives could at best split 2:2:1:1:1:1. `XTIER_COLD_UNITS=3` cuts every part into three units, 24 a record, which `XTIER_COLD_PARTS` hands out by drive speed, e.g. `5:5:5:5:2:2` over four PCIe 5.0 and two PCIe 4.0 drives. `tools/cold_relayout.py` moves an existing store to a new layout (every record read back and compared, the old store kept). In the Kimi K3.1 Pro experiment, two more drives this way made decode 13.6% faster. Four drives of the same speed need no units (smaller pieces, three times the requests). Details: [design](design-cold-experts.md) and [report](reports/2026-11-06-cold-units-tail-skip.md) (in Chinese).
-
-### Route tail skip (off by default, changes the output)
-
-- `XTIER_TAIL_SKIP=keep/total` (DeepSeek V4.1 is top-6: `5/6`, `4/6`, `3/6`): in a decode step, an expert the CPU computes (in RAM or on a drive) that no token has among its "keep" largest routes is neither read nor computed; the other routes are not renormalized. The hot experts on the GPU are computed in full, prefill skips nothing; the total must be the model's top-k.
-- DeepSeek V4.1 Flash 1017 without cold experts: at 5/6 the CPU time drops 20% but a step only 2.3%; at 4/6 the CPU 36%, a step 5.3%, and the NLL leaves the noise. The hot-slot counts already balance the GPU and CPU sides, so most of the time the CPU saves is spent waiting for the GPU: off by default for DeepSeek. It pays off when most experts are on drives and reads are the bottleneck (Kimi K3.1 Pro at 9/16: about 2.1×).
-- Details: [report](reports/2026-11-06-tail-skip-cpu.md) (in Chinese).
+- **Drives other than four or of unequal speed**: `XTIER_COLD_UNITS=3` spreads each record by drive speed (e.g. `XTIER_COLD_PARTS=5:5:5:5:2:2`); `tools/cold_relayout.py` moves an existing store. [Report](reports/2026-11-06-cold-units-tail-skip.md) (in Chinese)
+- **Route tail skip** (changes the output): with `XTIER_TAIL_SKIP=5/6` (keep/total), a decode step skips an expert the CPU computes if no token has it among its 5 largest routes. DeepSeek without cold experts: a step only 2.3% faster; it pays off when most experts are on drives. [Report](reports/2026-11-06-tail-skip-cpu.md) (in Chinese)
 
 ### Minimal run: DeepSeek V4.1 Flash 1017 on 32 GB of GPU memory + 128 GB of host memory
 
-An emulation of one RTX 5090 (32 GB) + 128 GB + four NVMe drives (the store then on four PCIe 4.0 drives), the console card "DeepSeek V4.1 Flash 1017 · 最小化": 70% cold (115 of 384 experts per layer in RAM), 4 resident hot slots per layer + elastic, 8K chunks, 128K context, DSpark. GPU and host memory are hard limits; the GPU is still the RTX PRO 5000.
+An emulation of one RTX 5090: 32 GB of GPU memory and 128 GB of host memory as hard limits, 70% cold, the store on four PCIe 4.0 drives (console card "DeepSeek V4.1 Flash 1017 · 最小化"). About 25% of the normal speed, bound by the drives; [report](reports/2026-10-27-ds41-minimal.md) (in Chinese).
 
 | tok/s | 32K | 64K | 128K |
 |---|---:|---:|---:|
 | Prefill (32 GB + 128 GB) | 1,186 | 1,165 | 1,155 |
 | Decode (32 GB + 128 GB) | 28.5 | 28.1 | 32.7 |
-| Prefill (normal: 72 GB, all experts in RAM) | 3,886 | 4,609 | 4,655 |
+| Prefill (normal) | 3,886 | 4,609 | 4,655 |
 | Decode (normal) | 130.7 | 127.9 | 122.4 |
-
-About 25% of the normal configuration, bound by the drives.
 
 ## Latest changes
 
 All changes: [changelog](changelog.md) (in Chinese).
 
-- 2026-11-06 (v0.1.2): follows SGLang main 27bc1a0 (new dependency versions); DeepSeek's indexer keeps DeepGEMM on SM12x, where SGLang's check narrowed to SM100 made a 520K prefill 1.8× slower. The three models pass the regression ([report](reports/2026-11-06-sglang-27bc1a0.md), in Chinese).
+- 2026-11-06 (v0.1.2): follows SGLang main 27bc1a0 (new dependency versions). Fixes: SGLang narrowed DeepSeek's DeepGEMM indexer path to the SM100 family, which made a 520K prefill 1.8× slower on SM120 GPUs such as the RTX PRO 5000; an XTier hook keeps SM120 on DeepGEMM, back to the earlier speed. Engram gets the MXFP4 attributes SGLang added; compact verification uses SGLang's own mapping. The three models pass the regression ([report](reports/2026-11-06-sglang-27bc1a0.md), in Chinese).
 - 2026-11-06 (evening): DeepSeek V4.1's variable-length DSpark verification (`SGLANG_RAGGED_VERIFY_MODE=compact`) now runs correctly (thanks to cyrus-xc, [#13](https://github.com/a775828b-dot/xtier/pull/13)). It gave no speed-up on our test machine (RTX PRO 5000 + 2× EPYC 9334), so static stays the default; measure it on your own hardware.
 - 2026-11-06: two options, both off by default: cold-store units spread by drive speed (`XTIER_COLD_UNITS=3`, for drives other than four or of unequal speed) and the route tail skip (`XTIER_TAIL_SKIP=5/6`, keep/total, changes the output) for every expert the CPU computes, cold experts or not; from the archived Kimi K3.1 experiment.
 - 2026-11-01 (v0.1.1): DeepSeek on RTX 30 / 40 series no longer dies on the first request: the attention hook missed SGLang 6162b07's entry point (thanks to iounstone, [#10](https://github.com/a775828b-dot/xtier/pull/10)).
