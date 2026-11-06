@@ -2,10 +2,11 @@
 
 [中文](../README.md) · [Quick start](quickstart.en.md)
 
-> **Branch kimi-k31: the Kimi K3.1 Pro experiment, not merged into main** ([report, in Chinese](reports/2026-11-05-kimi-k31.md); launch configuration [configs/kimi-k31-pro5000-nps4](../configs/kimi-k31-pro5000-nps4/))
+> **Branch kimi-k31: the Kimi K3.1 Pro experiment, archived (2026-11-06), not merged into main** ([report, in Chinese](reports/2026-11-05-kimi-k31.md); launch configuration [configs/kimi-k31-pro5000-nps4](../configs/kimi-k31-pro5000-nps4/))
 >
+> - **Archived**: the weights are gone from the test machine and the branch stays as it is. The cold-store units and the route tail skip are in main now (off by default; main's [report](https://github.com/a775828b-dot/xtier/blob/main/docs/reports/2026-11-06-cold-units-tail-skip.md), in Chinese).
 > - 2.8T parameters on one RTX PRO 5000 with 384 GiB of RAM; 78% of the experts live only on six NVMe drives.
-> - About 10 tok/s decode on code prompts, about 90 tok/s prefill.
+> - About 10 tok/s decode on code prompts, about 90 tok/s prefill (113 tok/s in 16K chunks).
 > - The route tail skip is on at R = 9 by default (`XTIER_TAIL_SKIP=9`; it changes the output).
 > - **The accuracy cost of R = 9**: take no skip as the original (think Q8); R = 9 then sits between Q5_K_M and Q4_K_M. Its KL is 0.024; in llama.cpp's Llama 3 8B table, Q5_K_M is 0.011 and Q4_K_M 0.031.
 

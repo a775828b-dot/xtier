@@ -2,10 +2,11 @@
 
 [English](docs/README.en.md) · [文档目录](docs/README.md) · [快速开始](docs/quickstart.md) · [支持情况](docs/support.md)
 
-> **kimi-k31 分支：Kimi K3.1 Pro 实验，不合进 main**（[报告](docs/reports/2026-11-05-kimi-k31.md)，启动配置 [configs/kimi-k31-pro5000-nps4](configs/kimi-k31-pro5000-nps4/)）
+> **kimi-k31 分支：Kimi K3.1 Pro 实验，已归档（2026-11-06），不合进 main**（[报告](docs/reports/2026-11-05-kimi-k31.md)，启动配置 [configs/kimi-k31-pro5000-nps4](configs/kimi-k31-pro5000-nps4/)）
 >
+> - **归档**：测试机上的权重已删除，分支停在这个状态，不再更新。冷存储分段和尾部跳过已移植进 main（默认关，见 main 的[报告](https://github.com/a775828b-dot/xtier/blob/main/docs/reports/2026-11-06-cold-units-tail-skip.md)）。
 > - 2.8T 参数，单张 RTX PRO 5000 加 384 GiB 内存，78% 的专家只放在 6 块 NVMe 上。
-> - 代码题 decode 约 10 tok/s，prefill 约 90 tok/s。
+> - 代码题 decode 约 10 tok/s，prefill 约 90 tok/s（16K 一块时 113 tok/s）。
 > - 默认开尾部跳过 R = 9（`XTIER_TAIL_SKIP=9`，会改变输出）。
 > - **R = 9 的精度损失**：把不跳过当作原版（好比 Q8），R = 9 相当于 Q5_K_M 和 Q4_K_M 之间。R = 9 的 KL 是 0.024，llama.cpp 的 Llama 3 8B 表里 Q5_K_M 是 0.011、Q4_K_M 是 0.031。
 

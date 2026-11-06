@@ -26,17 +26,21 @@ MODEL = {
          'hint': '不在内存、每个 token 都排在第 R 名以后的专家不读不算，会改变输出。代码题 decode：R = 9 10.3、'
                  'R = 10 9.4、R = 11 8.3、关 4.9 tok/s，R = 8 没实测（估约 11）；精度：不跳过好比 Q8，R = 9 在 Q5_K_M '
                  '和 Q4_K_M 之间，R = 8 估计约等于 Q4_K_M'},
+        {'key': 'chunk', 'label': 'Prefill 分块', 'default': '16384',
+         'choices': [['16384', '16K · 固定热专家槽 1 个'], ['8192', '8K · 固定热专家槽 4 个']],
+         'hint': 'prefill 每层要把 896 个专家分批上传、反量化，开销按专家数算，块越大分摊越多。16K 一块临时要约 10 G 显存，'
+                 '所以固定热专家槽从 4 个降到 1 个（decode 时弹性热专家会把空出的显存用上）'},
     ],
 }
 
 
 def tags(o):
     """The fixed context and the store in job labels."""
-    return ['96K', '冷专家 78%', f"尾部跳过 R = {o['tail']}" if o['tail'] != '0' else '不跳过']
+    return ['96K', f"{int(o['chunk']) // 1024}K 分块", '冷专家 78%', f"尾部跳过 R = {o['tail']}" if o['tail'] != '0' else '不跳过']
 
 
 def build(o, port):
     """(environment additions, argv) for validated options o."""
     env = {'XTIER_THREADS': o['threads'], 'PORT': str(port), 'DFLASH': '1' if o['spec'] == 'on' else '0',
-           'XTIER_TAIL_SKIP': o['tail']}
+           'XTIER_TAIL_SKIP': o['tail'], 'BATCH': o['chunk'], 'CACHE_SLOTS': '1' if o['chunk'] == '16384' else '4'}
     return env, [str(HERE / 'run-kimi-xtier.sh')]
