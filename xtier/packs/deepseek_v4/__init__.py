@@ -72,6 +72,7 @@ HASHER = 'sglang.srt.layers.engram.EngramHasher'
 DSPARK_DRAFT = 'sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark'
 DRAFT_PROJECT = 'sglang.srt.models.dspark.project_through_lm_head'
 INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
+INDEXER_ARCH = 'sglang.srt.layers.attention.dsv4.v41_indexer.is_sm100'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
 REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
 MXFP8_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_blockscaled_linear'
@@ -135,15 +136,18 @@ def _check_rows(self, param, loaded_weight):
                          f'{self._xtier_rows.rows}')
 
 
-def _init(original, self, num_embeddings, dim, layer_id, column_bounds, *args, **kwargs):
+def _init(original, self, num_embeddings, dim, layer_id, column_bounds, *args, mxfp4=False, **kwargs):
     from sglang.srt.arg_groups import engram_config   # its EngramLookup, not this module's
     from sglang.srt.layers.engram import resolve_engram_config, shard_range
     from sglang.srt.runtime_context import get_parallel
 
     if dim != ROW_BYTES:
         raise ValueError(f'xtier: Engram rows on NVMe hold {ROW_BYTES} FP8 values, not {dim}')
+    if mxfp4:   # quantization_config.engram_embed_quant = 'mxfp4' (SGLang reads such tables since 27bc1a0)
+        raise ValueError('xtier: Engram rows on NVMe hold FP8 rows; this checkpoint stores its Engram tables in MXFP4')
     torch.nn.Module.__init__(self)
     self.dim = dim
+    self.mxfp4, self.row_bytes = False, dim   # the FP8 table: a byte a value
     self.tp_size = get_parallel().tp_size
     self.row_start, row_end = shard_range(num_embeddings, column_bounds, get_parallel().tp_rank, self.tp_size)
     self.rows = row_end - self.row_start
@@ -254,6 +258,14 @@ def _draft_project(original, hidden, lm_head):
     return out.view(*hidden.shape[:-1], qweight.shape[0])
 
 
+def _indexer_arch(original, *args, **kwargs):
+    """Around SGLang's v41_indexer.is_sm100, which picks the DSv4.1 indexer's DeepGEMM fp8_fp4 MQA-logits kernels for
+    prefill and decode: SGLang 27bc1a0 narrowed it from SM100 and newer to the SM100 family, so SM12x took the torch /
+    Triton indexer and a 520K prefill ran 1.8x slower (each 22K chunk 5 s -> 12 s as the context grew). SM12x keeps
+    DeepGEMM, as up to 6162b07."""
+    return original(*args, **kwargs) or torch.cuda.get_device_capability()[0] == 12
+
+
 def _make_candidate_indexer(original, *args, **kwargs):
     from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_PAGED_SPARSE_MQA_LOGITS
 
@@ -317,13 +329,9 @@ def _mxfp8_linear(original, input, *args, **kwargs):
 def install(registry, hook_type):
     from xtier.packs.deepseek_v4 import ragged_verify, paged_indexer, wo_a
 
-    registry.register(f'{HASHER}.forward', ragged_verify.forward, hook_type.AROUND)
-    registry.register('sglang.srt.layers.attention.dsv4.dsv41_sparse.token_req_indices',
-                      ragged_verify.token_req_indices, hook_type.AROUND)
-    registry.register('sglang.srt.layers.attention.deepseek_v4_backend.token_req_indices',
-                      ragged_verify.token_req_indices, hook_type.AROUND)
     registry.register('sglang.srt.speculative.dspark_components.dspark_planner.DSparkVerifyPlanner.set_forced_budget_frac',
                       ragged_verify.forced_budget, hook_type.AFTER)
+    registry.register(INDEXER_ARCH, _indexer_arch, hook_type.AROUND)
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
     wo_a.install(registry, hook_type)

@@ -1,4 +1,8 @@
-"""Packed Engram verification matches independent requests without changing history."""
+"""DSpark compact verification on DeepSeek V4 (SGLANG_RAGGED_VERIFY_MODE=compact): SGLang's packed paths against
+per-request ones (no checkpoint needed). The Engram hasher hashes each packed request against its own committed history
+(unequal lengths, sequence starts, an image token, graph padding) and leaves the history as it is, on the CPU and with
+the CUDA kernel; the low-ratio attention maps each packed token to its request (padding to slot 0); and XTier's
+calibration hook (xtier/packs/deepseek_v4/ragged_verify.py) lets a forced budget bypass the verify-all shortcut."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,20 +12,26 @@ import unittest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from xtier.packs.deepseek_v4.ragged_verify import forward, forced_budget, token_req_indices
+from xtier.packs.deepseek_v4.ragged_verify import forced_budget
 
 
-class RaggedHashTests(unittest.TestCase):
-    def test_attention_mapping_uses_request_starts(self):
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            req_pool_indices=torch.tensor([3, 1]),
-            ragged_verify_layout=SimpleNamespace(extend_start_loc=torch.tensor([0, 2])),
-        )
-        actual = token_req_indices(None, batch, num_tokens=7)
-        torch.testing.assert_close(actual, torch.tensor([3, 3, 1, 1, 1, 1, 1]))
+def layout(lengths, device):
+    """The packed layout's request rows as the verify reads them."""
+    indptr = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+    indptr[1:] = torch.cumsum(torch.tensor(lengths, dtype=torch.int32, device=device), 0)
+    return SimpleNamespace(qo_indptr_device=indptr, bs=len(lengths))
+
+
+class RaggedVerifyTests(unittest.TestCase):
+    def test_attention_mapping_uses_request_rows(self):
+        batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY, req_pool_indices=torch.tensor([3, 1]),
+                                positions=torch.zeros(9, dtype=torch.long), ragged_verify_layout=layout([2, 5], 'cpu'))
+        torch.testing.assert_close(token_req_indices(batch, num_tokens=7), torch.tensor([3, 3, 1, 1, 1, 1, 1]))
+        # graph padding past the last request takes slot 0
+        torch.testing.assert_close(token_req_indices(batch, num_tokens=9), torch.tensor([3, 3, 1, 1, 1, 1, 1, 0, 0]))
 
     def test_calibration_disables_then_restores_verify_all(self):
         from sglang.srt.speculative.dspark_components.dspark_sps import build_uninitialized_sps_table
@@ -54,27 +64,25 @@ class RaggedHashTests(unittest.TestCase):
         for lengths in ([1, 5], [3, 2], [6, 1], [1, 1]):
             for padding in (0, 3):
                 with self.subTest(device=device, lengths=lengths, padding=padding):
-                    sequences = [torch.tensor([10, 31, 12, 13, 14, 15][:n], device=device)
-                                 for n in lengths]
-                    positions = [torch.arange(n, device=device) + offset
-                                 for n, offset in zip(lengths, (0, 20))]
+                    sequences = [torch.tensor([10, 31, 12, 13, 14, 15][:n], device=device) for n in lengths]
+                    positions = [torch.arange(n, device=device) + offset for n, offset in zip(lengths, (0, 20))]
                     slots = torch.tensor([3, 1], device=device)
                     before = hasher.history.clone()
                     expected = []
                     for i, sequence in enumerate(sequences):
                         batch = SimpleNamespace(
-                            forward_mode=ForwardMode.TARGET_VERIFY, req_pool_indices=slots[i:i+1],
-                            positions=positions[i], spec_info=SimpleNamespace(draft_token_num=len(sequence)),
+                            forward_mode=ForwardMode.TARGET_VERIFY, req_pool_indices=slots[i:i + 1],
+                            positions=positions[i], ragged_verify_layout=None,
+                            spec_info=SimpleNamespace(draft_token_num=len(sequence)),
                         )
                         expected.append(EngramHasher.forward(hasher, sequence, batch))
                     ids = torch.cat([*sequences, torch.zeros(padding, dtype=torch.long, device=device)])
                     batch = SimpleNamespace(
                         forward_mode=ForwardMode.TARGET_VERIFY, req_pool_indices=slots,
                         positions=torch.cat([*positions, torch.zeros(padding, dtype=torch.long, device=device)]),
-                        ragged_verify_layout=SimpleNamespace(
-                            extend_start_loc=torch.tensor([0, lengths[0]], dtype=torch.int32, device=device)),
+                        ragged_verify_layout=layout(lengths, device),
                     )
-                    actual = forward(EngramHasher.forward, hasher, ids, batch)
+                    actual = EngramHasher.forward(hasher, ids, batch)
                     torch.testing.assert_close(actual[:sum(lengths)], torch.cat(expected), rtol=0, atol=0)
                     torch.testing.assert_close(hasher.history, before, rtol=0, atol=0)
 

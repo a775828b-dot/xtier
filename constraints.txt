@@ -9,6 +9,7 @@ anyio==4.15.1
 apache-tvm-ffi==0.1.11
 asttokens==3.0.2
 attrs==26.1.0
+blake3==1.0.11
 blobfile==3.0.0
 build==1.6.1
 certifi==2026.10.19
@@ -36,7 +37,6 @@ einops==0.8.2
 executing==2.3.0
 fastapi==0.159.1
 filelock==3.32.3
-flash-attn-4==4.0.0b36
 flashinfer-python==0.7.2
 frozenlist==1.8.0
 fsspec==2026.7.0
@@ -51,7 +51,7 @@ httpcore==1.0.9
 httpx2==2.16.0
 httpx==0.28.1
 huggingface_hub==1.33.0
-humming-kernels==0.1.12
+humming-kernels==0.1.18
 idna==3.20
 interegular==0.3.3
 ipython==9.17.1
@@ -61,8 +61,6 @@ Jinja2==3.1.6
 jiter==0.17.0
 jsonschema-specifications==2025.9.1
 jsonschema==4.26.0
-kernels-data==0.16.2
-kernels==0.14.1
 lark==1.3.1
 llguidance==1.9.1
 llvmlite==0.47.0
@@ -164,8 +162,8 @@ setuptools-rust==1.13.0
 setuptools-scm==10.3.4
 setuptools==84.2.1
 sgl-deep-ep==0.1.2.post1
-sgl-deep-gemm==0.2.3.post2
-sgl-flash-mla==1.0.0
+sgl-deep-gemm==0.2.6
+sgl-flash-mla==1.0.2
 sglang-kernel==0.4.10
 shellingham==1.5.4
 six==1.17.0
