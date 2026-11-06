@@ -61,6 +61,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 | [mem_guard.sh](../tools/mem_guard.sh) | 可用内存太低时停掉服务（启动台默认带） |
 | [cold_punch.py](../tools/cold_punch.py) | 专家只留在冷存储，模型文件打洞释放空间，也能写回 |
 | [cold_relayout.py](../tools/cold_relayout.py) | 冷存储换布局（换盘、分段、按盘速分配），逐条读回比对，旧存储不动 |
+| [sps_profile.py](../tools/sps_profile.py) | 测 DSpark 变长验证（compact）要用的成本表 |
 | [plan_probe.py](../tools/plan_probe.py)、[plan_trace.py](../tools/plan_trace.py)、[plan_auto.py](../tools/plan_auto.py)、[plan_calibrate.py](../tools/plan_calibrate.py) | 规划器：探测、路由档案、出方案、校准 |
 
 ## 常见问题
@@ -119,7 +120,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
-| [2026-11-06 DeepSeek 变长验证（compact）](reports/2026-11-06-ds-compact-verify.md) | 来自 #13：能跑对、照抄 0 错，但没有收益，默认仍是 static |
+| [2026-11-06 DeepSeek 变长验证（compact）](reports/2026-11-06-ds-compact-verify.md) | 来自 #13：要配本机实测的成本表；照抄 0 错，两个请求同时快 17%，默认仍是 static |
 | [2026-10-24 MiniMax 512K](reports/2026-10-24-minimax-512k.md) | NVFP4 KV、DSpark 按置信度截断（已暂停开发） |
 | [2026-10-24 Qwen NVFP4 KV、DeepSeek agent 实测](reports/2026-10-24-qwen-kv-ds-agent.md) | 省下的显存怎么用 |
 | [2026-10-24 DeepSeek decode、分词和 MiniMax](reports/2026-10-24-ds-woa-minimax.md) | FP8 wo_a、分页索引器、deepseek-recipe 分词 |

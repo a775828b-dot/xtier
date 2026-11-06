@@ -11,8 +11,9 @@
 
   三个模型回归通过：照抄、序号回绕、PPL、64K / 520K、dsh 15 分钟，另外模拟 SM86 跑了 DeepSeek。详见[文档](reports/2026-11-06-sglang-27bc1a0.md)。
 - 2026-11-06（晚）：DeepSeek V4.1 的 DSpark 变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了：Engram 哈希按每个请求自己的历史算、低压缩比注意力
-  按请求起点映射打包的 token（来自 [#13](https://github.com/a775828b-dot/xtier/pull/13)，感谢 cyrus-xc；控制台部分没有合并）。DS 启动脚本的验证模式可以通过环境变量指定。
-  在我们的测试机（RTX PRO 5000 + 2× EPYC 9334）上照抄 0 错，但单请求 −8.6%、两请求 +2%，所以默认仍是 static；其他机器请自行测试。
+  按请求起点映射打包的 token（来自 [#13](https://github.com/a775828b-dot/xtier/pull/13)，感谢 [cyrus-xc](https://github.com/cyrus-xc)；控制台部分没有合并）。DS 启动脚本的验证模式可以通过环境变量指定。
+  11-06 夜更正：当时的测试里成本表斜率为 0，compact 没有生效；配上本机实测的表（`tools/sps_profile.py`，启动台 DS 卡可选「变长」），
+  单请求不变、两个请求同时快 17%，照抄 0 错。默认仍是 static，其他机器请先测表。
   `bench/copy_test.py`、`bench/agent_bench.py` 单个请求出错时记下来、最后非零退出。
   详见[文档](reports/2026-11-06-ds-compact-verify.md)。
 - 2026-11-06（下午）：尾部跳过不再只管冷专家：decode 时 CPU 算的专家都可以跳（GPU 上的热专家照算，prefill 不跳，DSpark 草稿模型的层不动），
