@@ -66,11 +66,11 @@ MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 
 | 未命中专家 GPU 代算 | 三个模型能跑；本机反而变慢，弱 CPU 只模拟过（8 线程 +6–7%） | 关 |
 | 投机解码 | DeepSeek DSpark、GLM EAGLE、Qwen MTP，都是整模型 | 启动台按模型 |
 
-## v0.1.1 的测试环境
+## v0.1.2 的测试环境
 
 | 项目 | 版本 |
 |---|---|
-| SGLang | main `6162b07199`（2026-10-30） |
+| SGLang | main `27bc1a0615`（2026-11-06） |
 | Python | 3.12.3 |
 | PyTorch | 2.14.1+cu130（CUDA 13.0） |
 | FlashInfer | 0.7.2 |

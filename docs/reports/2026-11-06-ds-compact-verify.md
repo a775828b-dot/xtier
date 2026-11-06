@@ -11,6 +11,9 @@ DSpark 的验证有三种模式（`SGLANG_RAGGED_VERIFY_MODE`）：
 DeepSeek V4.1 以前不能用 compact：Engram 哈希器和低压缩比注意力层（`token_req_indices`）都假定每个请求验证一样多的 token。
 [#13](https://github.com/a775828b-dot/xtier/pull/13)（cyrus-xc）补上了这两处；这个 PR 的控制台部分没有合并。
 
+> 同日晚上跟进 SGLang main 27bc1a0（v0.1.2）以后，这两处由 SGLang 自己做（按布局的 `qo_indptr`，CUDA 图回放时会刷新），#13 的这两个钩子
+> 已删，只留校准预算那一处，见[跟进报告](2026-11-06-sglang-27bc1a0.md)。下面是合并 #13 时的记录。
+
 ## 改了什么
 
 | 文件 | 内容 |

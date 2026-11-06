@@ -39,7 +39,7 @@ bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟
 从空机器到第一次请求的完整路线（环境、模型准备、启动命令、测试请求）见[快速开始](docs/quickstart.md)。已经有 SGLang 环境时：
 
 ```bash
-git -C /path/to/sglang checkout 6162b07199      # 测试过的官方 SGLang main（2026-10-30）
+git -C /path/to/sglang checkout 27bc1a0615      # 测试过的官方 SGLang main（2026-11-06）
 SGLANG_BUILD_RUST_EXTS=none pip install -e /path/to/sglang/python   # 没装 Rust 时跳过 SGLang 可选的 Rust 扩展
 tools/build_engine.sh /path/to/site-packages/nvidia/cu13   # CPU 引擎与信箱库 -> xtier/engine/lib
 pip install --no-deps -e .                      # 注册插件入口 sglang.srt.plugins: xtier
@@ -274,12 +274,12 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-11-06（v0.1.2）：跟进官方 SGLang main 27bc1a0（依赖有变化）；SM12x 上 DeepSeek 的索引器继续用 DeepGEMM（SGLang 把它收窄到 SM100 后，520K prefill 慢 1.8 倍）。三个模型回归通过，详见[报告](docs/reports/2026-11-06-sglang-27bc1a0.md)。
 - 2026-11-06（晚）：DeepSeek V4.1 的变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了（感谢 cyrus-xc，[#13](https://github.com/a775828b-dot/xtier/pull/13)）。在我们的测试机（RTX PRO 5000 + 2× EPYC 9334）上实测没有收益，所以默认仍是 static；其他机器请自行测试。详见[报告](docs/reports/2026-11-06-ds-compact-verify.md)。
 - 2026-11-06：两个选项，都默认关：冷存储按盘速分段（`XTIER_COLD_UNITS=3`，盘数不是 4 块或盘速不一样时用）；尾部跳过（`XTIER_TAIL_SKIP=5/6` 这种「保留/总共」写法，会改变输出），CPU 算的专家都能跳，不必开冷专家。来自已归档的 Kimi K3.1 实验分支，详见[分段](docs/reports/2026-11-06-cold-units-tail-skip.md)、[尾部跳过](docs/reports/2026-11-06-tail-skip-cpu.md)。
 - 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩：跟进 SGLang 6162b07 后注意力钩子挂空了（感谢 iounstone，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
 - 2026-11-01（v0.1.0）：全面代码审计后修了换槽序号回绕、后台线程报错被吞、首个请求现编内核被内存守护杀掉等问题，失效的加速项启动时直接报错；
   冷专家池换到 4 块 PCIe 5.0 盘（卸载 30% 时 decode −21%），大模型的专家可以只存一份。详见[修复](docs/reports/2026-11-01-audit-fixes.md)、[冷专家](docs/reports/2026-11-01-cold-pcie5.md)。
-- 2026-10-31：第二张卡可以不放模型、纯当热专家池（可选，`XTIER_GPU2_SLOTS`，默认关），给显存或速度不一样的两张卡用：双 RTX 4090 模拟 24 + 16 GiB 时 Qwen3.8 decode 比同样配置的 TP 快 12–13%，比单卡快约 28%。详见[文档](docs/reports/2026-10-31-second-gpu-pool.md)。
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
 ## 许可

@@ -2,6 +2,14 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-06（v0.1.2）：跟进官方 SGLang main 27bc1a0（6162b07 之后 562 个提交）。依赖：sgl-deep-gemm 0.2.6、sgl-flash-mla 1.0.2、humming-kernels 0.1.18，
+  新加 blake3，不再需要 flash-attn-4 和 kernels。XTier 跟着改了三处：
+  - SM12x 上 DSv4.1 索引器继续用 DeepGEMM 的 fp8_fp4 MQA-logits（新钩子挂在 `v41_indexer.is_sm100`）：27bc1a0 把它收窄到 SM100 系列，SM120 改走
+    torch / Triton 索引器后 520K prefill 慢 1.8 倍；
+  - Engram：XTier 替换的 `EngramEmbedding.__init__` 补上 SGLang 新加的 `mxfp4`、`row_bytes`（NVMe 行表只支持 FP8 的表）；
+  - 变长验证改用 SGLang 自己的按请求映射，删掉 #13 的两个钩子，`tests/engram_ragged_check.py` 改成检查 SGLang 的实现。
+
+  三个模型回归通过：照抄、序号回绕、PPL、64K / 520K、dsh 15 分钟，另外模拟 SM86 跑了 DeepSeek。详见[文档](reports/2026-11-06-sglang-27bc1a0.md)。
 - 2026-11-06（晚）：DeepSeek V4.1 的 DSpark 变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了：Engram 哈希按每个请求自己的历史算、低压缩比注意力
   按请求起点映射打包的 token（来自 [#13](https://github.com/a775828b-dot/xtier/pull/13)，感谢 cyrus-xc；控制台部分没有合并）。DS 启动脚本的验证模式可以通过环境变量指定。
   在我们的测试机（RTX PRO 5000 + 2× EPYC 9334）上照抄 0 错，但单请求 −8.6%、两请求 +2%，所以默认仍是 static；其他机器请自行测试。
