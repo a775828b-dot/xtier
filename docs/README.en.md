@@ -223,7 +223,7 @@ About 25% of the normal configuration, bound by the drives.
 
 All changes: [changelog](changelog.md) (in Chinese).
 
-- 2026-11-06 (evening): DeepSeek V4.1's variable-length DSpark verification (`SGLANG_RAGGED_VERIFY_MODE=compact`) now runs correctly (thanks to cyrus-xc, [#13](https://github.com/a775828b-dot/xtier/pull/13)), but gives no speed-up here; static stays the default.
+- 2026-11-06 (evening): DeepSeek V4.1's variable-length DSpark verification (`SGLANG_RAGGED_VERIFY_MODE=compact`) now runs correctly (thanks to cyrus-xc, [#13](https://github.com/a775828b-dot/xtier/pull/13)). It gave no speed-up on our test machine (RTX PRO 5000 + 2× EPYC 9334), so static stays the default; measure it on your own hardware.
 - 2026-11-06: two options, both off by default: cold-store units spread by drive speed (`XTIER_COLD_UNITS=3`, for drives other than four or of unequal speed) and the route tail skip (`XTIER_TAIL_SKIP=5/6`, keep/total, changes the output) for every expert the CPU computes, cold experts or not; from the archived Kimi K3.1 experiment.
 - 2026-11-01 (v0.1.1): DeepSeek on RTX 30 / 40 series no longer dies on the first request: the attention hook missed SGLang 6162b07's entry point (thanks to iounstone, [#10](https://github.com/a775828b-dot/xtier/pull/10)).
 - 2026-11-01 (v0.1.0): fixes after a full code audit (swap sequence wrap, swallowed thread errors, kernels compiled during the first request and killed by the memory guard); acceleration features that fail to apply now stop the start. The cold pool moved to four PCIe 5.0 drives (decode −21% at 30% cold); a big model's experts can be kept in one copy.

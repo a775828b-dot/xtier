@@ -44,7 +44,8 @@ DeepSeek V4.1 以前不能用 compact：Engram 哈希器和低压缩比注意力
 
 ## 结论
 
-默认仍是 static。compact 现在能跑对，要试就用 `SGLANG_RAGGED_VERIFY_MODE=compact` 启动 DS。
+默认仍是 static。上面是这台测试机上的结果，其他机器（显卡、CPU、内存带宽不同）请自行测试：compact 现在能跑对，用
+`SGLANG_RAGGED_VERIFY_MODE=compact` 启动 DS 即可。
 
 10 月在旧管线（lsglang_ds4.1）上试过 compact：单请求会改错字，已放弃（当时两请求同时 decode 快 13.9%，单请求 +1–3%）。
 这次在官方 SGLang main 上没再出现改错字。

@@ -274,7 +274,7 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
-- 2026-11-06（晚）：DeepSeek V4.1 的变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了（感谢 cyrus-xc，[#13](https://github.com/a775828b-dot/xtier/pull/13)），但实测没有收益，默认仍是 static。详见[报告](docs/reports/2026-11-06-ds-compact-verify.md)。
+- 2026-11-06（晚）：DeepSeek V4.1 的变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了（感谢 cyrus-xc，[#13](https://github.com/a775828b-dot/xtier/pull/13)）。在我们的测试机（RTX PRO 5000 + 2× EPYC 9334）上实测没有收益，所以默认仍是 static；其他机器请自行测试。详见[报告](docs/reports/2026-11-06-ds-compact-verify.md)。
 - 2026-11-06：两个选项，都默认关：冷存储按盘速分段（`XTIER_COLD_UNITS=3`，盘数不是 4 块或盘速不一样时用）；尾部跳过（`XTIER_TAIL_SKIP=5/6` 这种「保留/总共」写法，会改变输出），CPU 算的专家都能跳，不必开冷专家。来自已归档的 Kimi K3.1 实验分支，详见[分段](docs/reports/2026-11-06-cold-units-tail-skip.md)、[尾部跳过](docs/reports/2026-11-06-tail-skip-cpu.md)。
 - 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩：跟进 SGLang 6162b07 后注意力钩子挂空了（感谢 iounstone，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
 - 2026-11-01（v0.1.0）：全面代码审计后修了换槽序号回绕、后台线程报错被吞、首个请求现编内核被内存守护杀掉等问题，失效的加速项启动时直接报错；
