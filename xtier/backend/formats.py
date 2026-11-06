@@ -168,6 +168,11 @@ def detect(gpu_method, draft=False) -> Format:
         return Fp8Fp4Experts()
     if name == 'Mxfp4FlashinferCutlassMoEMethod' and getattr(getattr(gpu_method, '_fp8', None), 'is_fp4_expert', False):
         return Fp8Fp4Experts()   # SGLang's SM90 / SM120 choice for these experts: Fp8MoEMethod's parameters, E8M0 scales
+    if name == 'Mxfp4MarlinMoEMethod':
+        # SGLang's Ampere choice (moe_runner_backend=marlin) for the same MXFP4 experts: Fp8MoEMethod's
+        # parameters, the packed E2M1 weights and UE8M0 scales under the same names. Marlin's repack runs in
+        # process_weights_after_loading, which XTier replaces, so the parameters keep the checkpoint layout.
+        return Fp8Fp4Experts()
     if name == 'CompressedTensorsFusedMoEMethod':
         return CompressedTensorsNvFp4()   # the scheme sits on the layer: checked once the parameters exist
     if name == 'UnquantizedFusedMoEMethod' and draft:
