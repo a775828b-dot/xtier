@@ -155,9 +155,40 @@ def round_result(rows, wall):
                 latency_p95_s=percentile([r['latency_s'] for r in good], .95))
 
 
+def dspark_watermarks(info):
+    """Per-rank last observed step, so warm-up records are excluded from a test."""
+    return [max((r.get('forward_ct', -1) for r in
+                 (state.get('dspark_info_record') or {}).get('records', [])), default=-1)
+            for state in info.get('internal_states', [])]
+
+
+def dspark_evidence(info, watermarks):
+    """Summarize native planner decisions; a table path alone is not activation evidence."""
+    ranks = []
+    for rank, state in enumerate(info.get('internal_states', [])):
+        payload = state.get('dspark_info_record')
+        if not payload:
+            continue
+        watermark = watermarks[rank] if rank < len(watermarks) else -1
+        rows = [r for r in payload.get('records', []) if r.get('forward_ct', -1) > watermark]
+        decisions = [r for r in rows if r.get('budget') is not None and r.get('predicted_step_ms') is not None]
+        gamma = payload.get('gamma', 0)
+        histogram = {}
+        for row in decisions:
+            key = str(row['budget'])
+            histogram[key] = histogram.get(key, 0) + 1
+        ranks.append(dict(rank=rank, mode=payload.get('mode'), observed_steps=len(rows),
+                          planned_steps=len(decisions), budget_counts=histogram,
+                          reduced_steps=sum(r['budget'] < r.get('num_running_reqs', 0) * gamma for r in decisions),
+                          simulated_acceptance=payload.get('simulate_acc_len')))
+    return dict(table=info.get('speculative_dspark_sps_table_path'), ranks=ranks,
+                note='服务级记录，仅统计开始采样后的步骤；可能包含其他客户端。预算缩短不等于加速。')
+
+
 def run(args):
     """Run fixed workloads; requested concurrency above the server cap is skipped unless explicitly queued."""
     info = get(args.url + '/server_info')
+    dspark_start = dspark_watermarks(info)
     cap = info.get('max_running_requests')
     context = int(info.get('context_length') or 0)
     configuration = {}
@@ -249,6 +280,10 @@ def run(args):
         raise
     finally:
         stop.set(); thread.join(timeout=20)
+        try:
+            report['dspark'] = dspark_evidence(get(args.url + '/server_info'), dspark_start)
+        except (OSError, ValueError) as exc:
+            report['dspark'] = {'error': str(exc)}
         report['finished'] = time.time()
         report['samples'] = list(report['samples'])
         report['observations'] = observations(report['samples'], report['rounds'])

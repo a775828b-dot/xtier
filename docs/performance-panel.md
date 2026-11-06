@@ -15,7 +15,7 @@
 
 需要测客户端 4/8/16 并发但服务上限较低时，显式开启排队压力模式。结果将标注含排队；它不能证明服务实际执行了相同大小的 batch。若要提高服务并发能力，另行调整启动配置、校准 SPS 并验证显存峰值，测试面板不代做这些操作。
 
-Agent 测试自动适配当前 xtier/ 源码布局；旧上游 adapter/ 工作负载和此版本不是完全相同的任务，不直接混合基线。原有 decode/context/TTFT 脚本仍保留；统一面板修正了总吞吐的计时区间，并免去其本机不存在的默认语料路径。PPL、token flip 等需要额外评估语料或目标答案，本版不纳入一键性能测试。verify_step_bench 依赖外部 prompts 文件，验证步相关计数先使用已有服务 metrics 和 Agent 报告。
+Agent 测试自动适配当前 xtier/ 源码布局；旧上游 adapter/ 工作负载和此版本不是完全相同的任务，不直接混合基线。原有 decode/context/TTFT 脚本仍保留；统一面板修正了总吞吐的计时区间，并移除对固定语料路径的依赖。PPL、token flip 等需要额外评估语料或目标答案，本版不纳入一键性能测试。verify_step_bench 依赖外部 prompts 文件，验证步相关计数先使用已有服务 metrics 和 Agent 报告。
 
 ## 监控与测试就绪
 
@@ -36,8 +36,8 @@ GPU 功耗、显存、利用率和时钟在模型未启动、加载中或退出�
 ## 命令行与结果
 
 ```sh
-python xtier/console/perf.py --kind decode --url http://127.0.0.1:18190 --model DeepSeek-V4.1-Flash-1017 --tokens 512 --rounds 3 --out bench/results/decode-baseline.json
-python xtier/console/perf.py --kind concurrency --url http://127.0.0.1:18190 --model DeepSeek-V4.1-Flash-1017 --tokens 512 --rounds 3 --queue --out bench/results/concurrency-baseline.json
+python xtier/console/perf.py --kind decode --url http://127.0.0.1:30000 --model DeepSeek-V4.1-Flash-1017 --tokens 512 --rounds 3 --out bench/results/decode-baseline.json
+python xtier/console/perf.py --kind concurrency --url http://127.0.0.1:30000 --model DeepSeek-V4.1-Flash-1017 --tokens 512 --rounds 3 --queue --out bench/results/concurrency-baseline.json
 ```
 
 面板结果和配置快照保存在管理器状态目录的 benchmarks/ 中，保留完整文件，界面显示最近 20 次。开始测试时自动保存在线模型配置和本次测试选项。点击“查看测试结果”打开浮窗，上方是配置快照，下方是各轮测试结果、观测摘要和 JSON 导出。运行中也可查看已保存的配置；历史记录可随时重新打开。CLI 结果存到 --out。管理器一次只允许一个测试；测试运行中拒绝启动/安装操作。取消只终止测试客户端进程组，不停止模型；已提交请求可能仍在服务端收尾。重启管理服务会中断其测试进程，历史状态标记 interrupted。
@@ -45,6 +45,10 @@ python xtier/console/perf.py --kind concurrency --url http://127.0.0.1:18190 --m
 建议先以固定输出和 Agent 测试建立基线，再只改变一个参数复测。主要指标是单请求速度、首 token 延迟、总吞吐、错误/照抄差异；功耗用作辅助观测，不以功耗上限作为验收目标。
 
 ## Agent 与照抄结果
+
+测试结果中的“DSpark / SPS 实际运行证据”展示原生 `dspark_info_record` 中的验证模式、成本预测对应的预算决策与预算缩短次数。需服务启用 `SGLANG_DSPARK_DEBUG_DUMP=core`；未采集时明确显示无法确认，不能仅凭表路径认定生效。记录按测试开始时各 rank 的 `forward_ct` 排除既有预热步骤，仍可能包含其他客户端流量；预算缩短本身不代表速度提升。
+
+`python -m xtier.console.sps_profiler` 复用 SGLang profiler 的参数和采样流程，但二维拟合保留逐 token 的预算档位，避免小 batch 的所有测量被合并到同一个 64-token 桶。校准使用 compact 模式和模拟接受长度 1；正式服务必须移除模拟设置。DeepSeek V4 补丁按变长布局计算 Engram 哈希和注意力请求索引，验证过程不提交 Engram 历史；校准期间的强制预算会禁用未初始化表的 verify-all 快捷路径。
 
 Agent 结果按会话和步骤展示输入、缓存、输出 token、TTFT、decode 速度、验证步数、接受长度和工具调用；失败请求独立列出。此基准没有任务标准答案或验收器，因此任务准确率显示未评分，工具调用不等于任务完成。
 

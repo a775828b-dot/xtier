@@ -35,6 +35,25 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class CopyAccuracyTests(unittest.TestCase):
+    def test_sps_table_path_does_not_imply_planner_activity(self):
+        info = {'speculative_dspark_sps_table_path': 'table.json', 'internal_states': [
+            {'dspark_info_record': {'mode': 'static', 'gamma': 5, 'records': [
+                {'forward_ct': 10, 'budget': None}]}}]}
+        result = perf.dspark_evidence(info, [9])
+        self.assertEqual(result['ranks'][0]['planned_steps'], 0)
+
+    def test_sps_evidence_excludes_warmup_and_counts_actual_decisions(self):
+        info = {'internal_states': [{'dspark_info_record': {'mode': 'compact', 'gamma': 5,
+            'simulate_acc_len': None, 'records': [
+                {'forward_ct': 10, 'budget': 1, 'predicted_step_ms': 20, 'num_running_reqs': 1},
+                {'forward_ct': 11, 'budget': 3, 'predicted_step_ms': 30, 'num_running_reqs': 1},
+                {'forward_ct': 12, 'budget': 5, 'predicted_step_ms': 40, 'num_running_reqs': 1}]}}]}
+        result = perf.dspark_evidence(info, [10])['ranks'][0]
+        self.assertEqual(result['observed_steps'], 2)
+        self.assertEqual(result['planned_steps'], 2)
+        self.assertEqual(result['reduced_steps'], 1)
+        self.assertEqual(result['budget_counts'], {'3': 1, '5': 1})
+
     def test_exact_match_counts_cases_not_matching_characters(self):
         result = perf.copy_summary([
             {'src': 'a', 'out': 'a', 'diffs': []},
