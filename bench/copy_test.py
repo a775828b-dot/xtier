@@ -29,7 +29,9 @@ P.add_argument('--out', default='bench/results/copy')
 A = P.parse_args()
 lines = Path(A.source).read_text(encoding='utf-8').splitlines()
 chunks = ['\n'.join(lines[a:a + 90]) for a in (200, 900, 1600, 2300, 3000, 3700, 4400, 5100)]
-chunks = [c for c in chunks if '｜' not in c][:A.chunks]
+chunks = [c for c in chunks if c.strip() and '｜' not in c][:A.chunks]
+if not chunks:
+    raise SystemExit('No non-empty source chunks available')
 url = f'http://127.0.0.1:{A.port}/v1/chat/completions'
 
 
@@ -39,22 +41,31 @@ def run(c):
                 messages=[{'role': 'user', 'content': '把 <src> 和 </src> 之间的内容逐字原样输出，不要增删改任何字符，'
                            '不要加代码块标记，不要解释。\n<src>\n' + c + '\n</src>'}])
     req = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})
-    d = json.loads(urllib.request.urlopen(req, timeout=900).read())
-    return c, d['choices'][0]['message'].get('content') or ''
+    try:
+        with urllib.request.urlopen(req, timeout=900) as response:
+            d = json.load(response)
+        choice = d['choices'][0]
+        return c, choice['message'].get('content') or '', choice.get('finish_reason'), None
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        return c, '', None, str(exc)
 
 
 saved, bad = [], 0
 with cf.ThreadPoolExecutor(A.concurrency) as ex:
-    for c, out in ex.map(run, chunks):
+    for c, out, finish_reason, error in ex.map(run, chunks):
         o = out.strip('\n')
-        if o.startswith('```'):
+        if o.startswith('```') and '\n' in o:
             o = o.split('\n', 1)[1].rsplit('```', 1)[0].strip('\n')
         src = c.strip('\n')   # as the output: a window can start or end on an empty line
         if A.ignore_first_indent:
             src, o = src.lstrip(' '), o.lstrip(' ')
         diffs = [op for op in difflib.SequenceMatcher(None, src, o, autojunk=False).get_opcodes() if op[0] != 'equal']
         bad += bool(diffs)
-        saved.append(dict(src=c, out=out, diffs=[list(d) for d in diffs]))
+        saved.append(dict(src=c, out=out, diffs=[list(d) for d in diffs], expected=src, actual=o,
+                          finish_reason=finish_reason, error=error))
 os.makedirs(A.out, exist_ok=True)
 Path(A.out, f'{A.tag}-c{A.concurrency}.json').write_text(json.dumps(saved, ensure_ascii=False))
 print(f'COPY {bad}/{len(chunks)} copies differ (concurrency {A.concurrency})')
+
+if any(row['error'] for row in saved):
+    raise SystemExit('Copy requests failed; inspect saved results')

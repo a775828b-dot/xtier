@@ -315,8 +315,15 @@ def _mxfp8_linear(original, input, *args, **kwargs):
 
 
 def install(registry, hook_type):
-    from xtier.packs.deepseek_v4 import paged_indexer, wo_a
+    from xtier.packs.deepseek_v4 import ragged_verify, paged_indexer, wo_a
 
+    registry.register(f'{HASHER}.forward', ragged_verify.forward, hook_type.AROUND)
+    registry.register('sglang.srt.layers.attention.dsv4.dsv41_sparse.token_req_indices',
+                      ragged_verify.token_req_indices, hook_type.AROUND)
+    registry.register('sglang.srt.layers.attention.deepseek_v4_backend.token_req_indices',
+                      ragged_verify.token_req_indices, hook_type.AROUND)
+    registry.register('sglang.srt.speculative.dspark_components.dspark_planner.DSparkVerifyPlanner.set_forced_budget_frac',
+                      ragged_verify.forced_budget, hook_type.AFTER)
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
     wo_a.install(registry, hook_type)

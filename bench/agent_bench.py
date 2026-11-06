@@ -273,6 +273,7 @@ def run_session(name, args, tok):
                 row, content, reasoning, calls = request(msgs, args)
             except urllib.error.HTTPError as e:   # XTier copy: end the session, keep the round
                 print(f'[{name}] step {step}: HTTP {e.code} {e.read()[:200]!r}, ending the session', flush=True)
+                args.failures.append({'session': name, 'step': step, 'http_status': e.code})
                 break
             row.update(session=name, step=step)
             rows.append(row)
@@ -366,10 +367,24 @@ def main():
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--dry-run', action='store_true', help='build the sandboxes and histories only, no requests')
     args = p.parse_args()
+    args.failures = []
     global ARGS
     ARGS = args
     if not args.tokenizer or not args.lsglang:
         p.error('--tokenizer and --lsglang are required (or set MODEL and LSGLANG)')
+    # Current XTier stores the former adapter modules under xtier/.
+    if not (Path(args.repo) / 'adapter').is_dir():
+        TREES[0] = ('repo', 'xtier', 'xtier', '*.py')
+        replacements = {'adapter/early_lk_moe.py': 'xtier/backend/direct.py',
+                        'adapter/sitecustomize.py': 'xtier/__init__.py',
+                        'adapter/engram_backend.py': 'xtier/packs/deepseek_v4/engram_gather.py',
+                        'adapter/ds1017_quant.py': 'xtier/cache/pool.py'}
+        for name, (target, task, files) in list(SESSIONS.items()):
+            for old, new in replacements.items():
+                task = task.replace(old, new)
+            SESSIONS[name] = (target, task, [replacements.get(f, f) for f in files])
+        global SYSTEM
+        SYSTEM = SYSTEM.replace('adapter（', 'xtier（')
     from tokenizers import Tokenizer
     t = Path(args.tokenizer)
     tok = Tokenizer.from_file(str(t / 'tokenizer.json' if t.is_dir() else t))
@@ -384,6 +399,8 @@ def main():
     json.dump(dict(label=args.label, args=vars(args), wall_s=round(time.time() - t0, 1), summary=summary, rows=rows),
               open(out, 'w'), indent=1, ensure_ascii=False)
     print('saved', out)
+    if args.failures or not rows:
+        raise SystemExit('agent_bench: incomplete run; inspect saved failures')
 
 
 if __name__ == '__main__':
