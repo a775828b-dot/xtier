@@ -1,14 +1,15 @@
 """CPU calls with cold experts that route to more experts than the free RAM slots hold (DeepSeek V4.1 Flash 1017
-layer 20, 30% of the experts on the Optane drives): CpuPlan.forward runs them in passes. Compared with the full plan:
+layer 20, 30% of the experts on NVMe drives): CpuPlan.forward runs them in passes. Compared with the full plan:
 calls of up to 8 tokens bit for bit (one pass), larger ones within float32 summation-order error.
-    python tests/cold_passes_check.py DIR1 DIR2      (store directories, one per drive; a test store is written there)
+    python tests/cold_passes_check.py DIR1 DIR2 [DIR...]   (store directories, one per drive; a test store is written
+    there; with XTIER_COLD_UNITS=3 and XTIER_COLD_PARTS the records lie in units)
 """
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(sys.argv[1:3]), XTIER_COLD_FRACTION='0.3',
+os.environ.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(sys.argv[1:]), XTIER_COLD_FRACTION='0.3',
                   XTIER_COLD_KEY='passes-check', XTIER_COLD_LOG='0')
 for name, value in {'DYNAMIC': '2', 'DOWN_BF16': '1', 'DOWN_GRAIN': '24', 'SPIN_COUNT': '1048576', 'THP': '0'}.items():
     os.environ.setdefault('XTIER_' + name, value)

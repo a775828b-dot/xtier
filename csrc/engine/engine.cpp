@@ -626,8 +626,14 @@ template<bool MX> class Plan: public PlanBase {
     std::vector<int> cold_taken;      // the slots the reads in flight land in
     std::vector<int32_t> cold_split;  // the routes of the two passes
     std::vector<float> cold_late;     // the second pass's output
-    std::vector<int32_t> cold_file,pins;   // cold_file, cold_offset: per expert and node part
-    bool stored(int e) const {return cold_file[size_t(e)*nodes]>=0;}
+    std::vector<int32_t> cold_file,pins;   // cold_file, cold_offset: per expert, node part and unit
+    int cold_units=1;                      // XTIER_COLD_UNITS: a node part's units on the drives (1 or 3)
+    bool stored(int e) const {return cold_file[size_t(e)*nodes*cold_units]>=0;}
+    // XTIER_TAIL_SKIP (0: off; changes the output): see tail_skip
+    int tail_rank=0,tail_tokens=8;
+    long long cold_tail_skipped=0;
+    std::vector<int32_t> tail_ids;
+    std::vector<int> tail_min;
     std::vector<long long> cold_offset,cold_mark,cold_stamp;
     std::vector<double> cold_score;
     std::vector<int> cold_used,cold_miss;
@@ -1164,6 +1170,7 @@ public:
         std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
         if(!guard.owns_lock())throw std::runtime_error("Plan does not permit concurrent callers");
         if(tokens<1||tokens>MAX_BATCH||k<1||k>MAX_K||!x||!ids||!rw||!y)throw std::runtime_error("Invalid input");
+        ids=tail_skip(tokens,k,ids,rw);
         void *reads=cold_store?ensure_resident(tokens,k,ids):nullptr;
         if(!reads)return compute(tokens,k,x,ids,rw,y);
         // Experts being read (overlap): first the routes to the experts in RAM, then the others once their reads
@@ -1187,6 +1194,33 @@ public:
         for(size_t j=0;j<rows;j++)y[j]+=cold_late[j];
         last_times[0]+=phases[0];last_times[1]+=phases[1];
         return first+second;
+    }
+    // XTIER_TAIL_SKIP=R (Strata's STRATA_ROUTE_TAIL_SKIP): in a call of at most XTIER_TAIL_SKIP_TOKENS tokens (8: a
+    // decode step, one request's speculative verify window), an expert outside RAM that every token of the call routes
+    // at rank R or lower (by weight within the token's top-k, 0 the largest) is neither read nor computed: its routes
+    // become -1 (computed elsewhere: they add nothing), the other routes keep their weights (no renormalisation).
+    // Returns ids, or a copy with those routes taken out.
+    const int32_t *tail_skip(int tokens,int k,const int32_t *ids,const float *rw) {
+        if(tail_rank<=0||tail_rank>=k||tokens>tail_tokens||!cold_store)return ids;
+        tail_min.assign(experts,k);
+        for(int t=0;t<tokens;t++)for(int q=0;q<k;q++) {
+            const int e=ids[t*k+q];
+            if(e<0||e>=experts)continue;
+            const float w=rw[t*k+q];int r=0;
+            for(int p=0;p<k;p++){const float v=rw[t*k+p];r+=v>w||(v==w&&p<q);}
+            tail_min[e]=std::min(tail_min[e],r);
+        }
+        bool any=false;
+        for(int t=0;t<tokens*k&&!any;t++){const int e=ids[t];any=e>=0&&e<experts&&slot_of[e]<0&&stored(e)&&tail_min[e]>=tail_rank;}
+        if(!any)return ids;
+        tail_ids.assign(ids,ids+size_t(tokens)*k);
+        for(int j=0;j<tokens*k;j++) {
+            const int e=tail_ids[j];
+            if(e<0||e>=experts||slot_of[e]>=0||!stored(e)||tail_min[e]<tail_rank)continue;
+            if(tail_min[e]<k){cold_tail_skipped++;tail_min[e]=k+1;}   // counted once a call
+            tail_ids[j]=-1;
+        }
+        return tail_ids.data();
     }
     // One pass over the routes (-1: skipped) into y.
     int compute(int tokens,int k,const uint16_t *x,const int32_t *ids,const float *rw,float *y) {
@@ -1295,23 +1329,30 @@ public:
         }
         const size_t H=hidden,I=inter,IN=I/nodes,HN=H/nodes;
         const size_t sizes[6]={IN*(H/2),IN*(H/2),IN*(H>>scale_shift),IN*(H>>scale_shift),HN*(I/2),HN*(I>>scale_shift)};
-        const int jobs=int(cold_miss.size())*nodes;
+        // a job per unit of a node part (cold.py _unit_pieces): one unit, the six pieces; three units of four pieces each,
+        // the gate piece and the up piece each in four 512-byte aligned quarters, then the scales and the down piece
+        const int U=cold_units,n=U==1?6:4;
+        const size_t quarter=sizes[0]/4/512*512;   // the gate and the up piece are the same size
+        const int jobs=int(cold_miss.size())*nodes*U;
         std::vector<int> files(jobs);std::vector<long long> offsets(jobs);
-        std::vector<void*> dst(size_t(jobs)*6);std::vector<size_t> len(size_t(jobs)*6);
-        for(size_t q=0;q<cold_miss.size();q++)for(int node=0;node<nodes;node++) {
-            const size_t j=q*nodes+node,s=size_t(taken[q]);const int e=cold_miss[q];const auto &sh=shards[node];
+        std::vector<void*> dst(size_t(jobs)*n);std::vector<size_t> len(size_t(jobs)*n);
+        for(size_t q=0;q<cold_miss.size();q++)for(int node=0;node<nodes;node++)for(int t=0;t<U;t++) {
+            const size_t j=(q*nodes+node)*U+t,s=size_t(taken[q]);const int e=cold_miss[q];const auto &sh=shards[node];
             uint8_t *base[6]={sh.gate.get(),sh.up.get(),sh.sg.get(),sh.su.get(),sh.down.get(),sh.sd.get()};
-            files[j]=cold_file[size_t(e)*nodes+node];offsets[j]=cold_offset[size_t(e)*nodes+node];
-            for(int p=0;p<6;p++){dst[j*6+p]=base[p]+s*sizes[p];len[j*6+p]=sizes[p];}
+            const size_t at=(size_t(e)*nodes+node)*U+t;
+            files[j]=cold_file[at];offsets[j]=cold_offset[at];
+            if(U==1)for(int p=0;p<6;p++){dst[j*6+p]=base[p]+s*sizes[p];len[j*6+p]=sizes[p];}
+            else if(t<2)for(int r=0;r<4;r++){dst[j*4+r]=base[t]+s*sizes[t]+r*quarter;len[j*4+r]=r<3?quarter:sizes[t]-3*quarter;}
+            else for(int p=2;p<6;p++){dst[j*4+p-2]=base[p]+s*sizes[p];len[j*4+p-2]=sizes[p];}
         }
         cold_taken=taken;
         if(cold_overlap) {
             std::vector<int> group(size_t(jobs),0);
-            void *ticket=cold_io.submit(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),6,group.data(),1);
+            void *ticket=cold_io.submit(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),n,group.data(),1);
             if(!ticket){release_taken();throw std::runtime_error("Reading cold experts from NVMe failed");}
             return ticket;
         }
-        if(cold_io.read(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),6)) {
+        if(cold_io.read(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),n)) {
             release_taken();
             throw std::runtime_error("Reading cold experts from NVMe failed");
         }
@@ -1341,8 +1382,15 @@ public:
                     float half_life) override {
         std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
         if(!guard.owns_lock()||!store||!io||!io->read||!io->submit||!io->finish||!files||!offsets||!(half_life>0))return -1;
-        // per expert and node part ([e*nodes+n]): where the part's six pieces are in the store
-        cold_file.assign(files,files+size_t(experts)*nodes);cold_offset.assign(offsets,offsets+size_t(experts)*nodes);
+        // per expert, node part and unit ([(e*nodes+n)*units+t]): where the unit's pieces are in the store (cold.py: one
+        // unit of the part's six pieces, or three units, see ensure_resident)
+        const char *units=std::getenv("XTIER_COLD_UNITS");
+        cold_units=units&&std::string(units)=="3"?3:1;
+        const char *tail=std::getenv("XTIER_TAIL_SKIP"),*tail_n=std::getenv("XTIER_TAIL_SKIP_TOKENS");
+        tail_rank=tail&&*tail?std::max(0,std::atoi(tail)):0;
+        tail_tokens=tail_n&&*tail_n?std::max(0,std::atoi(tail_n)):8;   // 0: never (XTIER_TAIL_SKIP_EVAL alone)
+        const size_t entries=size_t(experts)*nodes*cold_units;
+        cold_file.assign(files,files+entries);cold_offset.assign(offsets,offsets+entries);
         for(int e=0;e<experts;e++)if(slot_of[e]<0&&!stored(e))return -1;   // in neither RAM nor the store
         cold_score.assign(experts,0.0);
         if(scores)for(int e=0;e<experts;e++)cold_score[e]=scores[e];
@@ -1365,10 +1413,12 @@ public:
         std::lock_guard<std::mutex> g(resident_lock);
         if(slot>=0&&slot<int(pins.size())&&pins[slot]>0)pins[slot]--;
     }
-    // forwards, experts read from NVMe, seconds spent reading; the same for the forwards of at most 8 tokens
+    // forwards, experts read from NVMe, seconds spent reading; the same for the forwards of at most 8 tokens; experts
+    // XTIER_TAIL_SKIP left out (once a call)
     void cold_stats(double *out) override {
         out[0]=double(cold_forwards);out[1]=double(cold_loads);out[2]=cold_seconds;
         out[3]=double(cold_small_forwards);out[4]=double(cold_small_loads);out[5]=cold_small_seconds;
+        out[6]=double(cold_tail_skipped);
     }
     // Placement, from the plan's one caller between forwards (the call lock guards it): expert into slot; the expert
     // the slot held, -1 if none; -2 invalid, -3 a forward in progress.

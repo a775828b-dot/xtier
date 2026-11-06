@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from xtier import config, platform
 from xtier.backend import direct, formats, kernels
 from xtier.backend.prefill import Prefill
+from xtier.cache import tail
 from xtier.engine import CpuPlan, Mailbox, placement
 
 logger = logging.getLogger(__name__)
@@ -317,6 +318,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         capturing = torch.cuda.is_current_stream_capturing()
         if not capturing and XTierMoEMethod._registered < len(XTierMoEMethod.layers):
             XTierMoEMethod._register_all()
+        if not capturing and m > config.decode_max() and tail.eval_rank():   # XTIER_TAIL_SKIP_EVAL: measuring only
+            weights = tail.prefill_mask(getattr(self, 'plan', None), ids, weights, tail.eval_rank())
         if not capturing and m > config.decode_max() and self.pool is not None and not self.pool.full:
             from xtier.cache import pool as cache_pool
             cache_pool.record_prompt(self.pool, ids)   # XTIER_CACHE_PROMPT=1: the prompt warms the expert cache

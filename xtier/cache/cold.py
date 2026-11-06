@@ -14,7 +14,10 @@ drives' bandwidth).
   XTIER_COLD=1                   on
   XTIER_COLD_PATHS=dir[:dir...]  one directory per drive; node part n of every record goes to drive n % drives
   XTIER_COLD_PARTS=3:3:2         node parts of a record per drive instead (a faster drive takes more; the sum is the
-                                 engine's node count)
+                                 engine's node count), or units with XTIER_COLD_UNITS=3 (the sum: 3 x the node count)
+  XTIER_COLD_UNITS=3             every node part in three units on the drives (its gate piece, its up piece, the rest):
+                                 finer shares for drives of unequal speed (four PCIe 5.0 and two PCIe 4.0 drives:
+                                 XTIER_COLD_PARTS=5:5:5:5:2:2); the default 1 keeps node parts whole
   XTIER_COLD_FRACTION=0.3        share of each layer's experts not in RAM
   XTIER_COLD_HALF_LIFE=50        forwards over which a use count halves (decode steps)
   XTIER_COLD_THREADS=8           readers per drive
@@ -222,14 +225,61 @@ class LayerPlan:
         self.reads = []   # where the loader's expert tensors lie in the checkpoint files (direct.locate; save_ranges)
 
 
-def _drive_parts(nodes, drives):
-    """Per node part, its drive: XTIER_COLD_PARTS counts (or an even split) handed out in turn, a drive leaving the
-    turn once it has its count."""
+def _units():
+    """XTIER_COLD_UNITS: the units a record's node part is split into across the drives, 1 (the part whole) or 3."""
+    u = (os.environ.get('XTIER_COLD_UNITS') or '1').strip()
+    if u not in ('1', '3'):
+        raise RuntimeError(f'xtier cold: XTIER_COLD_UNITS={u}: 1 or 3')
+    return int(u)
+
+
+def _unit_pieces(sizes, units):
+    """Per unit of a node part, its pieces as (piece, offset in the piece, bytes), in the order they lie on the drive.
+    One unit: the six pieces. Three: the gate piece and the up piece, each as four 512-byte aligned quarters, then the
+    other four pieces: four pieces a read, as the engine's reads take them (csrc/engine/engine.cpp ensure_resident)."""
+    if units == 1:
+        return [[(p, 0, s) for p, s in enumerate(sizes)]]
+    quarter = sizes[0] // 4 // 512 * 512   # the gate and the up piece are the same size
+    return ([[(p, r * quarter, quarter if r < 3 else sizes[p] - 3 * quarter) for r in range(4)] for p in (0, 1)]
+            + [[(p, 0, sizes[p]) for p in range(2, 6)]])
+
+
+def _drive_parts(nodes, drives, unit_bytes=None):
+    """Per unit of a record (node part n's unit t is unit n * units + t; one unit a part without unit_bytes), its drive:
+    XTIER_COLD_PARTS counts of units per drive (or an even split). Whole node parts are handed out in turn (the layout
+    of the stores written before units); units go largest first to the drive whose count they fill least (its bytes
+    over its count), so that a record's bytes on a drive follow its count."""
+    units = 1 if unit_bytes is None else len(unit_bytes)
+    total = nodes * units
     spec = os.environ.get('XTIER_COLD_PARTS')
-    counts = [int(c) for c in spec.split(':')] if spec else [nodes // drives + (d < nodes % drives) for d in range(drives)]
-    if len(counts) != drives or sum(counts) != nodes or min(counts) < 1:
-        raise RuntimeError(f'xtier cold: XTIER_COLD_PARTS={spec} needs {drives} counts of at least 1 summing to {nodes}')
-    return counts, hand_out(counts)
+    counts = [int(c) for c in spec.split(':')] if spec else [total // drives + (d < total % drives) for d in range(drives)]
+    if len(counts) != drives or sum(counts) != total or min(counts) < 1:
+        raise RuntimeError(f'xtier cold: XTIER_COLD_PARTS={spec} needs {drives} counts of at least 1 summing to {total}')
+    if units == 1:
+        return counts, hand_out(counts)
+    size = [unit_bytes[u % units] for u in range(total)]
+    load, left, drive_of = [0] * drives, list(counts), [0] * total
+    for u in sorted(range(total), key=lambda u: (-size[u], u)):
+        d = min((d for d in range(drives) if left[d]), key=lambda d: ((load[d] + size[u]) / counts[d], d))
+        drive_of[u], load[d], left[d] = d, load[d] + size[u], left[d] - 1
+    return counts, drive_of
+
+
+def _unit_layout(sizes, nodes, drives):
+    """(the units' pieces, the units' bytes, the units per drive, each unit's drive) of XTIER_COLD_UNITS and
+    XTIER_COLD_PARTS for node parts of these piece sizes."""
+    units = _unit_pieces(sizes, _units())
+    unit_bytes = [sum(b for _, _, b in u) for u in units]
+    counts, drive_of = _drive_parts(nodes, drives, unit_bytes)
+    return units, unit_bytes, counts, drive_of
+
+
+def _layout_matches(entry, record, drives, units, counts, drive_of):
+    """Whether a manifest entry's records lie as this layout puts them (entries from before units have no units and no
+    map: whole node parts, handed out in turn)."""
+    return (entry is not None and entry.get('record') == record and len(entry.get('starts', [])) == drives
+            and entry.get('parts', counts) == counts and entry.get('units', 1) == units
+            and entry.get('map', drive_of) == drive_of)
 
 
 def hand_out(counts):
@@ -275,16 +325,26 @@ def _layout(H, I, nodes, scale_format):
 
 
 def _key(E, H, I, scale_format, nodes):
-    return os.environ.get('XTIER_COLD_KEY') or f'{_model_name()}-E{E}-H{H}-I{I}-{scale_format}-n{nodes}'
+    units = _units()
+    return os.environ.get('XTIER_COLD_KEY') or (f'{_model_name()}-E{E}-H{H}-I{I}-{scale_format}-n{nodes}'
+                                                + (f'-u{units}' if units > 1 else ''))
 
 
-def where_records(drive_of, counts, part):
-    share = [c * part for c in counts]   # a record's bytes on each drive
-    rank_in = [drive_of[:n].count(drive_of[n]) for n in range(len(drive_of))]   # a part's place among its drive's parts
+def where_records(drive_of, unit_bytes):
+    """where(starts, i, u): (drive, offset) of unit u (node part u // units, its unit u % units; units: len(unit_bytes))
+    of the layer's i-th stored record. A drive holds its units of every record back to back, in unit order;
+    where.share: a record's bytes on each drive."""
+    units = len(unit_bytes)
+    share = [0] * (max(drive_of) + 1)
+    before = []   # a unit's offset among its drive's units of a record
+    for u, d in enumerate(drive_of):
+        before.append(share[d])
+        share[d] += unit_bytes[u % units]
 
-    def where(starts, i, n):   # (drive, offset) of node part n of the layer's i-th stored record
-        d = drive_of[n]
-        return d, starts[d] + i * share[d] + rank_in[n] * part
+    def where(starts, i, u):
+        d = drive_of[u]
+        return d, starts[d] + i * share[d] + before[u]
+    where.share = share
     return where
 
 
@@ -303,14 +363,14 @@ def loadable(lp, hidden, inter, scale_format, threads):
     RAM slots, not the records: lp takes their order from the manifest. A layer only in the store has no checkpoint
     bytes to match (its files are checked by cold_only, the model's .json files may change)."""
     nodes = _nodes(threads)
-    _, _, record = _layout(hidden, inter, nodes, scale_format)
+    sizes, _, record = _layout(hidden, inter, nodes, scale_format)
     st = store(_key(lp.experts, hidden, inter, scale_format, nodes))
-    counts, _ = _drive_parts(nodes, len(st.paths))
+    units, _, counts, drive_of = _unit_layout(sizes, nodes, len(st.paths))
     with st.lock:
         entry = st.manifest['layers'].get(str(lp.layer_id))
-        ok = (entry is not None and (entry.get('source') == source() or only_in_store(lp.layer_id))
-              and entry.get('record') == record and sorted(entry.get('stored', [])) == sorted(lp.stored)
-              and len(entry.get('starts', [])) == len(st.paths) and entry.get('parts', counts) == counts)
+        ok = (_layout_matches(entry, record, len(st.paths), len(units), counts, drive_of)
+              and (entry.get('source') == source() or only_in_store(lp.layer_id))
+              and sorted(entry.get('stored', [])) == sorted(lp.stored))
         if ok:
             lp.stored = entry['stored']
         return ok
@@ -332,17 +392,22 @@ def attach_loaded(plan, lp, scale_format):
     loading: direct.finish), the cold experts attached as attach does. Returns the layer's PrefillCold."""
     from xtier.backend import direct
     nodes, H, I, E = plan.nodes(), plan.hidden, plan.inter, plan.experts
-    sizes, part, record = _layout(H, I, nodes, scale_format)
+    sizes, _, record = _layout(H, I, nodes, scale_format)
     st = store(_key(E, H, I, scale_format, nodes))
-    counts, drive_of = _drive_parts(nodes, len(st.paths))
-    where = where_records(drive_of, counts, part)
+    units, unit_bytes, _, drive_of = _unit_layout(sizes, nodes, len(st.paths))
+    where = where_records(drive_of, unit_bytes)
     t0 = time.time()
     with st.lock:
         starts = st.manifest['layers'][str(lp.layer_id)]['starts']
     index = {e: i for i, e in enumerate(lp.stored)}
-    jobs = [(*where(starts, index[e], n), plan.slot_pieces(j, n)) for j, e in enumerate(lp.resident) for n in range(nodes)]
+    U, jobs = len(units), []
+    for j, e in enumerate(lp.resident):
+        for n in range(nodes):
+            slot = plan.slot_pieces(j, n)
+            jobs += [(*where(starts, index[e], n * U + t), [(slot[p][0] + o, b) for p, o, b in unit])
+                     for t, unit in enumerate(units)]
     direct.defer(plan, _Ticket(st.native, st.native.submit(jobs, [0] * len(jobs), 1)), scale_format, lp.layer_id)
-    return _attach(plan, lp, st, starts, where, sizes, part, nodes, record,
+    return _attach(plan, lp, st, starts, where, sizes, units, nodes, record,
                    f'matching this checkpoint, {plan.slots * record / 1e9:.1f} GB being read into the RAM slots', t0)
 
 
@@ -351,18 +416,18 @@ def attach(plan, lp, inputs, scale_format):
     reused), then the plan's forwards handle the cold experts (xtier_cold_attach). Returns the layer's PrefillCold."""
     group = 32 if scale_format == 'mxfp4' else 16
     nodes, H, I, E = plan.nodes(), plan.hidden, plan.inter, plan.experts
-    sizes, part, record = _layout(H, I, nodes, scale_format)
+    sizes, _, record = _layout(H, I, nodes, scale_format)
     st = store(_key(E, H, I, scale_format, nodes))
     D = len(st.paths)
-    counts, drive_of = _drive_parts(nodes, D)
-    share = [c * part for c in counts]   # a record's bytes on each drive
-    where = where_records(drive_of, counts, part)
+    units, unit_bytes, counts, drive_of = _unit_layout(sizes, nodes, D)
+    U = len(units)
+    where = where_records(drive_of, unit_bytes)
+    share = where.share   # a record's bytes on each drive
     key = str(lp.layer_id)
     t0 = time.time()
     with st.lock:
         entry = st.manifest['layers'].get(key)
-        layout_ok = (entry is not None and entry.get('record') == record and entry.get('stored') == lp.stored
-                     and len(entry.get('starts', [])) == D and entry.get('parts', counts) == counts)
+        layout_ok = _layout_matches(entry, record, D, U, counts, drive_of) and entry.get('stored') == lp.stored
         reuse = False
         if layout_ok:   # the records are there: check two samples of each against the weights
             buf = torch.empty(3 * 4096, dtype=torch.uint8)
@@ -370,8 +435,8 @@ def attach(plan, lp, inputs, scale_format):
             base = buf.data_ptr() + skip
             reuse = True
             for i, e in enumerate(lp.stored):
-                (f0, a), (f1, b) = where(entry['starts'], i, 0), where(entry['starts'], i, nodes - 1)
-                st.native.read([(f0, a, [(base, 4096)]), (f1, b + part - 4096, [(base + 4096, 4096)])])
+                (f0, a), (f1, b) = where(entry['starts'], i, 0), where(entry['starts'], i, nodes * U - 1)
+                st.native.read([(f0, a, [(base, 4096)]), (f1, b + unit_bytes[-1] - 4096, [(base + 4096, 4096)])])
                 got = bytes(buf[skip:skip + 8192].numpy())
                 if zlib.crc32(got[4096:], zlib.crc32(got[:4096])) != _sample(inputs, e, nodes, H, I, group):
                     reuse = False
@@ -385,8 +450,8 @@ def attach(plan, lp, inputs, scale_format):
                 st.save()
         else:
             size = [len(lp.stored) * b for b in share]   # on each drive
-            if layout_ok or (entry is not None and entry.get('record') == record and len(entry.get('starts', [])) == D
-                             and entry.get('parts', counts) == counts and len(entry.get('stored', [])) >= len(lp.stored)):
+            if layout_ok or (_layout_matches(entry, record, D, U, counts, drive_of)
+                             and len(entry.get('stored', [])) >= len(lp.stored)):
                 starts = entry['starts']   # rewrite in place
             else:
                 starts = list(st.ends)
@@ -396,11 +461,14 @@ def attach(plan, lp, inputs, scale_format):
 
             errors = []
 
-            def write(d):   # drive d: its node parts of every record, in part order, back to back
+            def write(d):   # drive d: its units of every record, in unit order, back to back
                 try:
-                    mine = [n for n in range(nodes) if drive_of[n] == d]
+                    mine = [u for u in range(nodes * U) if drive_of[u] == d]
                     for i, e in enumerate(lp.stored):
-                        pieces = [p for n in mine for p in _pieces(inputs, e, n, nodes, H, I, group)]
+                        pieces = []
+                        for u in mine:
+                            src = _pieces(inputs, e, u // U, nodes, H, I, group)
+                            pieces += [(src[p][0] + o, b) for p, o, b in units[u % U]]
                         st.native.write(d, starts[d] + i * share[d], pieces)
                 except BaseException as e:   # re-raised after the join: the manifest must not vouch for these records
                     errors.append(e)
@@ -414,25 +482,27 @@ def attach(plan, lp, inputs, scale_format):
                 raise errors[0]
             st.sync()
             st.manifest['layers'][key] = dict(record=record, stored=lp.stored, starts=starts, parts=counts,
-                                              ends=[s + z for s, z in zip(starts, size)], source=source())
+                                              ends=[s + z for s, z in zip(starts, size)], source=source(),
+                                              **({'units': U, 'map': drive_of} if U > 1 else {}))
             st.save()
             st.written += 1
-    return _attach(plan, lp, st, starts, where, sizes, part, nodes, record, 'reused' if reuse else 'written', t0)
+    return _attach(plan, lp, st, starts, where, sizes, units, nodes, record, 'reused' if reuse else 'written', t0)
 
 
-def _attach(plan, lp, st, starts, where, sizes, part, nodes, record, how, t0):
+def _attach(plan, lp, st, starts, where, sizes, units, nodes, record, how, t0):
     """The cold experts handled by the plan's forwards, the layer's PrefillCold linked to the previous layer's."""
-    E = plan.experts
-    files, offsets = [-1] * (E * nodes), [0] * (E * nodes)   # per expert and node part
+    E, U = plan.experts, len(units)
+    # per expert, node part and unit ([(e * nodes + n) * U + t]; the engine reads XTIER_COLD_UNITS as _units does)
+    files, offsets = [-1] * (E * nodes * U), [0] * (E * nodes * U)
     for i, e in enumerate(lp.stored):
-        for n in range(nodes):
-            files[e * nodes + n], offsets[e * nodes + n] = where(starts, i, n)
+        for u in range(nodes * U):
+            files[e * nodes * U + u], offsets[e * nodes * U + u] = where(starts, i, u)
     position = {e: r for r, e in enumerate(lp.rank)}
     # hotter experts start ahead, but the GPU pool's first experts at 0: the GPU computes them, their RAM slots go first
     scores = [0.0 if position[e] < lp.gpu_slots else lp.half_life * 1.44 * (1 - position[e] / E) for e in range(E)]
     plan.attach_cold(st.native, files, offsets, scores, lp.half_life)
     plan.dynamic = plan.slots   # slots experts can leave: bounds a CPU call's pass (CpuPlan.forward)
-    pc = PrefillCold(plan, st, files, offsets, sizes, part, nodes, len(_layers))
+    pc = PrefillCold(plan, st, files, offsets, sizes, units, nodes, len(_layers))
     if _layers:
         _layers[-1][2].next = pc   # read ahead by the previous layer's calls (layers attach in model order)
     _layers.append((lp.layer_id, plan, pc, record))
@@ -484,20 +554,22 @@ def _start_reporter():
         return
 
     def run():
-        last = [0.0] * 7
+        last = [0.0] * 8
         while True:
             time.sleep(every)
             stats = [p.cold_stats() for _, p, _, _ in _layers]
             now = [sum(s[i] for s in stats) for i in (1, 2, 3, 4, 5)]   # loads, s, small forwards, small loads, s
             now += [sum(pc.reads for _, _, pc, _ in _layers), sum(pc.read_s for _, _, pc, _ in _layers)]
+            now += [sum(s[6] for s in stats)]   # experts XTIER_TAIL_SKIP left out
             d = [a - b for a, b in zip(now, last)]
             record = _layers[0][3] if _layers else 0
-            if d[0] or d[5]:
+            if d[0] or d[5] or d[7]:
                 steps = d[2] / max(1, len(_layers))   # one CPU call per layer and decode step
                 logger.info('xtier cold: last %.0f s: decode %.0f steps read %d experts (%.1f per step, %.1f GB, '
                             '%.1f s), CPU prefill read %d (%.1f GB, %.1f s), GPU prefill %d (%.1f GB, uploads waited '
-                            '%.1f s)', every, steps, d[3], d[3] / steps if steps else 0, d[3] * record / 1e9, d[4],
-                            d[0] - d[3], (d[0] - d[3]) * record / 1e9, d[1] - d[4], d[5], d[5] * record / 1e9, d[6])
+                            '%.1f s)%s', every, steps, d[3], d[3] / steps if steps else 0, d[3] * record / 1e9, d[4],
+                            d[0] - d[3], (d[0] - d[3]) * record / 1e9, d[1] - d[4], d[5], d[5] * record / 1e9, d[6],
+                            f', tail skip left out {d[7]:.0f} ({d[7] / steps:.1f} per step)' if d[7] and steps else '')
             last = now
 
     _reporter = threading.Thread(target=run, name='xtier-cold-log', daemon=True)
@@ -529,9 +601,10 @@ class PrefillCold:
     and the next attention runs; a call without a read-ahead (the first layer, a call that routes to fewer, or the
     residency changed since) reads the cold experts it routes to."""
 
-    def __init__(self, plan, st, files, offsets, sizes, part, nodes, index):
+    def __init__(self, plan, st, files, offsets, sizes, units, nodes, index):
         self.plan, self.store, self.files, self.offsets = plan, st, files, offsets
-        self.sizes, self.part, self.nodes = sizes, part, nodes
+        self.sizes, self.part, self.nodes = sizes, sum(sizes), nodes
+        self.units = units   # a node part's units: their pieces (_unit_pieces); files / offsets per expert, part, unit
         self.E, self.C = plan.experts, plan.slots
         self.K = self.E - self.C   # experts not in RAM between forwards
         self.index = index         # the layer's position: its staging is index % 2
@@ -585,23 +658,23 @@ class PrefillCold:
             if held is not None and held[e]:
                 skipped.add(i)
                 continue
-            for n in range(self.nodes):
-                jobs.append((self.files[e * self.nodes + n], self.offsets[e * self.nodes + n],
-                             [(shards[n][j][0] + i * size, size) for j, size in enumerate(self.sizes)]))
-                groups.append(i)
-        self.reads += len(jobs) // self.nodes
+            mine = self._expert_jobs(shards, i, e)
+            jobs += mine
+            groups += [i] * len(mine)
+        self.reads += len(jobs) // (self.nodes * len(self.units))
         _open.add(self)
         return shards, self.store.native.submit(jobs, groups, self.K), skipped
 
+    def _expert_jobs(self, shards, i, e):
+        """Reads of expert e's records (every unit of every node part) into staging row i."""
+        U = len(self.units)
+        return [(self.files[(e * self.nodes + n) * U + t], self.offsets[(e * self.nodes + n) * U + t],
+                 [(shards[n][p][0] + i * self.sizes[p] + o, b) for p, o, b in unit])
+                for n in range(self.nodes) for t, unit in enumerate(self.units)]
+
     def _jobs(self, rows):
         """Reads of the given staging rows (the cold experts there) into this call's staging."""
-        jobs = []
-        for i in rows:
-            e = self.vexpert[self.C + i]
-            for n in range(self.nodes):
-                jobs.append((self.files[e * self.nodes + n], self.offsets[e * self.nodes + n],
-                             [(self.shards[n][j][0] + i * size, size) for j, size in enumerate(self.sizes)]))
-        return jobs
+        return [job for i in rows for job in self._expert_jobs(self.shards, i, self.vexpert[self.C + i])]
 
     def prepare(self, globals_, ids, table=None):
         """ids: the call's routes (int32 [m, k] on the device). Snapshot the slot table (no decode forward may move

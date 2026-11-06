@@ -45,20 +45,25 @@ void *xtier_create4(int hidden,int inter,int experts,int slots,int threads,float
 // expert already in another slot leaves that one). From the plan's one caller, between forwards. Returns the expert
 // the slot held or -1; -2 invalid arguments, -3 a forward in progress.
 int xtier_place(void *plan,int expert,int slot);
-// Cold experts handled by the forward: files[e*nodes+n] / offsets[e*nodes+n] locate expert e's node part n in the
-// store (cold/store.cpp; the six pieces of xtier_slot_pieces back to back), files[e*nodes] = -1 for an expert that
+// Cold experts handled by the forward: files[(e*nodes+n)*units+t] / offsets[(e*nodes+n)*units+t] locate unit t of
+// expert e's node part n in the store (cold/store.cpp). units is XTIER_COLD_UNITS, read here: 1 (default), the
+// part's six pieces of xtier_slot_pieces back to back; 3, the gate piece, the up piece, then the other four
+// (xtier/cache/cold.py _unit_pieces). files[e*nodes*units] = -1 for an expert that
 // never leaves RAM (it must be in a slot). Before a forward runs, the experts its routes name that are not in RAM are read into the
 // slots of the experts with the lowest decayed use counts (initial counts `scores`, may be NULL; halved every
 // `half_life` forwards) that the call does not use and nobody pinned. With XTIER_COLD_OVERLAP=1 (default) the forward
 // computes the routes to the experts in RAM while those reads run, then the others (two FP32 sums, added: not bitwise
 // the one-pass order); 0: it waits for the reads first. Before the first forward. 0 or -1.
+// XTIER_TAIL_SKIP=R (read here; 0, the default, is off; changes the output): a forward of at most
+// XTIER_TAIL_SKIP_TOKENS (8) tokens leaves out an expert not in RAM that every one of its tokens routes at rank R or
+// lower (0 the largest weight of the token's top-k): neither read nor computed, the other routes keep their weights.
 int xtier_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,const float *scores,float half_life);
 // For readers on other threads (the GPU pool's copies): the slot holding `expert`, kept until xtier_slot_unpin;
 // -1 if it is not in RAM.
 int xtier_slot_pin(void *plan,int expert);
 void xtier_slot_unpin(void *plan,int slot);
-// out[6]: forwards, experts read from NVMe, seconds the forwards waited for reads; the same for the forwards of at
-// most 8 tokens (decode steps).
+// out[7]: forwards, experts read from NVMe, seconds the forwards waited for reads; the same for the forwards of at
+// most 8 tokens (decode steps); experts XTIER_TAIL_SKIP left out (once a forward).
 void xtier_cold_plan_stats(void *plan,double *out);
 // table[0..experts): the slot of every expert, -1 if in none. Returns the slot count, or -1 (-3: a forward in progress).
 int xtier_slot_table(void *plan,int32_t *table);
