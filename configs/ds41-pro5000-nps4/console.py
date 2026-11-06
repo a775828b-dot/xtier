@@ -19,6 +19,11 @@ MODEL = {
     'bench': {'kind': 'agent', 'dec': '141.3', 'pre': '4420 / 4806',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('DSpark') + [
+        {'key': 'verify', 'label': 'DSpark 验证', 'default': 'static',
+         'choices': [['static', '固定（static）'], ['compact', '变长（compact）· 本机实测成本表']],
+         'hint': '变长：按本机实测的成本表（sps-table.json）决定每个请求验证几个草稿 token；单请求和固定一样，两个请求同时约快 17%'
+                 '（11-06 实测，照抄 0 错）。换机器要用 tools/sps_profile.py 重测这张表',
+         'off_when': [{'spec': 'off'}]},
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
          'choices': [['4', '4 GiB · 实测'], ['8', '8 GiB'], ['16', '16 GiB']]},
         elastic_option('on', 'decode 时多 13–15 槽 / 层（至多 68），agent 每步 −4%（10-26）；超过约 66 槽 GPU 一侧成瓶颈'),
@@ -53,6 +58,8 @@ def build(o, port):
                    XTIER_DRAFT_LMHEAD_FP8='0')
     elif o['elastic'] == 'on':   # past ~66 slots the GPU side of a layer is the slower one (planner, 10-26)
         env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68')
+    if o['spec'] == 'on' and o['verify'] == 'compact':   # budgeted by sps-table.json (run-ds-xtier.sh)
+        env['SGLANG_RAGGED_VERIFY_MODE'] = 'compact'
     if o['cold'] != 'off':   # the store holds every expert: written at the first start, reused after
         env.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(COLD_PATHS), XTIER_COLD_FRACTION=f"0.{o['cold']}")
     else:
@@ -63,6 +70,8 @@ def build(o, port):
 def tags(o):
     """Extra parts of the server's label."""
     out = ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []
+    if o['spec'] == 'on' and o['verify'] == 'compact':
+        out.append('变长验证')
     if o['cold'] != 'off':
         out.append(f"冷专家 {o['cold']}%")
     elif miss_env(o):

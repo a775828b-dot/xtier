@@ -38,11 +38,12 @@ export XTIER_DOWN_PRECISION=tf32 XTIER_PREFILL_TILE_M=64 XTIER_GATE_BN=128 XTIER
 BATCH=${BATCH:-22528}
 SPEC=()
 if [ "${DSPARK:-0}" = 1 ]; then
-  # SGLANG_RAGGED_VERIFY_MODE=compact (variable-length verification) runs correctly but gives nothing here
-  # (docs/reports/2026-11-06-ds-compact-verify.md)
+  # SGLANG_RAGGED_VERIFY_MODE=compact (variable-length verification) budgets by an SPS cost table measured on this
+  # machine: sps-table.json here, SPS_TABLE=FILE for another (tools/sps_profile.py measures one). Here one request
+  # verifies full width as static does, two at a time 17% faster (docs/reports/2026-11-06-ds-compact-verify.md)
   export SGLANG_RAGGED_VERIFY_MODE=${SGLANG_RAGGED_VERIFY_MODE:-static} XTIER_DRAFT=${XTIER_DRAFT:-1}
   SPEC=(--speculative-draft-model-path $P/draft --speculative-algorithm DSPARK --speculative-dspark-block-size 5
-        --speculative-num-draft-tokens 6 --speculative-dspark-sps-table-path $P/overlay/sps-table.json)
+        --speculative-num-draft-tokens 6 --speculative-dspark-sps-table-path "${SPS_TABLE:-$(cd "$(dirname "$0")" && pwd)/sps-table.json}")
 fi
 exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-name DeepSeek-V4.1-Flash-1017 \
   --host 127.0.0.1 --port ${PORT:-18190} --tp-size 1 --trust-remote-code --skip-server-warmup \
