@@ -2,6 +2,10 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-06（下午）：尾部跳过不再只管冷专家：decode 时 CPU 算的专家都可以跳（GPU 上的热专家照算，prefill 不跳，DSpark 草稿模型的层不动），
+  写法改成「保留/总共」（`XTIER_TAIL_SKIP=5/6`；单写一个数、总数和模型的 top-k 对不上，启动时报错）。引擎加 `xtier_forward_decode`（mailbox 用）
+  和 `xtier_tail_stats`，日志一行 `[xtier] tail skip K/N`。DeepSeek V4.1 Flash 1017 不卸载时 5/6 每步 −2.3%、4/6 −5.3%（GPU、CPU 两边已调平），
+  默认关。详见[文档](reports/2026-11-06-tail-skip-cpu.md)。
 - 2026-11-06：冷专家池的两个选项，从 Kimi K3.1 实验分支（`kimi-k31`，已归档）移植过来，都默认关，默认设置下以前的冷存储照常复用：
   - 分段（`XTIER_COLD_UNITS=3`）：每片再切成 gate、up、其余三段，一条记录 24 段由 `XTIER_COLD_PARTS` 按盘速分，盘数不是 4 块或盘速不一样时用，存储名加 `-u3`。
     `tools/cold_relayout.py` 把已有存储换成新布局（逐条读回比对，DS 268.9 GiB 用 116 s）。Kimi 上 4 块 PCIe 5.0 加 2 块傲腾按 5:5:5:5:2:2 分，decode +13.6%。

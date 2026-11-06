@@ -98,7 +98,8 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
-| [2026-11-06 冷存储分段和尾部跳过](reports/2026-11-06-cold-units-tail-skip.md) | 盘数不是 4 块、盘速不一样时按盘速分配；不读排名靠后的冷专家 |
+| [2026-11-06 尾部跳过不再只管冷专家](reports/2026-11-06-tail-skip-cpu.md) | CPU 算的专家都可以跳，写法 `5/6`；DeepSeek 不卸载时每步 −2.3% / −5.3% |
+| [2026-11-06 冷存储分段和尾部跳过](reports/2026-11-06-cold-units-tail-skip.md) | 盘数不是 4 块、盘速不一样时按盘速分配；不读排名靠后的冷专家（旧规则） |
 | [2026-11-01 PCIe 5.0 冷专家池和只存一份](reports/2026-11-01-cold-pcie5.md) | 卸载 10–50% 实测、打洞和恢复 |
 | [2026-10-27 最小化运行](reports/2026-10-27-ds41-minimal.md) | 模拟 32 GB 显存 + 128 GB 内存跑 DeepSeek |
 | [2026-10-27 快速加载](reports/2026-10-27-fast-load.md) | 专家直接从模型文件或冷存储读进引擎 |

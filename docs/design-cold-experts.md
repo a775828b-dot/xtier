@@ -77,20 +77,25 @@ DeepSeek V4.1 Flash 1017 的副本实测（[报告](reports/2026-11-01-cold-pcie
 - prefill：每次 GPU prefill 调用要读 X × 289 GB × 路由到的冷专家比例；预读后，下限是每层冷专家字节 ÷ 带宽，低于每层计算
   加注意力的时间就完全藏住。
 
-## 尾部跳过（`XTIER_TAIL_SKIP=R`，默认关，会改变输出）
+## 尾部跳过（`XTIER_TAIL_SKIP=保留/总共`，默认关，会改变输出）
 
-参考 Strata 的 `STRATA_ROUTE_TAIL_SKIP`（它的默认是 top-10 里的第 7 名起，NVFP4 包默认关）。专家多、top-k 大、大部分专家在盘上时，
-decode 每步读盘的大头是权重很小的路由。
+参考 Strata 的 `STRATA_ROUTE_TAIL_SKIP`（它只跳盘上的专家，默认 top-10 里保留 7 个，NVFP4 包默认关）。专家多、top-k 大、大部分专家在盘上时，
+decode 每步读盘的大头是权重很小的路由。XTier 不限于冷专家：decode 时 CPU 算的专家都可以跳，不开冷专家也能用。
 
-- **规则**：一次最多 `XTIER_TAIL_SKIP_TOKENS`（默认 8）个 token 的 CPU 调用（decode 一步、单请求的投机验证窗口）里，不在内存的专家，
-  如果每个 token 都把它排在第 R 名或以后（按该 token top-k 里的权重排，0 是最大，同权重按位置），就不读、不算：它的路由按 −1 处理
-  （加 0），其余路由保持原来的权重，不重新归一化。在内存里的专家照算，prefill 不跳；不开冷专家、或 R ≥ top-k 时不起作用。
-- **实现**：`csrc/engine/engine.cpp` 的 `tail_skip`，在换入之前改路由；跳过的专家数是引擎冷统计的第 7 项，日志
-  `xtier cold: last 60 s` 那一行末尾的 `tail skip left out`。
-- **测精度**：`XTIER_TAIL_SKIP_EVAL=1` 在 prompt 的 prefill 里按每个 token 套同一规则（被跳的路由权重置 0，`xtier/cache/tail.py`）。
-  `bench/ppl_eval.py --top N` 导出每个位置最可能的 N 个 token，`bench/kl_compare.py` 拿它和不跳过的一次比：KL、首位 token
+- **写法**：`保留/总共`，如 DeepSeek V4.1（top-6）的 `5/6`、`4/6`。只认"数字/数字"，单写一个数会报错（免得把"跳 2 个"写成"保留 2 个"）；
+  总数必须等于模型的 top-k（每层第一次调用时检查）。不设或 `0` 是关。
+- **规则**：decode 路径上一次最多 `XTIER_TAIL_SKIP_TOKENS`（默认 8）个 token 的 CPU 调用（decode 一步、单请求的投机验证窗口、不超过
+  `XTIER_DECODE_MAX` 的短 prompt）里，一个专家如果没有任何 token 把它排进前「保留」名（按该 token top-k 里的权重排，同权重按位置），就不读、
+  不算：它的路由按 −1 处理（加 0），其余路由保持原来的权重，不重新归一化。在内存还是在盘上都一样；GPU 上的热专家照算（权重仍参与排名），
+  prefill 不跳，DSpark 草稿模型的层（top-3）不动。
+- **实现**：`csrc/engine/engine.cpp` 的 `tail_skip`，只在 `xtier_forward_decode`（mailbox 调用）里、换入冷专家之前改路由。计数用
+  `xtier_tail_stats`，日志（`XTIER_CACHE_LOG=N` 时每 N 步）一行 `[xtier] tail skip K/N: ... CPU experts per layer call left out`；冷统计第 7 项是
+  省下的读盘数（`xtier cold: last 60 s` 那一行末尾的 `tail skip saved`）。
+- **测精度**：`XTIER_TAIL_SKIP_EVAL=1` 在 prompt 的 prefill 里按每个 token 套同一规则（不在该层 GPU 热专家里、被跳的路由权重置 0，
+  `xtier/cache/tail.py`）。`bench/ppl_eval.py --top N` 导出每个位置最可能的 N 个 token，`bench/kl_compare.py` 拿它和不跳过的一次比：KL、首位 token
   改变比例、NLL 差。这样测比实际 decode 偏保守：实际验证窗口里要每个 token 都排得低才跳，而且 prompt 本身不跳。
-- **实测**：见[报告](reports/2026-11-06-cold-units-tail-skip.md)。
+- **实测**：[冷专家 30%](reports/2026-11-06-cold-units-tail-skip.md)（当时只跳冷专家）、[不卸载的 DeepSeek](reports/2026-11-06-tail-skip-cpu.md)
+  （5/6 每步 −2.3%、4/6 −5.3%：热专家槽数已把 GPU、CPU 两边调平，CPU 省下的时间多半在等 GPU）。
 
 ## 否决
 

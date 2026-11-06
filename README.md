@@ -237,15 +237,20 @@ MemAvailable），不含显存；DeepSeek 不开冷专家取 6 次启动的中�
 配置不对时启动直接报错，不会读到全零；`--restore` 可以写回（174 秒，sha256 全部一致）。代价：冷存储成了唯一一份，任何一块盘坏了都要
 重新下载模型；没有 XTier 的官方 SGLang 不能加载打洞后的目录。
 
-### 盘数不是 4 块、盘速不一样；尾部跳过（都默认关）
+### 盘数不是 4 块、盘速不一样（默认关）
 
-- **分段**（`XTIER_COLD_UNITS=3`）：每个专家原来按 NUMA 节点切 8 片，盘只能整片分，6 块盘最好也只有 2:2:1:1:1:1。分 3 段后一条记录
-  24 段，`XTIER_COLD_PARTS` 按盘速分，例如 4 块 PCIe 5.0 加 2 块 PCIe 4.0 用 `5:5:5:5:2:2`。已有的存储用 `tools/cold_relayout.py`
-  换布局（逐条读回比对，旧存储不动）。Kimi K3.1 Pro 实验里这样多加两块盘，decode 快 13.6%。4 块一样快的盘不用开（段小、请求多 3 倍）。
-- **尾部跳过**（`XTIER_TAIL_SKIP=R`，**会改变输出**）：decode 时不在内存的冷专家，如果每个 token 都把它排在第 R 名以后（0 是权重最大），
-  就不读、不算，其余专家不重新归一化。DeepSeek V4.1 Flash 1017 卸载 30%、R = 4（top-6 的最后两名）时每步冷读 13.5 → 8.5 个，decode 快约 5%，
-  NLL 变化在两次启动的波动内；Kimi K3.1 Pro（top-16、78% 在盘上）R = 9 时 decode 约 2.1 倍，KL 0.024。
-- 详见[设计](docs/design-cold-experts.md)和[报告](docs/reports/2026-11-06-cold-units-tail-skip.md)。
+每个专家原来按 NUMA 节点切 8 片，盘只能整片分，6 块盘最好也只有 2:2:1:1:1:1。`XTIER_COLD_UNITS=3` 把每片再分 3 段，一条记录
+24 段，`XTIER_COLD_PARTS` 按盘速分，例如 4 块 PCIe 5.0 加 2 块 PCIe 4.0 用 `5:5:5:5:2:2`。已有的存储用 `tools/cold_relayout.py`
+换布局（逐条读回比对，旧存储不动）。Kimi K3.1 Pro 实验里这样多加两块盘，decode 快 13.6%。4 块一样快的盘不用开（段小、请求多 3 倍）。
+详见[设计](docs/design-cold-experts.md)和[报告](docs/reports/2026-11-06-cold-units-tail-skip.md)。
+
+### 尾部跳过（默认关，会改变输出）
+
+- `XTIER_TAIL_SKIP=保留/总共`（DeepSeek V4.1 是 top-6，可写 `5/6`、`4/6`、`3/6`）：decode 时 CPU 算的专家（在内存或在盘上），如果一步里
+  没有任何 token 把它排进前「保留」名，就不读、不算，其余路由不重新归一化。GPU 上的热专家照算，prefill 不跳；总数要等于模型的 top-k。
+- DeepSeek V4.1 Flash 1017 不卸载时：5/6 的 CPU 时间 −20%，每步只快 2.3%；4/6 的 CPU −36%，每步快 5.3%，NLL 开始超出波动。热专家槽数已经把
+  GPU、CPU 两边调平，CPU 省下的时间多半在等 GPU，所以 DeepSeek 默认不开。专家大多在盘上、读盘是瓶颈时收益大（Kimi K3.1 Pro 9/16 约 2.1 倍）。
+- 详见[报告](docs/reports/2026-11-06-tail-skip-cpu.md)。
 
 ### 最小化运行：32 GB 显存 + 128 GB 内存跑 DeepSeek V4.1 Flash 1017
 
@@ -269,7 +274,7 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
-- 2026-11-06：冷专家池加两个选项，都默认关：分段按盘速分配（`XTIER_COLD_UNITS=3`，盘数不是 4 块或盘速不一样时用）、尾部跳过（`XTIER_TAIL_SKIP`，会改变输出）。来自已归档的 Kimi K3.1 实验分支，详见[报告](docs/reports/2026-11-06-cold-units-tail-skip.md)。
+- 2026-11-06：两个选项，都默认关：冷存储按盘速分段（`XTIER_COLD_UNITS=3`，盘数不是 4 块或盘速不一样时用）；尾部跳过（`XTIER_TAIL_SKIP=5/6` 这种「保留/总共」写法，会改变输出），CPU 算的专家都能跳，不必开冷专家。来自已归档的 Kimi K3.1 实验分支，详见[分段](docs/reports/2026-11-06-cold-units-tail-skip.md)、[尾部跳过](docs/reports/2026-11-06-tail-skip-cpu.md)。
 - 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩：跟进 SGLang 6162b07 后注意力钩子挂空了（感谢 iounstone，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
 - 2026-11-01（v0.1.0）：全面代码审计后修了换槽序号回绕、后台线程报错被吞、首个请求现编内核被内存守护杀掉等问题，失效的加速项启动时直接报错；
   冷专家池换到 4 块 PCIe 5.0 盘（卸载 30% 时 decode −21%），大模型的专家可以只存一份。详见[修复](docs/reports/2026-11-01-audit-fixes.md)、[冷专家](docs/reports/2026-11-01-cold-pcie5.md)。
