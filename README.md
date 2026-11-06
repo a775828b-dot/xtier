@@ -237,6 +237,16 @@ MemAvailable），不含显存；DeepSeek 不开冷专家取 6 次启动的中�
 配置不对时启动直接报错，不会读到全零；`--restore` 可以写回（174 秒，sha256 全部一致）。代价：冷存储成了唯一一份，任何一块盘坏了都要
 重新下载模型；没有 XTier 的官方 SGLang 不能加载打洞后的目录。
 
+### 盘数不是 4 块、盘速不一样；尾部跳过（都默认关）
+
+- **分段**（`XTIER_COLD_UNITS=3`）：每个专家原来按 NUMA 节点切 8 片，盘只能整片分，6 块盘最好也只有 2:2:1:1:1:1。分 3 段后一条记录
+  24 段，`XTIER_COLD_PARTS` 按盘速分，例如 4 块 PCIe 5.0 加 2 块 PCIe 4.0 用 `5:5:5:5:2:2`。已有的存储用 `tools/cold_relayout.py`
+  换布局（逐条读回比对，旧存储不动）。Kimi K3.1 Pro 实验里这样多加两块盘，decode 快 13.6%。4 块一样快的盘不用开（段小、请求多 3 倍）。
+- **尾部跳过**（`XTIER_TAIL_SKIP=R`，**会改变输出**）：decode 时不在内存的冷专家，如果每个 token 都把它排在第 R 名以后（0 是权重最大），
+  就不读、不算，其余专家不重新归一化。DeepSeek V4.1 Flash 1017 卸载 30%、R = 4（top-6 的最后两名）时每步冷读 13.5 → 8.5 个，decode 快约 5%，
+  NLL 变化在两次启动的波动内；Kimi K3.1 Pro（top-16、78% 在盘上）R = 9 时 decode 约 2.1 倍，KL 0.024。
+- 详见[设计](docs/design-cold-experts.md)和[报告](docs/reports/2026-11-06-cold-units-tail-skip.md)。
+
 ### 最小化运行：32 GB 显存 + 128 GB 内存跑 DeepSeek V4.1 Flash 1017
 
 模拟一张 RTX 5090（32 GB）+ 128 GB 内存 + 4 块 NVMe（冷存储当时是 4 块 PCIe 4.0 盘），启动台卡片「DeepSeek V4.1 Flash 1017 ·
@@ -259,15 +269,13 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-11-06：冷专家池加两个选项，都默认关：分段按盘速分配（`XTIER_COLD_UNITS=3`，盘数不是 4 块或盘速不一样时用）、尾部跳过（`XTIER_TAIL_SKIP`，会改变输出）。来自已归档的 Kimi K3.1 实验分支，详见[报告](docs/reports/2026-11-06-cold-units-tail-skip.md)。
 - 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩：跟进 SGLang 6162b07 后注意力钩子挂空了（感谢 iounstone，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
 - 2026-11-01（v0.1.0）：全面代码审计后修了换槽序号回绕、后台线程报错被吞、首个请求现编内核被内存守护杀掉等问题，失效的加速项启动时直接报错；
   冷专家池换到 4 块 PCIe 5.0 盘（卸载 30% 时 decode −21%），大模型的专家可以只存一份。详见[修复](docs/reports/2026-11-01-audit-fixes.md)、[冷专家](docs/reports/2026-11-01-cold-pcie5.md)。
 - 2026-10-31：第二张卡可以不放模型、纯当热专家池（可选，`XTIER_GPU2_SLOTS`，默认关），给显存或速度不一样的两张卡用：双 RTX 4090 模拟 24 + 16 GiB 时 Qwen3.8 decode 比同样配置的 TP 快 12–13%，比单卡快约 28%。详见[文档](docs/reports/2026-10-31-second-gpu-pool.md)。
 - 2026-10-30（下午）：跟进官方 SGLang main 6162b07，安装步骤写明测试过的提交，装的版本不同时启动会警告，`tools/check_sglang.py`
   不用模型就能核对钩子；快速加载支持 MoE 张量并行（双 RTX 4090 实测通过）；英伟达官方 GLM NVFP4 检查点开 MTP 不再崩溃。详见[文档](docs/reports/2026-10-30-sglang-6162b07.md)。
-- 2026-10-30：双卡张量并行（`TP=2`）实测通过：双 RTX 3090 上 Qwen3.8 decode +42–48%、120K 首字 −35%，照抄 0 错；修了
-  `~/.cache` 是软链接时 SGLang 的 JIT 内核每次启动都重编（30 系单卡启动省约 5 分钟）。详见[文档](docs/reports/2026-10-30-tp.md)。
-
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
 ## 许可

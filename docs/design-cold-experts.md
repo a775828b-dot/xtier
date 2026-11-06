@@ -15,6 +15,12 @@ prefill 每次调用要把这一层用到的冷专家读一遍。`XTIER_COLD=1` 
   就是引擎内存槽里的排法）；一条记录的 8 片分到各盘（`XTIER_COLD_PARTS` 可按盘速度给快盘多分，默认平均），读一个专家时
   所有盘同时出力。每块盘 8 个读线程；forward 等着的同步读排在 prefill 的异步读前面。清单（第一个目录的 `KEY.json`）记每层
   每块盘的起点和分法，重启时复用：每条记录核对首尾 4 KiB 的 CRC，不对或分法变了就整层重写。
+- **分段**（`XTIER_COLD_UNITS=3`，默认 1）：盘数和 8 对不上、或者盘速不一样时，整片分太粗（6 块盘最好也只能 2:2:1:1:1:1，
+  快盘和慢盘读得一样多）。分 3 段时每片切成 gate、up、其余四段三部分（差不多一样大；gate 和 up 各按 512 字节对齐切成四块读），
+  一条记录 24 段，由 `XTIER_COLD_PARTS` 按盘速分，例如 4 块 PCIe 5.0 加 2 块 PCIe 4.0 用 `5:5:5:5:2:2`（大段先给按份额最空的盘）。
+  存储名多一个 `-u3`，清单记下段数和每段在哪块盘（`units`、`map`）；没有这两项的旧清单按整片读，所以默认设置照常复用旧存储。
+  已有的存储用 `tools/cold_relayout.py` 换布局（换盘、换段数、换分法）：逐条读出、写进新布局、读回逐字节比对，全部对上才写新清单，
+  旧存储不动。模型打过洞时，这是改布局的唯一办法。同样快的 4 块盘不用分段：段小（DS 每段约 0.8 MB）、读请求多 3 倍。
 - **内存槽**（`csrc/engine`，`xtier_create4`）：NUMA 分片只给 C = (1 − X) × 384 个槽，`slot_of` / `expert_of` 两张表。
   冷库存全部专家，任何专家都能换出，同一份存储可用于任意 X（常驻核心测过、没有采用，代码已移除，见「否决」）。
 - **启动时从冷存储填槽**（快速加载 `XTIER_FAST_LOAD=1` 的一部分，默认关）：清单每层记下记录对应的检查点（`source`：
@@ -70,6 +76,21 @@ DeepSeek V4.1 Flash 1017 的副本实测（[报告](reports/2026-11-01-cold-pcie
 - decode：每步缺失数 × 18.8 MB ÷ 带宽 = 每步多出的读盘时间（减去和计算重叠的部分）。缺失数随 X 超线性增长。
 - prefill：每次 GPU prefill 调用要读 X × 289 GB × 路由到的冷专家比例；预读后，下限是每层冷专家字节 ÷ 带宽，低于每层计算
   加注意力的时间就完全藏住。
+
+## 尾部跳过（`XTIER_TAIL_SKIP=R`，默认关，会改变输出）
+
+参考 Strata 的 `STRATA_ROUTE_TAIL_SKIP`（它的默认是 top-10 里的第 7 名起，NVFP4 包默认关）。专家多、top-k 大、大部分专家在盘上时，
+decode 每步读盘的大头是权重很小的路由。
+
+- **规则**：一次最多 `XTIER_TAIL_SKIP_TOKENS`（默认 8）个 token 的 CPU 调用（decode 一步、单请求的投机验证窗口）里，不在内存的专家，
+  如果每个 token 都把它排在第 R 名或以后（按该 token top-k 里的权重排，0 是最大，同权重按位置），就不读、不算：它的路由按 −1 处理
+  （加 0），其余路由保持原来的权重，不重新归一化。在内存里的专家照算，prefill 不跳；不开冷专家、或 R ≥ top-k 时不起作用。
+- **实现**：`csrc/engine/engine.cpp` 的 `tail_skip`，在换入之前改路由；跳过的专家数是引擎冷统计的第 7 项，日志
+  `xtier cold: last 60 s` 那一行末尾的 `tail skip left out`。
+- **测精度**：`XTIER_TAIL_SKIP_EVAL=1` 在 prompt 的 prefill 里按每个 token 套同一规则（被跳的路由权重置 0，`xtier/cache/tail.py`）。
+  `bench/ppl_eval.py --top N` 导出每个位置最可能的 N 个 token，`bench/kl_compare.py` 拿它和不跳过的一次比：KL、首位 token
+  改变比例、NLL 差。这样测比实际 decode 偏保守：实际验证窗口里要每个 token 都排得低才跳，而且 prompt 本身不跳。
+- **实测**：见[报告](reports/2026-11-06-cold-units-tail-skip.md)。
 
 ## 否决
 

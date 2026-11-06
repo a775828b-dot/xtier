@@ -196,6 +196,12 @@ Measured on the four PCIe 5.0 drives; the last column is the step time on the ea
 
 The store holds every expert, so the checkpoint's copy can go: after a first start with `XTIER_COLD=1` has written the store, stop the server and run `tools/cold_punch.py`. It compares every byte, then punches holes in the checkpoint files (their sizes, modification times, headers and other tensors stay). DeepSeek V4.1 Flash 1017, on a copy: disk use 290 → 21 GiB in 42 s; started from there, the layers' RAM contents match, the copy test has no errors, speed and accuracy are within noise. These layers then load only from the store: a wrong configuration stops the start instead of reading zeros. `--restore` writes the experts back (174 s, all sha256 sums match). The cost: the store is then the only copy, so losing any drive means downloading the model again, and SGLang without XTier cannot load the directory.
 
+### Drives other than four or of unequal speed; the route tail skip (both off by default)
+
+- **Units** (`XTIER_COLD_UNITS=3`): a record is cut into 8 node parts and a drive could only take whole parts, so six drives could at best split 2:2:1:1:1:1. With three units a part, a record has 24 units that `XTIER_COLD_PARTS` hands out by drive speed, e.g. `5:5:5:5:2:2` over four PCIe 5.0 and two PCIe 4.0 drives. `tools/cold_relayout.py` moves an existing store to a new layout (every record read back and compared, the old store kept). In the Kimi K3.1 Pro experiment, two more drives this way made decode 13.6% faster. Four drives of the same speed need no units (smaller pieces, three times the requests).
+- **Route tail skip** (`XTIER_TAIL_SKIP=R`, **changes the output**): in a decode step, a cold expert (not in RAM) that every token ranks R-th or lower (0 the largest weight) is neither read nor computed; the other routes are not renormalized. DeepSeek V4.1 Flash 1017 at 30% cold, R = 4 (the last two of its top-6): cold reads per step 13.5 → 8.5, about 5% faster decode, NLL within launch-to-launch noise. Kimi K3.1 Pro (top-16, 78% on the drives) at R = 9: about 2.1× decode, KL 0.024.
+- Details: [design](design-cold-experts.md) and [report](reports/2026-11-06-cold-units-tail-skip.md) (in Chinese).
+
 ### Minimal run: DeepSeek V4.1 Flash 1017 on 32 GB of GPU memory + 128 GB of host memory
 
 An emulation of one RTX 5090 (32 GB) + 128 GB + four NVMe drives (the store then on four PCIe 4.0 drives), the console card "DeepSeek V4.1 Flash 1017 · 最小化": 70% cold (115 of 384 experts per layer in RAM), 4 resident hot slots per layer + elastic, 8K chunks, 128K context, DSpark. GPU and host memory are hard limits; the GPU is still the RTX PRO 5000.
@@ -213,11 +219,11 @@ About 25% of the normal configuration, bound by the drives.
 
 All changes: [changelog](changelog.md) (in Chinese).
 
+- 2026-11-06: two cold-store options, both off by default: units spread by drive speed (`XTIER_COLD_UNITS=3`, for drives other than four or of unequal speed) and the route tail skip (`XTIER_TAIL_SKIP`, changes the output), from the archived Kimi K3.1 experiment.
 - 2026-11-01 (v0.1.1): DeepSeek on RTX 30 / 40 series no longer dies on the first request: the attention hook missed SGLang 6162b07's entry point (thanks to iounstone, [#10](https://github.com/a775828b-dot/xtier/pull/10)).
 - 2026-11-01 (v0.1.0): fixes after a full code audit (swap sequence wrap, swallowed thread errors, kernels compiled during the first request and killed by the memory guard); acceleration features that fail to apply now stop the start. The cold pool moved to four PCIe 5.0 drives (decode −21% at 30% cold); a big model's experts can be kept in one copy.
 - 2026-10-31: a second GPU can hold only hot experts (optional, `XTIER_GPU2_SLOTS`) for GPUs of different memory or speed.
 - 2026-10-30: follows SGLang main 6162b07; fast load with MoE tensor parallelism; NVIDIA's GLM NVFP4 checkpoint no longer crashes with MTP.
-- 2026-10-30: `TP=2` measured on two RTX 3090s: Qwen3.8 decode +42–48%.
 
 ## License
 

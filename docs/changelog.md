@@ -2,6 +2,12 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-06：冷专家池的两个选项，从 Kimi K3.1 实验分支（`kimi-k31`，已归档）移植过来，都默认关，默认设置下以前的冷存储照常复用：
+  - 分段（`XTIER_COLD_UNITS=3`）：每片再切成 gate、up、其余三段，一条记录 24 段由 `XTIER_COLD_PARTS` 按盘速分，盘数不是 4 块或盘速不一样时用，存储名加 `-u3`。
+    `tools/cold_relayout.py` 把已有存储换成新布局（逐条读回比对，DS 268.9 GiB 用 116 s）。Kimi 上 4 块 PCIe 5.0 加 2 块傲腾按 5:5:5:5:2:2 分，decode +13.6%。
+  - 尾部跳过（`XTIER_TAIL_SKIP=R`，会改变输出）：decode 一步里每个 token 都排在第 R 名以后的冷专家不读、不算，不重新归一化；`XTIER_TAIL_SKIP_EVAL=1`、
+    `bench/ppl_eval.py --top N`、`bench/kl_compare.py` 测精度。DS 卸载 30%、R = 4 时每步冷读 −37%、decode 约 +5%，NLL 在波动内；Kimi R = 9 时 decode 2.1 倍。
+  新测试 `tests/tail_skip_check.py`；`tests/cold_passes_check.py` 可以接任意块盘。详见[文档](reports/2026-11-06-cold-units-tail-skip.md)。
 - 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩（`Unsupported architecture for sparse decode fwd`）。SGLang 10-23 把 V4 后端改成
   经 `flash_mla_interface` 调 FlashMLA，XTier 10-30 跟进 6162b07 后，`packs/deepseek_v4` 的钩子还挂在旧入口上；旧入口还在，所以启动检查查不出
   （iounstone 发现，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。修复后在 RTX PRO 5000 上模拟 SM86 跑整模型：照抄 0 错，NLL 1.19735（升级前 1.19867）。真卡还要等他确认。

@@ -37,7 +37,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 | 启动台：网页上选模型和参数、看加载进度和速度、加新模型 | [启动台](console.md) |
 | 全部 `XTIER_*` 开关和默认值 | [xtier/config.py](../xtier/config.py) 开头的说明；功能各自的开关在对应模块开头（如 [cache/cold.py](../xtier/cache/cold.py)、[backend/direct.py](../xtier/backend/direct.py)） |
 | 每层放几个热专家、自动规划 | [规划器](planner.md) |
-| 冷专家池：盘的要求、池子大小、只存一份的流程 | [冷专家设计](design-cold-experts.md) |
+| 冷专家池：盘的要求、池子大小、只存一份的流程、按盘速分段、尾部跳过 | [冷专家设计](design-cold-experts.md) |
 | 大嵌入表（DeepSeek Engram、Qwen PLE）的行放 NVMe | [大嵌入表设计](design-tables-nvme.md) |
 
 **现成的启动配置**（[configs/](../configs/)）：
@@ -60,6 +60,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 | [build_engine.sh](../tools/build_engine.sh) | 编译 CPU 引擎和信箱库 |
 | [mem_guard.sh](../tools/mem_guard.sh) | 可用内存太低时停掉服务（启动台默认带） |
 | [cold_punch.py](../tools/cold_punch.py) | 专家只留在冷存储，模型文件打洞释放空间，也能写回 |
+| [cold_relayout.py](../tools/cold_relayout.py) | 冷存储换布局（换盘、分段、按盘速分配），逐条读回比对，旧存储不动 |
 | [plan_probe.py](../tools/plan_probe.py)、[plan_trace.py](../tools/plan_trace.py)、[plan_auto.py](../tools/plan_auto.py)、[plan_calibrate.py](../tools/plan_calibrate.py) | 规划器：探测、路由档案、出方案、校准 |
 
 ## 常见问题
@@ -97,6 +98,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-06 冷存储分段和尾部跳过](reports/2026-11-06-cold-units-tail-skip.md) | 盘数不是 4 块、盘速不一样时按盘速分配；不读排名靠后的冷专家 |
 | [2026-11-01 PCIe 5.0 冷专家池和只存一份](reports/2026-11-01-cold-pcie5.md) | 卸载 10–50% 实测、打洞和恢复 |
 | [2026-10-27 最小化运行](reports/2026-10-27-ds41-minimal.md) | 模拟 32 GB 显存 + 128 GB 内存跑 DeepSeek |
 | [2026-10-27 快速加载](reports/2026-10-27-fast-load.md) | 专家直接从模型文件或冷存储读进引擎 |
