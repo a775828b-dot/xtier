@@ -100,7 +100,7 @@ env, argv = console.build('qwen38', {**console.defaults('qwen38'), 'kv': 'fp8', 
 assert argv[argv.index('--chunked-prefill-size') + 1] == '24576' and ',27' not in env['XTIER_CACHE_FULL']
 # decode steps between a long prompt's prefill chunks (SGLang's --prefill-decode-interval): on by default at the
 # measured setting of each model; off takes the argument away and shows in the label
-for mid, measured in (('qwen38', '96'), ('glm53', '64'), ('ds41', '48')):
+for mid, measured in (('qwen38', '96'), ('glm53', '64'), ('ds41', '72')):
     d = console.defaults(mid)
     choices = next(o for o in console.models[mid]['options'] if o['key'] == 'interleave')['choices']
     assert d['interleave'] == measured == choices[0][0] and choices[-1][0] == 'off' and '穿插' not in console.describe(mid, d)
@@ -116,7 +116,16 @@ env, argv = console.build('glm53', {**console.defaults('glm53'), 'packs': 'off'}
 assert '--speculative-use-rejection-sampling' not in argv and env['XTIER_FP8_WEIGHTS'] == '0'
 assert 'XTIER_CACHE_ELASTIC' not in env
 env, argv = console.build('ds41', console.defaults('ds41'))
-assert env['DSPARK'] == '1' and env['BATCH'] == '22528' and env['XTIER_ENGRAM_CACHE_GIB'] == '4'
+assert env['DSPARK'] == '1' and env['BATCH'] == '49152' and env['XTIER_ENGRAM_CACHE_GIB'] == '4'
+assert env['XTIER_CACHE_SLOTS'] == '35'   # 48K chunks leave the memory of 35 slots; the elastic cache adds up to 68
+# a chunk size bounds the slots (more would run a long prompt out of GPU memory); the baseline is production's layout
+ds = console.defaults('ds41')
+assert console.build('ds41', {**ds, 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '35'
+assert console.build('ds41', {**ds, 'chunk': '32768', 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '43'
+assert console.build('ds41', {**ds, 'chunk': '22528', 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '50'
+assert console.build('ds41', {**ds, 'chunk': '22528'})[0]['XTIER_CACHE_SLOTS'] == '35'
+env0 = console.build('ds41', {**ds, 'packs': 'off'})[0]
+assert env0['BATCH'] == '22528' and env0['XTIER_CACHE_SLOTS'] == '50'
 assert env['XTIER_CACHE_ELASTIC'] == '1' and env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '68'
 assert 'XTIER_CACHE_ELASTIC' not in console.build('ds41', {**console.defaults('ds41'), 'packs': 'off'})[0]
 assert 'XTIER_COLD' not in env   # cold experts off by default

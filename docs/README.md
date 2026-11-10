@@ -84,6 +84,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-11 DeepSeek 的 prefill 分块 22K → 48K](reports/2026-11-11-prefill-chunk.md) | 冷 prefill 快 28–35%、decode 不变的原因和各档实测；显存从热专家槽让、弹性槽补回；512K 不爆显存的验证；两个请求时的表现；CPU 分担 prefill 为什么没采用；GLM、Qwen 为什么不改 |
 | [2026-11-10 长 prefill 时让另一个请求继续 decode（v0.1.4）](reports/2026-11-10-prefill-interleave.md) | 启动台选项「Prefill 中穿插 decode」（默认开）三个模型各挡的实测、弹性热专家槽在分块之间不再加槽、只为长提示加预热不需要 |
 | [2026-11-10 稳定性审阅和修复（v0.1.3）](reports/2026-11-10-stability-fixes.md) | 别的程序抢 CPU、日志和指标文件写盘卡住解码、插件异常被吞、FP4 prefill 重跑、冷存储唯一副本、核心转储；修了什么、怎么验证的 |
 | [2026-11-06 跟进 SGLang 27bc1a0（v0.1.2）](reports/2026-11-06-sglang-27bc1a0.md) | 依赖变化；XTier 改的三处（SM12x 的 DeepSeek 索引器、Engram、变长验证）；三个模型的回归 |

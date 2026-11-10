@@ -1,7 +1,7 @@
 # 测速细节
 
 [README](../README.md)「测速」各表的测法、配置、精度和原始数据。单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）
-+ 384 GiB DDR5，XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测的（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s。后面的版本没有重测这些表。
++ 384 GiB DDR5，XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测的（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s。后面的版本没有重测这些表，只有 DeepSeek 加速包那两行在 2026-11-11 重测（v0.1.4，prefill 分块改成 48K）。
 
 ## 测法
 
@@ -13,8 +13,12 @@
 
 ## DeepSeek V4.1 Flash 1017
 
-- 加速包（2026-10-26 重测，启动台默认，含弹性热专家槽）对基线：长回复每步 31.2 对 50.9 ms（快 39%），冷 prefill 64K / 500K
-  4,420 / 4,806 对 3,318 / 3,627（快 33% / 33%）。弹性热专家槽（decode 时把只有 prefill 才用的显存借给热专家，至多 68 槽）把每步
+- 加速包（2026-11-11 重测，启动台默认：48K 分块、每层 35 槽、弹性热专家槽）对基线（2026-10 下旬测，22K 分块、50 槽）：长回复每步
+  30.4 对 50.9 ms（快 40%），冷 prefill 64K / 500K 5,577 / 6,588 对 3,318 / 3,627（快 68% / 82%）。
+- prefill 分块 48K（2026-11-11，原来 22K）：每读一块，每层都要把不在热专家槽里的专家传上显卡，约 2.5 秒，和块的大小无关；块加大后
+  摊给更多 token。同一天用原默认（22K、50 槽）跑的一轮：冷 prefill 64K / 500K 4,107 / 4,893，长回复每步 30.3 ms；改成 48K 后
+  5,268–5,886 / 6,576–6,600，每步 30.2–30.7 ms。大块多用的显存从热专家槽里让（50 → 35），decode 时弹性热专家槽补回到 68。
+  2026-10-26 的 22K 数据是 4,420 / 4,806、每步 31.2 ms。各档分块、显存、两个请求时的表现和 GLM / Qwen 的结果见[报告](reports/2026-11-11-prefill-chunk.md)。弹性热专家槽（decode 时把只有 prefill 才用的显存借给热专家，至多 68 槽）把每步
   从 32.6 降到 31.2 ms，见[报告](reports/2026-10-26-elastic-cache.md)。
 - 基线 的 DeepSeek 工具调用解析不逐 token 流式返回参数，工具调用请求量不出 decode（两轮 177 个请求里能计时 13 个），所以只比
   长回复；加速包第 1 轮可计时的长回复只有 3 个，tok/s 偏低。
@@ -22,7 +26,7 @@
   验证）、wo_a 存检查点的 FP8（还原逐位一致，kernel 与 cuBLAS 只差求和顺序）、索引器走分页路径（logits 与非分页路径逐位相同，top-k
   只在同分时可能选到不同位置），PPL 3.319 → 3.317（分页索引器之前测），照抄 0 错。
 - 和生产管线（lsglang_ds4.1）的 agent 对比见[报告](reports/2026-10-24-ds-woa-minimax.md)。
-- 原始数据：加速包 `bench/results/agent-bench-ds41-elastic-r{1,2}-20261026.json`（不开弹性：`agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`），
+- 原始数据：加速包 `bench/results/agent-bench-ds41-chunk48k-r{1,2}-20261111.json`（22K 分块：`agent-bench-ds41-chunk22k-r1-20261111.json`、`agent-bench-ds41-elastic-r{1,2}-20261026.json`；不开弹性：`agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`），
   基线 `bench/results/context-ds41-xtier-base-20261023.json`。
 
 ## Qwen3.8 Flash Next
@@ -71,7 +75,7 @@
   别名、NextN 草稿量化；DeepSeek 的 SM120 候选索引器、Engram 行放 NVMe、尾部重放不走 CUDA 图；
   MiniMax 的 SM120 通用栈、CUDA 上的 DSpark verify 和 NVFP4 KV（`xtier/packs/minimax_m3`；512K 时 FP8 KV 放不下）。
 - **热专家布局与启动参数与生产相同**：Qwen NVFP4 KV、其余层每层 155 槽；GLM 每层 60 槽（启动台默认 58 槽 + 弹性，见 GLM 一节）、16K 分块、BF16 SSM 状态、拒绝采样；
-  DeepSeek 每层 50 槽；MiniMax（没有生产管线）每层 8 槽、512K NVFP4 KV 池、16K 分块。
+  DeepSeek 每层 50 槽（启动台默认从 2026-11-11 起是 48K 分块、35 槽加弹性，见 DeepSeek 一节）；MiniMax（没有生产管线）每层 8 槽、512K NVFP4 KV 池、16K 分块。
   不同的地方：Qwen 加速包那行 26 层常驻（比生产多第 27 层，用 NVFP4 KV 省下的显存，prefill +0.5–1.4%；10-25 起启动台默认由规划器
   在这份显存内重排成 29 层常驻 + 18 × 64–88 槽）、
   24K 分块（生产 32K：这里 32K 在 64K 冷 prefill 慢 3%），见[报告](reports/2026-10-24-qwen-kv-ds-agent.md)；Qwen 基线

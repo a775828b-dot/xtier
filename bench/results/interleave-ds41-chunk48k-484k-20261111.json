@@ -1,0 +1,16 @@
+{
+ "alone": {
+  "ttft_s": 74.263,
+  "prompt_tokens": 483691
+ },
+ "mix": {
+  "b_ttft_s": 95.985,
+  "b_prompt_tokens": 483675,
+  "a_chunks_per_s_before": 34.2,
+  "a_chunks_per_s_during": 7.22,
+  "a_chunks_per_s_after": 33.86,
+  "a_longest_wait_during_s": 7.704,
+  "a_tokens_per_chunk": 4.51,
+  "a_ended_before_b_first_token": false
+ }
+}
