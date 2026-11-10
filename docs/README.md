@@ -23,7 +23,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 |---|---|
 | 从空机器到第一次请求：环境、模型准备、启动命令、测试请求 | [快速开始](quickstart.md)（[English](quickstart.en.md)） |
 | 已经有 SGLang 环境 | [快速上手](../README.md#快速上手) |
-| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v012-的测试环境)、[constraints.txt](../constraints.txt) |
+| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v013-的测试环境)、[constraints.txt](../constraints.txt) |
 | 不加载模型，核对 SGLang 和 XTier 对得上 | `python tools/check_sglang.py --strict` |
 | 单卡 24 GB（RTX 4090 / 3090）和约 120 GB 内存，比如租用的云主机 | [Qwen3.8 配置](../configs/qwen38-rtx4090-3090/README.md) |
 | Zen2 + 双卡（已准备，还没有在这类机器上跑过） | [部署说明](deploy-zen2-dual-gpu.md) |
@@ -84,7 +84,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
-| [2026-11-10 稳定性审阅和修复](reports/2026-11-10-stability-fixes.md) | 别的程序抢 CPU、日志和指标文件写盘卡住解码、插件异常被吞、FP4 prefill 重跑、冷存储唯一副本、核心转储；修了什么、怎么验证的 |
+| [2026-11-10 稳定性审阅和修复（v0.1.3）](reports/2026-11-10-stability-fixes.md) | 别的程序抢 CPU、日志和指标文件写盘卡住解码、插件异常被吞、FP4 prefill 重跑、冷存储唯一副本、核心转储；修了什么、怎么验证的 |
 | [2026-11-06 跟进 SGLang 27bc1a0（v0.1.2）](reports/2026-11-06-sglang-27bc1a0.md) | 依赖变化；XTier 改的三处（SM12x 的 DeepSeek 索引器、Engram、变长验证）；三个模型的回归 |
 | [2026-11-01 代码审计和修复](reports/2026-11-01-audit-fixes.md) | v0.1.0：修了什么、查明了什么、试过但没采用什么，三个模型的回归结果 |
 | [2026-10-30 跟进 SGLang 6162b07](reports/2026-10-30-sglang-6162b07.md) | 升级 SGLang 时改了什么、怎么验证 |
