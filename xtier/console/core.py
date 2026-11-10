@@ -262,6 +262,25 @@ def _read_tail(path, size=262144):
         return ''
 
 
+# a server on its way out: XTier's fatal stops, a scheduler that raised. Its API can answer for up to a minute after
+# (2026-11-10 audit R10: /v1/models 11 s after a scheduler's kill -9, the port closed after 52 s).
+_DOWN = re.compile(r'\[xtier\] FATAL: [^\n]*|Scheduler hit an exception[^\n]*|scheduler is dead[^\n]*'
+                   r'|xtier: setting up XTier failed[^\n]*|xtier: hooks not applied[^\n]*')
+
+
+def why_down(state, text=None):
+    """Why the server is gone or going: the memory guard's kill (its own log), a fatal line of the server log (text: its
+    tail, if read already); '' if neither."""
+    log = state.get('log')
+    if not log:
+        return ''
+    guard = re.findall(r'[^\n]*mem_guard: MemAvailable[^\n]*', _read_tail(str(Path(log).with_suffix('.guard.log')), 8192))
+    if guard:
+        return '内存守护停掉了服务：' + guard[-1].strip()
+    found = _DOWN.findall(_read_tail(log, 65536) if text is None else text)
+    return found[-1].strip()[:300] if found else ''
+
+
 def _short(line):
     """A log line for the page: HH:MM:SS, SGLang's batch lines in short, an access line as method, path, status."""
     line = re.sub(r'\x1b\[[0-9;]*m', '', line)
@@ -316,10 +335,14 @@ class Console:
     the last options per model (xtier-launcher-settings.json) and, unless log_dir says otherwise, the server logs.
     runner: 'systemd' (a transient user scope named unit), 'setsid' (own session; stopped through its process group)
     or 'auto'. guard_gib: tools/mem_guard.sh beside the server stops it when the host's available memory drops below
-    that many GiB (0 = no guard)."""
+    that many GiB (0 = no guard). cpu_weight: the scope's CPUWeight (systemd: 1-10000, default 100; 0 or None = not set).
+    Every MoE layer waits for all CPU expert threads, and they take nearly every core: a busy process elsewhere in the
+    user manager's tree costs decode up to 10x unless the server's scope outweighs it (2026-11-10 audit R1). Processes
+    started from a login session sit outside that tree: tools/low_cpu.sh. The server log is written synchronously:
+    log_dir on a disk that stalls stalls decode with it (R12)."""
 
     def __init__(self, models, state_dir, *, log_dir=None, runner='auto', unit='xtier-console', guard_gib=20,
-                 cwd=None):
+                 cwd=None, cpu_weight=10000):
         self.models = models
         self.state_dir = Path(state_dir)
         self.log_dir = Path(log_dir) if log_dir else self.state_dir / 'logs'
@@ -327,6 +350,7 @@ class Console:
         self.settings_file = self.state_dir / 'xtier-launcher-settings.json'
         self.runner = ('systemd' if _user_systemd() else 'setsid') if runner == 'auto' else runner
         self.unit, self.guard_gib, self.cwd = unit, guard_gib, Path(cwd or REPO)
+        self.cpu_weight = int(cpu_weight or 0)
         self._waiting = set()   # ports wait_ready() is still bringing up: status() says loading until it is done
         self._status = {'t': 0.0, 'body': None}
         self._lock = threading.Lock()
@@ -424,11 +448,12 @@ class Console:
         state = self.read_state()
         return state if state and self.active(state) else None
 
-    def _wrap(self, unit, argv):
+    def _wrap(self, unit, argv, cpu_weight=0):
         if self.runner != 'systemd':
             return argv
+        weight = [f'--property=CPUWeight={cpu_weight}'] if cpu_weight else []
         return ['systemd-run', '--user', '--scope', '--quiet', '--collect', f'--unit={unit}',
-                '--property=KillMode=control-group', '--property=TimeoutStopSec=90', *argv]
+                '--property=KillMode=control-group', '--property=TimeoutStopSec=90', *weight, *argv]
 
     def start(self, model, values):
         """Launch the server of model (validated values), with the host memory guard beside it; returns the state."""
@@ -446,7 +471,7 @@ class Console:
             fh.write(('[xtier-console] ' + ' '.join(f'{k}={v}' for k, v in env_add.items()) + ' ' + ' '.join(argv)
                       + '\n').encode())
             fh.flush()
-            proc = subprocess.Popen(self._wrap(self.unit, argv), stdin=subprocess.DEVNULL, stdout=fh,
+            proc = subprocess.Popen(self._wrap(self.unit, argv, self.cpu_weight), stdin=subprocess.DEVNULL, stdout=fh,
                                     stderr=subprocess.STDOUT, env=env, cwd=str(self.cwd), start_new_session=True)
         if self.runner == 'systemd':   # the scope shows up once systemd-run has registered it: until then active() says no
             for _ in range(100):
@@ -504,14 +529,15 @@ class Console:
         try:
             while time.monotonic() < deadline:
                 if not self.active(state):
-                    return False, '服务提前退出：' + ' | '.join(log_tail(state.get('log'), 6))
+                    return False, '服务提前退出：' + (why_down(state) or ' | '.join(log_tail(state.get('log'), 6)))
                 if health(state['port']):
                     t0 = time.monotonic()
                     why = warm_up(state['port'], state.get('served'), deadline)
                     _note(state.get('log'), f'warm-up {"failed after" if why else "done in"} '
                                             f'{time.monotonic() - t0:.1f} s{": " + why if why else ""}')
                     if not self.active(state):   # the warm-up took the server down (out of memory, a crash)
-                        return False, '服务在预热时退出：' + ' | '.join(log_tail(state.get('log'), 6))
+                        return False, '服务在预热时退出：' + (why_down(state)
+                                                             or ' | '.join(log_tail(state.get('log'), 6)))
                     state['ready_at'] = time.time()
                     self.write_state(state)
                     return True, ''
@@ -546,8 +572,11 @@ class Console:
             body.update(started_at=state.get('started_at'), options=state.get('options'),
                         elapsed=round(time.time() - state.get('started_at', time.time())),
                         version=version[-1] if version else '', layers=len(set(_LAYER.findall(text))))
+            why = why_down(state, text)
+            if why:   # still in its scope, but going
+                body.update(state='failed', error=why, tail=log_tail(state.get('log'), 6))
             # online once wait_ready saw /health pass; /v1/models when nothing here waits (the console restarted)
-            if state.get('ready_at') or (state.get('port') not in self._waiting and models_ok(state.get('port'))):
+            elif state.get('ready_at') or (state.get('port') not in self._waiting and models_ok(state.get('port'))):
                 decodes = _DECODE_AT.findall(text)[-40:]
                 prefills = _PREFILL_AT.findall(text)
                 body.update(state='online', progress=100, phase='online', phase_label='在线')
@@ -573,9 +602,10 @@ class Console:
             else:
                 phase, label, pct = _progress(text)
                 body.update(state='loading', progress=pct, phase=phase, phase_label=label)
-            body['tail'] = log_tail(state.get('log'))
+            body.setdefault('tail', log_tail(state.get('log')))
         elif state.get('started_at') and not state.get('stopped_at'):
-            body.update(state='failed', error=state.get('error') or '进程已退出', tail=log_tail(state.get('log'), 6))
+            body.update(state='failed', error=state.get('error') or why_down(state) or '进程已退出',
+                        tail=log_tail(state.get('log'), 6))
         with self._lock:
             self._status.update(t=time.monotonic(), body=body)
         return body

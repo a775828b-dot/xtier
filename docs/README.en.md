@@ -43,7 +43,7 @@ git -C /path/to/sglang checkout 27bc1a0615      # the tested SGLang main (2026-1
 SGLANG_BUILD_RUST_EXTS=none pip install -e /path/to/sglang/python   # skips SGLang's optional Rust extensions if you have no Rust
 tools/build_engine.sh /path/to/site-packages/nvidia/cu13   # CPU engine and mailbox -> xtier/engine/lib
 pip install --no-deps -e .                      # registers the plugin entry sglang.srt.plugins: xtier
-python tools/check_sglang.py --strict           # without a model: SGLang's commit, XTier's hook targets and imports
+python tools/check_sglang.py --strict           # without a model: SGLang's commit, hook targets, imports, hooked code
 XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
   python -m sglang.launch_server --model-path <MoE checkpoint> --cuda-graph-backend-prefill disabled ...
 ```
@@ -63,6 +63,8 @@ From the repository root run `python3 -m xtier.console` (standard library only) 
 - **Right, status**: loading stages (weights, draft, expert pool, CUDA graphs, warm-up, online), then decode speed, acceptance length, GPU memory and logs.
 
 One model runs at a time; it serves an OpenAI-compatible API on its own port, and leaving the console does not stop it. To add a model, add a `console.py` under `configs/<model>-<hardware>/`.
+
+The CPU expert threads take nearly every core and every MoE layer waits for all of them, so other busy processes slow decode down tenfold even at `nice 19` (Linux shares CPU time between control groups first). The console runs the server in a systemd scope of `CPUWeight=10000` (`--cpu-weight`); start CPU-heavy commands from a login session with `tools/low_cpu.sh COMMAND`. The server writes its log synchronously: keep `--log-dir` on a reliable disk.
 
 ## Supported models
 
@@ -210,11 +212,11 @@ An emulation of one RTX 5090: 32 GB of GPU memory and 128 GB of host memory as h
 
 All changes: [changelog](changelog.md) (in Chinese).
 
+- 2026-11-10: fixes after a stability review; the normal path is unchanged. Busy processes elsewhere slowed decode tenfold: the console gives the server a high CPU weight, and `tools/low_cpu.sh` runs CPU-heavy commands from a login session without hurting it. SGLang's metrics files moved to the RAM disk, so a stalled system disk no longer stops decode. An error while XTier installs its hooks stops the start instead of serving with part of XTier; DeepSeek's FP4 prefill no longer faults when retried after a failure; a cold store that holds the only copy is never rewritten from another directory; a crash no longer dumps hundreds of GiB of memory. Details: [report](reports/2026-11-10-stability-fixes.md) (in Chinese).
 - 2026-11-06 (v0.1.2): follows SGLang main 27bc1a0 (new dependency versions). Fixes: SGLang narrowed DeepSeek's DeepGEMM indexer path to the SM100 family, which made a 520K prefill 1.8× slower on SM120 GPUs such as the RTX PRO 5000; an XTier hook keeps SM120 on DeepGEMM, back to the earlier speed. Engram gets the MXFP4 attributes SGLang added; compact verification uses SGLang's own mapping. The three models pass the regression ([report](reports/2026-11-06-sglang-27bc1a0.md), in Chinese).
 - 2026-11-06 (evening): DeepSeek V4.1's variable-length DSpark verification (`SGLANG_RAGGED_VERIFY_MODE=compact`) now runs correctly (thanks to [cyrus-xc](https://github.com/cyrus-xc), [#13](https://github.com/a775828b-dot/xtier/pull/13)). It needs an SPS cost table measured on the machine (`tools/sps_profile.py`): on our test machine one request is unchanged and two at a time are 17% faster, with no copy-test errors. Static stays the default (the console's DeepSeek card offers compact); measure the table on your own hardware first. Details: [report](reports/2026-11-06-ds-compact-verify.md) (in Chinese).
 - 2026-11-06: two options, both off by default: cold-store units spread by drive speed (`XTIER_COLD_UNITS=3`, for drives other than four or of unequal speed) and the route tail skip (`XTIER_TAIL_SKIP=5/6`, keep/total, changes the output) for every expert the CPU computes, cold experts or not; from the archived Kimi K3.1 experiment.
 - 2026-11-01 (v0.1.1): DeepSeek on RTX 30 / 40 series no longer dies on the first request: the attention hook missed SGLang 6162b07's entry point (thanks to iounstone, [#10](https://github.com/a775828b-dot/xtier/pull/10)).
-- 2026-11-01 (v0.1.0): fixes after a full code audit (swap sequence wrap, swallowed thread errors, kernels compiled during the first request and killed by the memory guard); acceleration features that fail to apply now stop the start. The cold pool moved to four PCIe 5.0 drives (decode −21% at 30% cold); a big model's experts can be kept in one copy.
 
 ## License
 

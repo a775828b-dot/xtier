@@ -26,13 +26,15 @@ export CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 PATH=$CUDA_HOME
 
 | 内容 | 命令（都在 `tests/` 下） |
 |---|---|
-| 不需要模型 | `fp4_decode_check` `fp8_decode_check` `fp8_encode_check` `qsa_decode_check` `qsa_fp4_check` `qsa_fp8_check` `qsa_prefill_check` `ds_sparse_mla_check` `ds_fp8_soft_check` `hc_mix_check` `ple_blocks_check` `swiglu_oai_check` `spec_truncate_check` `glm_indexer_torch_check` `draft_bf16_check` `draft_lmhead_fp8_check` `fp8_weights_check` `elastic_check` `elastic_need_check` `tables_check` `table_lookup_check` `ds_wo_a_check` `ds_w8a16_check` `direct_load_check` `pool_wrap_check` `prefill_errors_check` `startup_checks_check` |
-| 每个模型（`--preset ds41_1017`、`glm53`、`qwen38`） | `formats_check`；`mailbox_check --threads N`；`cache_check --threads N --slots 64`；`hybrid_prefill_check --threads N --slots 64 --lengths 100,500,1000`；`resident_prefill_check`；`miss_gpu_check --threads N` |
+| 不需要模型 | `fp4_decode_check` `fp8_decode_check` `fp8_encode_check` `qsa_decode_check` `qsa_fp4_check` `qsa_fp8_check` `qsa_prefill_check` `ds_sparse_mla_check` `ds_fp8_soft_check` `hc_mix_check` `ple_blocks_check` `swiglu_oai_check` `spec_truncate_check` `glm_indexer_torch_check` `draft_bf16_check` `draft_lmhead_fp8_check` `fp8_weights_check` `elastic_check` `elastic_need_check` `elastic_release_check` `tables_check` `table_lookup_check` `ds_wo_a_check` `ds_w8a16_check` `direct_load_check` `pool_wrap_check` `prefill_errors_check` `startup_checks_check` |
+| 每个模型（`--preset ds41_1017`、`glm53`、`qwen38`） | `formats_check`；`mailbox_check --threads N`；`cache_check --threads N --slots 64`；`hybrid_prefill_check --threads N --slots 64 --lengths 100,500,1000`；`resident_prefill_check`；`miss_gpu_check --threads N`；DeepSeek 另跑 `prefill_fp4_retry_check`（SM120 的 FP4 prefill 失败后重跑） |
 | CPU 模拟多卡 | `tp_check --preset glm53 --tp 2` |
-| 冷专家（往盘上写测试数据） | `cold_punch_check DIR`；`cold_passes_check DIR1 DIR2`；`cold_prefill_check --store DIR1 DIR2` |
+| 冷专家（往盘上写测试数据） | `cold_punch_check DIR`（再用 `XTIER_COLD_UNITS=3` 跑一次）；`cold_sole_copy_check DIR`；`cold_passes_check DIR1 DIR2`；`cold_prefill_check --store DIR1 DIR2` |
 | 两张卡 | `second_gpu_check` |
 
-路径和模型位置写在脚本开头，换机器要改。`tools/check_sglang.py --strict` 也要通过。
+路径和模型位置写在脚本开头，换机器要改。`tools/check_sglang.py --strict` 也要通过：除了钩子目标和 import 都在，还比对被钩函数的源码指纹（[tools/hook_sources.json](../tools/hook_sources.json)，不看注释、文档字符串和排版）和 XTier 带默认值读取的上游属性。跟进 SGLang 后，逐个看完它列出的改动，再用 `--write-sources` 记下新提交的指纹（`--emulate sm86` 再记一次 SM86 才挂的钩子）。
+
+CPU 引擎改了的话，再用线程检查（TSan）和内存检查（ASan、UBSan）构建引擎跑一遍并发驱动程序，0 报告：`tests/engine_san.sh thread|address DIR`（DIR 在支持 O_DIRECT 的盘上）。
 
 ## 3. 整模型回归（每个模型）
 
@@ -45,6 +47,7 @@ export CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 PATH=$CUDA_HOME
 | 长上下文 | `bench/context_speed.py --port P --model M --tokenizer T --contexts 65536,65536,520000 --output 1024` | 不 OOM，速度和上个版本接近 |
 | 真实使用 | dsh 连续 15 分钟（填上下文、召回、写代码） | 请求全部成功，召回正确 |
 | 换槽序号回绕 | `XTIER_DEBUG_SEQ_START=2147478648` 起服务，再跑一次照抄（DeepSeek 还要测 `4294962296`） | 0 错，日志没有 GPU 错误 |
+| 异常客户端 | `bench/abuse_test.py --port P --model M --out F`：中途断开、超长、坏参数、并发，约 5 分钟 | 全部通过，之后照抄 0 错 |
 | 日志 | `grep -E "Traceback\|OutOfMemory\|FATAL\|Scheduler hit\|does not know"` | 没有 |
 
 改了冷专家的话，还要在 GLM（NVFP4）上跑开 / 关冷专家的 PPL：DeepSeek 是 MXFP4，全局缩放都是 1，会掩盖缩放类错误。

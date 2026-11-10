@@ -1,8 +1,9 @@
 """tools/cold_punch.py and the guards around it on a small made-up checkpoint and store (two node parts on two drives):
 a compare changes nothing and refuses a record that differs or a file with another hard link; a punch frees the expert
-tensors' blocks and nothing else, keeps the checkpoint id; a punched layer can only load from the store, even after a
-model .json changed or with another ranking, and an unusable manifest does not delete the records; a restore gives the
-files back byte for byte.
+tensors' blocks and nothing else, keeps the checkpoint id, marks the store; a punched layer can only load from the
+store, even after a model .json changed or with another ranking, and an unusable manifest does not delete the records
+(not from another directory either); a restore gives the files back byte for byte and clears the store's mark.
+tests/cold_sole_copy_check.py: starts from another directory with the same store.
     python tests/cold_punch_check.py DIR      (a directory on a drive with holes and O_DIRECT; removed at the end)
 """
 import hashlib
@@ -129,6 +130,10 @@ link.unlink()
 
 code, out = tool(*PATHS)
 check('punch', code == 0 and (MODEL / cold.MARKER).exists(), out[-80:])
+marked = json.loads((DRIVES[0] / f'{KEY}.json').read_text())['layers']
+check('the store knows its records are the only copy', all(marked[k].get('only', {}).get('model') == str(MODEL.resolve())
+                                                          for k in ('0', '1'))
+      and cold.only_layers(DRIVES[0], KEY) == {'0', '1'})
 freed = (blocks - sum(p.stat().st_blocks for p in MODEL.glob('*.safetensors'))) * 512
 total = sum(len(t) for t in tensors.values())
 check('blocks freed', total - 2 * 4096 * len(tensors) <= freed <= total, f'{freed} of {total}')
@@ -176,6 +181,14 @@ try:
     check('an unusable manifest stops the start', False)
 except RuntimeError as e:
     check('an unusable manifest stops the start', 'only copy' in str(e), str(e)[:60])
+cold._marker.clear()
+cold._marker.append(None)   # a start from another directory (no marker): the store's KEY.only stops it
+try:
+    cold.Store(KEY)
+    check('an unusable manifest, another directory: stops the start', False)
+except RuntimeError as e:
+    check('an unusable manifest, another directory: stops the start', 'only copy' in str(e), str(e)[:60])
+cold._marker.clear()
 check('the records are still there', all((d / f'{KEY}.cold').stat().st_size > 0 for d in DRIVES))
 (DRIVES[0] / f'{KEY}.json').write_text(text)
 
@@ -191,6 +204,9 @@ os.utime(MODEL / 'model-1.safetensors', ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
 code, out = tool('--restore')
 check('restore', code == 0 and not (MODEL / cold.MARKER).exists(), out[-70:])
+check("restore clears the store's note", not any('only' in v for v in json.loads((DRIVES[0] / f'{KEY}.json')
+                                                                                 .read_text())['layers'].values())
+      and not cold.only_path(DRIVES[0], KEY).exists())
 check('the files are back, byte for byte, with their times', ids() == before
       and all(p.stat().st_mtime_ns == t for p, t in times.items()))
 # what the punch left in place was the original too: only bytes inside the noted tensors differ from it

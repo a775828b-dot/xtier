@@ -110,7 +110,38 @@ def locate(bulk, shard, expert, w, hidden, inter, experts, scale_format, tp_rank
     if w.dim() != 2 or tuple(w.shape) != shape or w.element_size() != 1 or not w.is_contiguous():
         return None
     where = file_range(w.data_ptr(), shape[0] * shape[1])
-    return None if where is None else (expert, piece, where[0], where[1] + start, nbytes, columns)
+    if where is None or not _direct(where[0]):
+        return None
+    return expert, piece, where[0], where[1] + start, nbytes, columns
+
+
+_direct_ok = {}   # checkpoint file -> whether it reads with O_DIRECT
+
+
+def _direct(path):
+    """Whether `path` reads with O_DIRECT: tmpfs before Linux 6.6 and some overlay or network filesystems refuse it.
+    Tried when its first tensor is noted: such a file's layers load the usual way (logged once) instead of every read
+    failing at the end of loading (2026-11-10 audit R11)."""
+    ok = _direct_ok.get(path)
+    if ok is None:
+        ok = True
+        buf = mmap.mmap(-1, ALIGN)   # page-aligned, as O_DIRECT needs
+        view = memoryview(buf)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
+            try:
+                os.preadv(fd, [view], 0)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            ok = False
+            logger.warning('xtier: XTIER_FAST_LOAD=1, but %s cannot be read with O_DIRECT (%s): the layers in it load '
+                           'the usual way', path, e)
+        finally:
+            view.release()
+            buf.close()
+        _direct_ok[path] = ok
+    return ok
 
 
 class Reader:

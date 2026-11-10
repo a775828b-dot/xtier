@@ -131,17 +131,23 @@ def main(argv=None):
     ap.add_argument('--config', action='append', metavar='NAME',
                     help='configs/NAME to offer (repeatable; default: every configs/*/console.py)')
     ap.add_argument('--state-dir', default=str(Path.home() / '.local/state/xtier-console'),
-                    help='state, last options per model and server logs')
+                    help='state, last options per model and (unless --log-dir) server logs')
+    ap.add_argument('--log-dir', default=None,
+                    help='server logs (default STATE_DIR/logs); written synchronously: a disk that stalls stalls decode')
     ap.add_argument('--runner', choices=('auto', 'systemd', 'setsid'), default='auto',
                     help='systemd: a transient user scope; setsid: an own session (auto: systemd when available)')
     ap.add_argument('--unit', default='xtier-console', help='name of the systemd scope')
+    ap.add_argument('--cpu-weight', type=int, default=10000,
+                    help="the systemd scope's CPUWeight (1-10000, systemd's default 100; 0 = not set): busy processes "
+                         'elsewhere cost decode up to 10x otherwise')
     ap.add_argument('--mem-guard-gib', type=int, default=20,
                     help='stop the server when the host has less available memory (GiB; 0 = no guard)')
     args = ap.parse_args(argv)
     models = core.load_models(args.config)
     if not models:
         sys.exit(f'no console entries (configs/*/console.py) under {core.CONFIGS}')
-    console = core.Console(models, args.state_dir, runner=args.runner, unit=args.unit, guard_gib=args.mem_guard_gib)
+    console = core.Console(models, args.state_dir, log_dir=args.log_dir, runner=args.runner, unit=args.unit,
+                           guard_gib=args.mem_guard_gib, cpu_weight=args.cpu_weight)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(console, Jobs(console)))
     if args.host not in ('127.0.0.1', 'localhost', '::1'):
         print(f'warning: listening on {args.host} - anyone who can reach it can start and stop model servers')

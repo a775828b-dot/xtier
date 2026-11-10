@@ -56,9 +56,10 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 工具 | 做什么 |
 |---|---|
-| [check_sglang.py](../tools/check_sglang.py) | 不加载模型，核对 SGLang 提交、钩子和 import |
+| [check_sglang.py](../tools/check_sglang.py) | 不加载模型，核对 SGLang 提交、钩子、import、被钩函数的源码有没有变 |
 | [build_engine.sh](../tools/build_engine.sh) | 编译 CPU 引擎和信箱库 |
 | [mem_guard.sh](../tools/mem_guard.sh) | 可用内存太低时停掉服务（启动台默认带） |
+| [low_cpu.sh](../tools/low_cpu.sh) | 模型在线时跑吃 CPU 的程序，不拖慢解码（[原因](faq.md#解码突然慢了十倍别的程序一停又恢复)） |
 | [cold_punch.py](../tools/cold_punch.py) | 专家只留在冷存储，模型文件打洞释放空间，也能写回 |
 | [cold_relayout.py](../tools/cold_relayout.py) | 冷存储换布局（换盘、分段、按盘速分配），逐条读回比对，旧存储不动 |
 | [sps_profile.py](../tools/sps_profile.py) | 测 DSpark 变长验证（compact）要用的成本表 |
@@ -68,10 +69,10 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 [常见问题](faq.md)按症状分类，日志里的原文可以直接搜：
 
-- [安装和启动](faq.md#安装和启动)：SGLang 版本警告、钩子没生效、第一次启动慢、每次都重新编译
+- [安装和启动](faq.md#安装和启动)：SGLang 版本警告、钩子没生效、XTier 装钩子出错、第一次启动慢、每次都重新编译
 - [内存和显存](faq.md#内存和显存)：服务被内存守护停掉、显存不够、模型比内存还大
-- [冷专家和只存一份](faq.md#冷专家和只存一份)：选什么盘、启动台选项是灰的、打洞后启动报错
-- [速度和精度](faq.md#速度和精度)：比测速表慢、温度 0 两次输出不一样
+- [冷专家和只存一份](faq.md#冷专家和只存一份)：选什么盘、启动台选项是灰的、打洞后启动报错、从别的目录启动被拦下
+- [速度和精度](faq.md#速度和精度)：比测速表慢、别的程序一跑解码就慢十倍、解码停住又自己恢复、崩溃转储、温度 0 两次输出不一样
 
 ## 测试报告
 
@@ -83,6 +84,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-10 稳定性审阅和修复](reports/2026-11-10-stability-fixes.md) | 别的程序抢 CPU、日志和指标文件写盘卡住解码、插件异常被吞、FP4 prefill 重跑、冷存储唯一副本、核心转储；修了什么、怎么验证的 |
 | [2026-11-06 跟进 SGLang 27bc1a0（v0.1.2）](reports/2026-11-06-sglang-27bc1a0.md) | 依赖变化；XTier 改的三处（SM12x 的 DeepSeek 索引器、Engram、变长验证）；三个模型的回归 |
 | [2026-11-01 代码审计和修复](reports/2026-11-01-audit-fixes.md) | v0.1.0：修了什么、查明了什么、试过但没采用什么，三个模型的回归结果 |
 | [2026-10-30 跟进 SGLang 6162b07](reports/2026-10-30-sglang-6162b07.md) | 升级 SGLang 时改了什么、怎么验证 |

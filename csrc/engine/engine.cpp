@@ -1339,8 +1339,14 @@ public:
         std::vector<int> taken;
         {
             std::lock_guard<std::mutex> g(resident_lock);
+            // a call that cannot have all its experts in RAM fails, and the slots it reserved so far are free again
+            // (their experts stay on NVMe): kept reserved they would be lost to every later call (2026-11-10 audit R5)
+            auto fail=[&](const std::string &why) {
+                for(int s:taken)expert_of[s]=-1;
+                throw std::runtime_error(why);
+            };
             for(int e:cold_miss) {
-                if(!stored(e))throw std::runtime_error("Expert "+std::to_string(e)+" is neither in RAM nor on NVMe");
+                if(!stored(e))fail("Expert "+std::to_string(e)+" is neither in RAM nor on NVMe");
                 int best=-1;double low=0;
                 for(int s=0;s<slots;s++) {
                     if(pins[s])continue;
@@ -1352,7 +1358,9 @@ public:
                     }
                     if(best<0||u<low){best=s;low=u;}
                 }
-                if(best<0)throw std::runtime_error("No RAM slot for expert "+std::to_string(e));
+                if(best<0)fail("No RAM slot for expert "+std::to_string(e)+": the call routes to "+
+                               std::to_string(cold_used.size())+" experts, "+std::to_string(cold_miss.size())+
+                               " of them not in RAM, "+std::to_string(slots)+" RAM slots");
                 if(expert_of[best]>=0)slot_of[expert_of[best]]=-1;
                 expert_of[best]=-2;
                 taken.push_back(best);
@@ -1415,8 +1423,10 @@ public:
         if(!guard.owns_lock()||!store||!io||!io->read||!io->submit||!io->finish||!files||!offsets||!(half_life>0))return -1;
         // per expert, node part and unit ([(e*nodes+n)*units+t]): where the unit's pieces are in the store (cold.py: one
         // unit of the part's six pieces, or three units, see ensure_resident)
-        const char *units=std::getenv("XTIER_COLD_UNITS");
-        cold_units=units&&std::string(units)=="3"?3:1;
+        // xtier/cache/cold.py _units checked it and wrote it back as 1 or 3; anything else would read another layout
+        const std::string units=std::getenv("XTIER_COLD_UNITS")?std::getenv("XTIER_COLD_UNITS"):"1";
+        if(units!="1"&&units!="3")return -1;
+        cold_units=units=="3"?3:1;
         const size_t entries=size_t(experts)*nodes*cold_units;
         cold_file.assign(files,files+entries);cold_offset.assign(offsets,offsets+entries);
         for(int e=0;e<experts;e++)if(slot_of[e]<0&&!stored(e))return -1;   // in neither RAM nor the store

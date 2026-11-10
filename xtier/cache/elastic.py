@@ -50,6 +50,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 GIB = 2 ** 30
+RING_EVICTIONS = 2048   # evictions xtier_mailbox_pool_shrink posts at once: half the command ring (csrc/mailbox POOL_RING)
 FORWARD = 'sglang.srt.model_executor.model_runner.ModelRunner.forward'
 ON_IDLE = 'sglang.srt.managers.scheduler.Scheduler.on_idle'
 _governor = None
@@ -220,6 +221,16 @@ class Governor:
             g.join()
         self.stop.clear()
 
+    def _settle(self):
+        """Commit rounds until everything the policy posted is applied and its copies landed (the policy paused)."""
+        lib = self.lib
+        for _ in range(400):
+            self.commit()
+            torch.cuda.synchronize()
+            if _check(lib, lib.xtier_mailbox_pool_quiesce(25)) == 0:
+                return
+        raise RuntimeError('xtier elastic cache: the expert policy did not settle')
+
     def release(self, target, why):
         """Down to `target` extra slots (at least 0) before the memory is needed; returns the slots released."""
         self._stop_growth()
@@ -231,17 +242,15 @@ class Governor:
             t0 = time.perf_counter()
             _check(lib, lib.xtier_mailbox_pool_pause(1))
             try:
-                for _ in range(400):
-                    self.commit()
-                    torch.cuda.synchronize()
-                    rc = _check(lib, lib.xtier_mailbox_pool_quiesce(25))
-                    if rc == 0:
-                        break
-                else:
-                    raise RuntimeError('xtier elastic cache: the expert policy did not settle')
-                _check(lib, lib.xtier_mailbox_pool_shrink(target))
-                self.commit()                # the evictions leave the residency table ...
-                torch.cuda.synchronize()     # ... before the granules go
+                self._settle()
+                # The command ring takes RING_EVICTIONS evictions at once: the slots go in steps over every layer, each
+                # applied before the next (2026-11-10 audit R6: 92 layers x 23 slots refused, nothing released).
+                step = max(1, RING_EVICTIONS // max(1, len(self.pools)))
+                k = self.extra
+                while k > target:
+                    k = max(target, k - step)
+                    _check(lib, lib.xtier_mailbox_pool_shrink(k))
+                    self._settle()           # the evictions leave the residency table before the granules go
                 freed = self.bytes(target, self.extra)
                 for p in self.pools:
                     keep = self._slots(p, target)

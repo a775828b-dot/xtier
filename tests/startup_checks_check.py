@@ -1,6 +1,6 @@
 """The checks that stop a server from running silently without part of XTier (xtier/plugin.py, the backend), without a model: SGLang without the scheduler entry the
-plugin goes by, a hook of XTier that does not apply (and one of another plugin, which is not XTier's to stop), a setting XTier does not know, a layer whose expert
-tensors did not all arrive; and the job count of the FlashInfer prebuild (xtier/prebuild.py) under a memory limit.
+plugin goes by, a hook of XTier that does not apply (and one of another plugin, which is not XTier's to stop), a setting XTier does not know, an exception while
+XTier sets itself up, a layer whose expert tensors did not all arrive; and the job count of the FlashInfer prebuild (xtier/prebuild.py) under a memory limit.
 
   python tests/startup_checks_check.py
 """
@@ -77,6 +77,27 @@ err = io.StringIO()
 with contextlib.redirect_stderr(err):
     plugin._check_settings()
 check('an unknown setting is named, a known one not', unknown in err.getvalue() and 'XTIER_THREADS' not in err.getvalue(), err.getvalue().strip())
+
+# an exception while XTier sets itself up (here a misspelt pack name): SGLang would log it and serve with the hooks
+# registered before it (2026-11-10 audit R4), load() stops the process instead
+for name in ('XTIER_MAIN_CPUS', unknown, 'PROMETHEUS_MULTIPROC_DIR'):
+    os.environ.pop(name, None)
+os.environ.update(XTIER='1', XTIER_PACKS='deepseek')
+apply_hooks = registry.apply_hooks
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    message = stops(plugin.load)
+registry.apply_hooks = apply_hooks   # load() wrapped it once more
+del os.environ['XTIER_PACKS']
+check('a failure while setting up: the server stops', bool(message) and 'unknown packs' in message
+      and 'Traceback' in err.getvalue(), str(message))
+# on the way, the main process put SGLang's Prometheus files on the RAM disk, and a crash leaves memory out of the core
+metrics = os.environ.pop('PROMETHEUS_MULTIPROC_DIR', '')
+check('metrics files on the RAM disk', metrics == f'/dev/shm/xtier-metrics-{os.getuid()}/server-{os.getpid()}'
+      and os.path.isdir(metrics), metrics)
+if metrics:
+    os.rmdir(metrics)
+check('a core without memory', Path('/proc/self/coredump_filter').read_text().strip() == '00000000')
 
 from xtier.backend.method import XTierMoEMethod  # noqa: E402
 

@@ -17,9 +17,11 @@ python3 -m xtier.console       # http://127.0.0.1:8100/
 | `--host` | `127.0.0.1` | 监听地址。从别的机器访问用 SSH 隧道：`ssh -L 8100:127.0.0.1:8100 主机` |
 | `--port` | `8100` | |
 | `--config NAME` | 全部 | 只列出 `configs/NAME`（可重复） |
-| `--state-dir` | `~/.local/state/xtier-console` | 状态、各模型上次用的参数、模型服务的日志 |
+| `--state-dir` | `~/.local/state/xtier-console` | 状态、各模型上次用的参数、（没有 `--log-dir` 时）模型服务的日志 |
+| `--log-dir` | `STATE_DIR/logs` | 模型服务的日志。服务同步写日志，这块盘卡住时解码也跟着停，要放在可靠的盘上（[常见问题](faq.md#解码停了几十秒到两分钟然后自己恢复)） |
 | `--runner` | `auto` | `systemd`：模型服务跑在用户级的临时 scope 里；`setsid`：独立会话，按进程组停止。`auto`：有用户级 systemd 就用它 |
 | `--unit` | `xtier-console` | systemd scope 的名字 |
+| `--cpu-weight` | `10000` | systemd scope 的 `CPUWeight`（1–10000，systemd 默认 100；0 = 不设）。专家线程占满几乎所有核，同一个用户管理器下别的进程一抢 CPU，解码就慢十倍；登录会话里的程序用 `tools/low_cpu.sh` 起（[常见问题](faq.md#解码突然慢了十倍别的程序一停又恢复)） |
 | `--mem-guard-gib` | `20` | 主机可用内存低于这么多 GiB 就停掉模型服务（`tools/mem_guard.sh`；0 = 不守护） |
 
 - 报告“在线”之前，控制台先经模型服务按顺序发三条带采样的短请求（提示约 340、2,500、6,800 token，对应各个 prefill 档，

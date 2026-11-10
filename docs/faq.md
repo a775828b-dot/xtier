@@ -12,6 +12,10 @@ XTier 每次只认一个测试过的 SGLang 提交（[xtier/__init__.py](../xtie
 
 这个 SGLang 和 XTier 对不上。继续跑的话加速项会悄悄消失，甚至退回官方路径，所以直接退出。处理方法同上。不想用 XTier 时去掉 `XTIER=1`。
 
+### 启动直接退出：`setting up XTier failed`
+
+XTier 装钩子时出错了，原因在同一行，比如 `unknown packs ['deepseek']` 是 `XTIER_PACKS` 写错了（应为 `deepseek_v4`），上面几行是完整的出错位置。SGLang 会把插件的异常记一行日志然后继续启动，服务就带着半套 XTier 跑，几十秒后报一个不相干的错（比如显存不足），所以 XTier 在这里直接退出。
+
 ### 日志有 `settings XTier does not know are ignored`
 
 环境变量拼错了，或者这个开关已经删掉。开关的名字和默认值见 [xtier/config.py](../xtier/config.py)。
@@ -84,6 +88,12 @@ FlashInfer 的内核在加载权重之前编译，好过在第一个请求里现
 
 想恢复完整的模型文件：`python tools/cold_punch.py 模型目录 --restore`。
 
+### 启动报 `holds the only copy of its experts` 或 `expert tensors read as zeros`
+
+这次启动用的模型目录和冷存储里的记录对不上，而这些记录是专家唯一的一份（打过洞）。常见原因是从另一个目录启动：同一模型的变体、没带 `XTIER-COLD-ONLY` 的目录副本。这种目录的专家张量读出来是零，以前会拿这些零把记录整个重写一遍。现在冷存储自己记着哪些层是唯一副本（清单里的 `only`，旁边的 `KEY.only`），一律不重写；没有这个记号的旧存储，看到专家张量是零也不写。
+
+从打洞的那个目录启动（开 `XTIER_FAST_LOAD=1`），或者先 `python tools/cold_punch.py 那个目录 --restore` 把专家写回去。
+
 ### 打洞之后有什么风险
 
 冷存储成了唯一一份，任何一块盘坏了都要重新下载模型。没有 XTier 的官方 SGLang 不能加载打洞后的目录。TP 下不能打洞。
@@ -96,6 +106,27 @@ FlashInfer 的内核在加载权重之前编译，好过在第一个请求里现
 - **再比测法**：表里的 decode 只算长回复（≥ 300 token），用 [bench/agent_bench.py](../bench/agent_bench.py) 可以同样测一遍。token/s 还受投机接受率影响，比较时看每步耗时更稳。
 - **看线程数**：`XTIER_THREADS` 要是 NUMA 节点数的倍数。
 - **启动后第一个长请求会慢几秒**（64K 实测多 2.6–7 s），第二个开始才是正常速度。
+
+### 解码突然慢了十倍，别的程序一停又恢复
+
+模型在线时，同一台机器上有吃 CPU 的程序在跑（编译、测试脚本、渲染），哪怕它是 `nice 19`。专家的 CPU 线程占满了几乎所有核，每层都要等所有线程算完，一个核被抢，整层就跟着等。Linux 先按控制组分 CPU 时间：ssh 登录会话和跑服务的用户管理器（`user@UID.service`）是同级的两个组，在同一个核上各拿一半，进程自己的 nice 值和调度类只在组内起作用。实测 DeepSeek 空闲 37 步/秒，16 个 `nice 19` 的忙循环让它掉到 3.5，落在专家线程的核上时 0.4。
+
+- 启动台起服务时给它的 scope 设了 `CPUWeight=10000`（`--cpu-weight`，0 不设），同一个用户管理器下的其他服务抢不动它。
+- 从登录会话跑吃 CPU 的东西，用 `tools/low_cpu.sh 命令`：放进 CPU 权重为 1 的 scope，模型只慢百分之几，那个程序拿模型剩下的 CPU。`LOW_CPU_CPUS=` 可以再限定到没有专家线程的核。
+- 想一劳永逸，用 root 给 `user@UID.service` 设高权重，或者把系统服务和登录会话的 `AllowedCPUs` 限到没有专家线程的核。
+
+### 解码停了几十秒到两分钟，然后自己恢复
+
+先看内核日志里有没有盘超时：`journalctl -k | grep -i "nvme.*timeout"`。解码循环里有两样东西每步都写盘，盘不响应时写的那一下卡住，解码就跟着停，盘恢复后接着跑：
+
+- **服务日志**，同步写。实测把日志所在的文件系统冻结 15 秒，解码就停 15 秒。日志要写在可靠的盘上：启动台 `--log-dir`（默认在 `--state-dir` 下）。
+- **SGLang 的指标文件**（`--enable-metrics`），每个进程通过内存映射写，默认在 `/tmp` 下。XTier 现在把它们放到内存盘 `/dev/shm/xtier-metrics-UID/`（自己设了 `PROMETHEUS_MULTIPROC_DIR` 时不动）。
+
+盘本身的问题（比如进出自动省电时超时）另外处理。
+
+### 进程崩溃后 `/var/crash` 里没有完整的内存转储
+
+XTier 让服务进程崩溃时只转储线程的寄存器，不写内存（`/proc/self/coredump_filter` 设为 0）。服务进程的内存是几百 GiB，Ubuntu 的 apport 不管 `ulimit -c` 都会把它写进系统盘的 `/var/crash`，写的那几分钟里进程不退出、显存不释放，服务也起不来。出错位置看服务日志。确实要完整转储时设 `XTIER_CORE_DUMP=1`。
 
 ### 温度 0，两次输出不完全一样
 

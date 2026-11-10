@@ -44,6 +44,13 @@ finally:
 models = core.load_models()
 assert list(models)[:3] == ['qwen38', 'glm53', 'ds41'], list(models)
 console = core.Console(models, tempfile.mkdtemp(prefix='xtier-console-'), runner='setsid', guard_gib=0)
+# the server's scope outweighs other processes of the user manager (2026-11-10 audit R1); the guard's scope does not
+scoped = core.Console(models, tempfile.mkdtemp(prefix='xtier-console-'), runner='systemd', unit='u', guard_gib=0)
+assert scoped.cpu_weight == 10000
+assert '--property=CPUWeight=10000' in scoped._wrap('u', ['server'], scoped.cpu_weight)
+assert not any('CPUWeight' in a for a in scoped._wrap('u-guard', ['guard'])), scoped._wrap('u-guard', ['guard'])
+assert scoped._wrap('u', ['server'], 0)[-1] == 'server' and console._wrap('u', ['server'], 10000) == ['server']
+assert core.Console(models, tempfile.mkdtemp(prefix='xtier-console-'), runner='systemd', cpu_weight=0).cpu_weight == 0
 
 combos = 0
 for mid, m in models.items():
@@ -196,4 +203,13 @@ log.write_text('mem_guard: killing\n')
 ok, why = console.wait_ready(dict(port=1, served='Some-Model', log=str(log)), 60)
 core.health, core.warm_up = health, warm
 assert not ok and '预热' in why, (ok, why)
+# why a server is gone or going (2026-11-10 audit R10): the memory guard's line first, else a fatal line of the log
+log = Path(tempfile.mkdtemp(prefix='xtier-console-')) / 'xtier-x-1.log'
+log.write_text('[2026-11-10 10:00:00] Decode batch, #running-req: 1\n')
+assert core.why_down({'log': str(log)}) == ''
+log.write_text('[xtier] FATAL: CPU forward failed in a decode call (m=1 k=8): No RAM slot; aborting\nAborted\n')
+assert core.why_down({'log': str(log)}).startswith('[xtier] FATAL: CPU forward failed'), core.why_down({'log': str(log)})
+log.with_suffix('.guard.log').write_text('2026-11-10 10:00:01 mem_guard: MemAvailable 19 GiB < 20 GiB, killing process '
+                                         'group 7 (pid 7); largest: python 300 GiB, \n')
+assert '内存守护' in core.why_down({'log': str(log)}) and '19 GiB' in core.why_down({'log': str(log)})
 print(f'console ok: {len(models)} models, {combos} option combinations built, warm-up requests checked')

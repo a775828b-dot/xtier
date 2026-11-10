@@ -148,4 +148,22 @@ for preset in sys.argv[1:] or ['ds41_1017']:
         assert ok
     del copied, filled
 direct.close()
+# a checkpoint file on a filesystem that refuses O_DIRECT (tmpfs before Linux 6.6, some overlay and network
+# filesystems) loads the usual way (2026-11-10 audit R11); an os.open that refuses it stands in for one
+real_open = os.open
+
+
+def refusing(path, flags, *args, **kwargs):
+    if flags & os.O_DIRECT and str(path).endswith('refused.safetensors'):
+        raise OSError(22, 'Invalid argument')
+    return real_open(path, flags, *args, **kwargs)
+
+
+os.open = refusing
+try:
+    assert not direct._direct('/somewhere/refused.safetensors'), 'a file without O_DIRECT taken'
+    assert direct._direct(layers.PRESETS[(sys.argv[1:] or ['ds41_1017'])[0]][0] + '/config.json')
+finally:
+    os.open = real_open
+print('  O_DIRECT tried when a file is first seen: a file that refuses it loads the usual way')
 print('DIRECT-LOAD-CHECK PASS')

@@ -36,7 +36,10 @@ expert, so tools/cold_punch.py can take their bytes out of the checkpoint files 
 records (holes: the files keep their sizes, modification times and everything else). KEY.ranges, next to the manifest,
 says where each expert tensor lies in the files (noted while loading, save_ranges). The marker XTIER-COLD-ONLY in the
 model directory then lists the layers that can only load from the store; any other way of loading them stops the start
-(require_checkpoint) instead of reading zeros, and such a layer's records are never rewritten.
+(require_checkpoint) instead of reading zeros. The store knows it too, for starts from other directories (a variant of
+the checkpoint, a copy without the marker): its manifest marks those layers ('only') and KEY.only beside it lists them,
+and such a layer's records are never rewritten, nor are records written from expert tensors that read as zeros
+(2026-11-10 audit R2: a start from another directory wrote the only copy over with zeros).
 """
 import hashlib
 import json
@@ -149,6 +152,7 @@ class Store:
         self.key = key
         self.paths = [d / f'{key}.cold' for d in dirs]
         self.manifest_path = dirs[0] / f'{key}.json'
+        self.only = only_layers(dirs[0], key)   # layers whose records are the only copy (tools/cold_punch.py)
         self.manifest = {'version': 2, 'layers': {}}
         if self.manifest_path.exists():
             try:
@@ -159,7 +163,7 @@ class Store:
             if manifest is not None and manifest.get('version') == 2:
                 self.manifest = manifest
             else:   # version 1 (a whole record on one drive) or unreadable: the files start again
-                if cold_only() is not None:
+                if cold_only() is not None or self.only:
                     raise RuntimeError(f'xtier cold: {self.manifest_path} is not usable and these records are the only '
                                        'copy of the experts: nothing is rewritten')
                 for p in self.paths:
@@ -175,13 +179,7 @@ class Store:
 
     def save(self):
         """The manifest replaced on the drive before the records it drops are overwritten (fsync, then the rename)."""
-        tmp = self.manifest_path.with_suffix('.tmp')
-        with open(tmp, 'w') as f:
-            f.write(json.dumps(self.manifest))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.manifest_path)
-        _fsync(self.manifest_path.parent, os.fsync)
+        write_json(self.manifest_path, self.manifest)
 
     def sync(self):
         """The records written so far on the drives themselves (their write caches flushed): only then may a manifest
@@ -196,6 +194,47 @@ def _fsync(path, how):
         how(fd)
     finally:
         os.close(fd)
+
+
+def write_json(path, value):
+    """path replaced by value as JSON on the drive itself: a temporary file flushed, renamed over it, the directory
+    flushed."""
+    path = Path(path)
+    tmp = path.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        f.write(json.dumps(value))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync(path.parent, os.fsync)
+
+
+def only_path(first_dir, key):
+    """KEY.only beside the manifest: the layers whose records tools/cold_punch.py made the only copy."""
+    return Path(first_dir) / f'{key}.only'
+
+
+def only_layers(first_dir, key):
+    p = only_path(first_dir, key)
+    if not p.exists():
+        return set()
+    try:
+        return {str(x) for x in json.loads(p.read_text())['layers']}
+    except (ValueError, KeyError, TypeError):   # unreadable: every layer counts as the only copy
+        return {'*'}
+
+
+def _reads_as_zeros(inputs, experts, nodes, I):
+    """Whether these experts' gate rows of node part 0 are nearly all zero bytes, as the expert tensors of a checkpoint
+    tools/cold_punch.py punched read (its holes; only the blocks at a tensor's ends keep their bytes). A few experts
+    of the layer: a punch takes them all."""
+    IN = I // nodes
+    picks = sorted({experts[0], experts[len(experts) // 2], experts[-1]}) if experts else []
+    for e in picks:
+        piece = inputs[0][e, :IN]
+        if int(torch.count_nonzero(piece)) > piece.numel() // 10:
+            return False
+    return bool(picks)
 
 
 def store(key):
@@ -230,6 +269,7 @@ def _units():
     u = (os.environ.get('XTIER_COLD_UNITS') or '1').strip()
     if u not in ('1', '3'):
         raise RuntimeError(f'xtier cold: XTIER_COLD_UNITS={u}: 1 or 3')
+    os.environ['XTIER_COLD_UNITS'] = u   # as the engine reads it (xtier_cold_attach takes exactly 1 or 3; audit R8)
     return int(u)
 
 
@@ -449,6 +489,18 @@ def attach(plan, lp, inputs, scale_format):
                 entry['source'] = source()
                 st.save()
         else:
+            only = (entry or {}).get('only')
+            if only or key in st.only or '*' in st.only:
+                raise RuntimeError(
+                    f'xtier cold: layer {key}: store {st.key} holds the only copy of its experts (tools/cold_punch.py '
+                    f'took them out of {(only or {}).get("model", "their checkpoint")}) and the checkpoint here, '
+                    f'{_model_dir()}, does not match the records: nothing is written over them. Start from that '
+                    'directory (with XTIER_FAST_LOAD=1), or write its experts back first: tools/cold_punch.py DIR '
+                    '--restore.')
+            if _reads_as_zeros(inputs, lp.stored, nodes, I):
+                raise RuntimeError(
+                    f"xtier cold: layer {key}: the checkpoint's expert tensors read as zeros ({_model_dir()}: one whose "
+                    f'experts tools/cold_punch.py took out, without its {MARKER}?): no records are written from them')
             size = [len(lp.stored) * b for b in share]   # on each drive
             if layout_ok or (_layout_matches(entry, record, D, U, counts, drive_of)
                              and len(entry.get('stored', [])) >= len(lp.stored)):

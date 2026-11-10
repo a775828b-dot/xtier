@@ -249,6 +249,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
             how = ', being read from the cold store'
         else:
             prefill_cold = cold.attach(self.plan, lp, inputs, self.format.name) if lp else None
+        if lp is not None:   # a mailbox call (decode) reads the experts it misses all at once, it cannot go in passes
+            need = min(self.experts, SLOT_TOKENS * (getattr(layer, 'top_k', None) or MAX_TOP_K))
+            if self.plan.slots < need:
+                raise RuntimeError(f'xtier cold: layer {self.cfg.layer_id} keeps {self.plan.slots} experts in RAM, a '
+                                   f'decode call of {SLOT_TOKENS} tokens can route to {need}: lower XTIER_COLD_FRACTION')
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,

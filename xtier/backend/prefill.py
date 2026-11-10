@@ -757,6 +757,11 @@ class Prefill:
             compute = torch.cuda.current_stream()
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError('GPU prefill capture is not supported; use native CPU decode')
+            # The hot pool's rows are read once per call, after the host rendezvous below. A call that raised before
+            # its end left its rows behind, and the uploads this call starts before the rendezvous would copy by them:
+            # the elastic cache's out-of-memory retry runs the layer again after it unmapped the extra slots (2026-11-10
+            # audit R3: a fault, or wrong experts where the pool's contents changed).
+            self._fp4_residency = None
             if _copy_stream is None:
                 _copy_stream = torch.cuda.Stream()
             ready = {}  # chunk -> (slot, upload-done event)
@@ -781,6 +786,8 @@ class Prefill:
             if target is not None and (target.slot_shapes != self.slot_shapes or target.chunk != CH
                                        or not target._fp4_ready(torch.bfloat16)):
                 target = None
+            if target is not None:
+                target._fp4_residency = None   # the same for the next layer's rows (set by this call's rendezvous)
             n_cross = min(n_slots, target.experts // target.chunk) if target is not None else 0
             cross = []  # [(next-layer chunk, upload-done event, slot), ...]
             if ready:

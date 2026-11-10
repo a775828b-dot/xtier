@@ -9,8 +9,10 @@ files (KEY.ranges, next to the manifest). With the server stopped:
 Nothing is punched unless every byte matched. The holes free the expert tensors' blocks and nothing else: the files
 keep their sizes, modification times, headers and other tensors (SGLang's loader goes through them as before, XTier does
 not read the punched tensors), and the marker XTIER-COLD-ONLY in the model directory makes any start that would read
-them stop (cold.require_checkpoint). The records are then the only copy: losing a drive of the store means downloading
-the model again, and SGLang without XTier cannot load this directory.
+them stop (cold.require_checkpoint). The store is marked too (its manifest's layers 'only', KEY.only beside it): a start
+from another directory with the same store (a variant, a copy without the marker) stops instead of writing the records
+over. The records are then the only copy: losing a drive of the store means downloading the model again, and SGLang
+without XTier cannot load this directory.
 """
 import argparse
 import ctypes as C
@@ -121,11 +123,13 @@ class Store:
                 stop(f'{len(found)} stores of {model.name} noted in {first}: --key picks one')
             key = found[0].name[:-len('.ranges')]
         self.key = key
+        self.manifest_path = first / f'{key}.json'
         try:
-            manifest = json.loads((first / f'{key}.json').read_text())
+            manifest = json.loads(self.manifest_path.read_text())
             ranges = json.loads((first / f'{key}.ranges').read_text())
         except (OSError, ValueError) as e:
             stop(f'store {key}: {e} (a start with XTIER_COLD=1 writes it)')
+        self.manifest = manifest
         self.source, self.names = ranges['source'], ranges['files']
         self.layers, self.entries = [], []
         for layer_id, noted in sorted(ranges['layers'].items(), key=lambda kv: int(kv[0])):
@@ -145,6 +149,26 @@ class Store:
 
     def record_files(self):
         return [d / f'{self.key}.cold' for d in self.paths]
+
+    def mark(self, only):
+        """The store's own note that its layers' records are the only copy (only: who took them out) or no longer
+        (None): the manifest's entries, then KEY.only (cold.Store reads it when the manifest is not usable)."""
+        for L in self.layers:
+            entry = self.manifest['layers'][L.id]
+            if only is None:
+                entry.pop('only', None)
+            else:
+                entry['only'] = only
+        cold.write_json(self.manifest_path, self.manifest)
+        path = cold.only_path(self.paths[0], self.key)
+        listed = cold.only_layers(self.paths[0], self.key) - {'*'}
+        ids = {L.id for L in self.layers}
+        listed = listed | ids if only is not None else listed - ids
+        if listed:
+            cold.write_json(path, dict(layers=sorted(listed, key=int), model=(only or {}).get('model', ''),
+                                       date=time.strftime('%Y-%m-%d %H:%M:%S')))
+        else:
+            path.unlink(missing_ok=True)
 
     def open_records(self):
         return [os.open(p, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC) for p in self.record_files()]
@@ -258,9 +282,11 @@ def punch(model, paths, key, dry_run, threads):
     if dry_run:
         return
     stats = [p.stat() for p in st.files]
+    date = time.strftime('%Y-%m-%d %H:%M:%S')
     write_marker(model, dict(key=st.key, paths=[str(d) for d in paths], layers=[L.id for L in st.layers],
                              files={n: [s.st_size, s.st_mtime_ns] for n, s in zip(st.names, stats)},
-                             date=time.strftime('%Y-%m-%d %H:%M:%S')))   # first: a crash below leaves the guard on
+                             date=date))   # first: a crash below leaves the guards on
+    st.mark(dict(model=str(model), date=date))
     freed = 0
     for p, s, file in zip(st.files, stats, spans):
         fd = os.open(p, os.O_RDWR | os.O_CLOEXEC)
@@ -295,6 +321,7 @@ def restore(model, paths, key, threads):
     st.compare(threads)
     for p, name in zip(st.files, st.names):
         os.utime(p, ns=(p.stat().st_atime_ns, marker['files'][name][1]))
+    st.mark(None)   # the store's note first: the marker still guards the directory meanwhile
     (model / cold.MARKER).unlink()
     print(f'restored: {need / 2 ** 30:.1f} GiB written back and compared', flush=True)
 

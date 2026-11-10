@@ -5,8 +5,8 @@ SGLang calls ``load()`` early in every process and then applies the hooks regist
 ones that build models: importing the hook targets elsewhere would only cost startup time); ``install()`` does it
 unconditionally, for tools that build a ModelRunner in their own process. The other processes, the one that serves
 the API among them, get the few hooks on how prompts are tokenized and the host fixes of serving
-(``install_serving()``). SGLang logs and swallows exceptions raised
-here, so the backend checks after every model load that it took over (``xtier.backend.hooks.check``).
+(``install_serving()``). SGLang logs and swallows exceptions raised here: ``load()`` turns them into SystemExit, and the
+backend checks after every model load that it took over (``xtier.backend.hooks.check``).
 """
 
 import logging
@@ -128,6 +128,57 @@ def load() -> None:
     if not config.enabled():
         logger.debug('xtier %s: XTIER is not 1, nothing registered', __version__)
         return
+    try:
+        _load()
+    except Exception as e:
+        # SGLang logs a plugin's exception and goes on: the hooks registered before it would stay, the rest missing
+        # (2026-11-10 audit R4: a misspelt XTIER_PACKS ended 20 s later in an unrelated out-of-memory error). Stop here,
+        # with the reason last.
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        raise SystemExit(f'xtier: setting up XTier failed in pid {os.getpid()}: {type(e).__name__}: {e}') from e
+
+
+def _small_core_dump() -> None:
+    """A server process that crashes would dump its whole memory (DeepSeek V4.1's scheduler: about 300 GiB): Ubuntu's
+    apport writes it into /var/crash on the system disk whatever ulimit -c says, for minutes, while the process holds
+    its GPU memory and the server cannot start again (2026-11-10: a 22 GiB test process, a 25 GiB report after ten
+    minutes). The core keeps the threads' registers and leaves the memory out (coredump_filter 0, inherited by child
+    processes); the log has the backtrace. XTIER_CORE_DUMP=1 keeps whole dumps."""
+    if os.environ.get('XTIER_CORE_DUMP') == '1':
+        return
+    try:
+        with open('/proc/self/coredump_filter', 'w') as f:
+            f.write('0')
+    except OSError:   # not Linux
+        pass
+
+
+def _metrics_in_memory() -> None:
+    """SGLang's Prometheus files (--enable-metrics) on the RAM disk: every server process writes them through a shared
+    mapping at every step, and in a directory under /tmp a disk that stops answering (or its journal) stopped decode
+    with them (2026-11-10: the root filesystem frozen for 10 s, decode stopped for 10 s; the server log was on another
+    disk already). One directory per server, named after its main process; those of servers that are gone (SGLang leaves
+    them when it is stopped by a signal) are removed at the next start. A PROMETHEUS_MULTIPROC_DIR set before is kept."""
+    if 'PROMETHEUS_MULTIPROC_DIR' in os.environ or not os.path.isdir('/dev/shm'):
+        return
+    import shutil
+    base = Path('/dev/shm') / f'xtier-metrics-{os.getuid()}'
+    try:
+        base.mkdir(mode=0o700, exist_ok=True)
+        for d in base.iterdir():
+            pid = d.name.rpartition('-')[2]
+            if pid.isdigit() and not os.path.exists(f'/proc/{pid}'):
+                shutil.rmtree(d, ignore_errors=True)
+        d = base / f'server-{os.getpid()}'
+        d.mkdir(exist_ok=True)
+    except OSError:
+        return
+    os.environ['PROMETHEUS_MULTIPROC_DIR'] = str(d)
+
+
+def _load() -> None:
+    _small_core_dump()
     if os.environ.get('XTIER_MAIN_CPUS'):
         # XTier places the threads itself. SGLang binds every scheduler to its GPU's NUMA node when the main process
         # starts it (numactl, SGLANG_NUMA_BIND_V2): XTier's main CPUs of that node only (2 on the RTX PRO 5000 host)
@@ -148,5 +199,6 @@ def load() -> None:
               f'{len(os.sched_getaffinity(0))}, SGLANG_AUTO_NUMA_BIND={os.environ.get("SGLANG_AUTO_NUMA_BIND", "")}',
               file=sys.stderr, flush=True)
     else:
+        _metrics_in_memory()   # the main process, before SGLang sets the directory up and starts the others
         _check_scheduler_entry()
         install_serving()

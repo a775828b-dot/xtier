@@ -2,6 +2,17 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-10：稳定性审阅后的修复，正常路径的行为不变：
+  - 别的程序抢 CPU 时解码会慢十倍（专家线程占满几乎所有核，Linux 先按控制组分 CPU）：启动台给服务的 scope 设 `CPUWeight=10000`（`--cpu-weight`），
+    登录会话里的程序用新的 `tools/low_cpu.sh` 起；
+  - 解码循环里每步写盘的两样东西，盘卡住时解码跟着停：服务日志（启动台 `--log-dir` 放到可靠的盘）、SGLang 的指标文件（XTier 挪到 `/dev/shm`）；
+  - 装钩子时出错直接退出，不再带着半套 XTier 起；DeepSeek FP4 prefill 失败后的重跑不再用过期的驻留记录（会段错误）；decode 里 CPU 调用失败直接终止，不再输出 NaN；
+  - 冷存储：唯一副本记在存储自己的清单里，从别的目录启动不会再用读成零的专家重写记录；预留到一半失败时归还内存槽；`XTIER_COLD_UNITS` 两边解析一致；
+  - 弹性槽分批释放（一次超过 2048 个会整个失败）；崩溃时不再把几百 GiB 的内存写进核心转储（`XTIER_CORE_DUMP=1` 恢复）；
+  - 快速加载一开始就试 O_DIRECT；启动台显示服务退出的原因；`tools/check_sglang.py` 比对被钩函数的源码指纹和上游属性；
+  - 新测试 `prefill_fp4_retry_check`、`cold_sole_copy_check`、`elastic_release_check`、`tests/engine_san.sh`，`bench/abuse_test.py`。
+
+  详见[报告](reports/2026-11-10-stability-fixes.md)。
 - 2026-11-06（v0.1.2）：跟进官方 SGLang main 27bc1a0（6162b07 之后 562 个提交）。依赖：sgl-deep-gemm 0.2.6、sgl-flash-mla 1.0.2、humming-kernels 0.1.18，
   新加 blake3，不再需要 flash-attn-4 和 kernels。XTier 跟着改了三处：
   - SM12x 上 DSv4.1 索引器继续用 DeepGEMM 的 fp8_fp4 MQA-logits（新钩子挂在 `v41_indexer.is_sm100`）：27bc1a0 把它收窄到 SM100 系列，SM120 改走

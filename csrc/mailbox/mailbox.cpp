@@ -554,13 +554,14 @@ void CUDART_CB execute(void *p) noexcept {
     if(rc>=0)xtier_last_timings(b->plan,phases);
     double wall=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
     if(rc<0) {
-        // Graph replays never re-check `failed`; make the NaN output visible in logs.
-        static std::atomic<int> reported{0};
-        if(reported.fetch_add(1)<16)
-            std::fprintf(stderr,"[xtier] CPU forward failed (m=%d k=%d): %s; output set to NaN\n",
-                         s->m,s->k,xtier_last_error());
+        // The step's experts could not be computed (a cold read that failed, say). A CUDA graph replay never looks at a
+        // return code: the model would go on with made-up outputs. Stop, as the row tables and the watchdog do
+        // (2026-11-10 audit R7; before, the output was set to NaN and only the next call outside a graph failed).
+        std::fprintf(stderr,"[xtier] FATAL: CPU forward failed in a decode call (m=%d k=%d): %s; aborting\n",
+                     s->m,s->k,xtier_last_error());
+        std::fflush(stderr);
         b->failed.store(1,std::memory_order_release);
-        std::fill(s->out,s->out+s->m*s->H,std::numeric_limits<float>::quiet_NaN());
+        std::abort();
     }
     if(second)g2_finish(s);
     if(s->shadow) {
