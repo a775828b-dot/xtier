@@ -65,6 +65,26 @@ def miss_env(o):
     return {} if o['packs'] == 'off' or o['missgpu'] == 'off' else {'XTIER_DECODE_MISS_GPU': f"0.{o['missgpu']}"}
 
 
+def interleave_option(choices, default, hint):
+    """Decode steps between the prefill chunks of a long prompt (SGLang's --prefill-decode-interval N, off there):
+    while one request reads a long prompt, the scheduler runs N decode steps of the other request after every chunk
+    instead of none until the prompt is read. Nothing changes while no request decodes. choices: [[N, label], ...]
+    per model (a chunk's time over a decode step's differs), each label with what was measured; default: the N that
+    leaves the other request about a fifth of its speed (2026-11-10: on by default)."""
+    return {'key': 'interleave', 'label': 'Prefill 中穿插 decode', 'default': default,
+            'choices': choices + [['off', '关 · 另一个请求等整段读完']], 'hint': hint}
+
+
+def interleave_args(o):
+    """The server arguments of the interleave option."""
+    return [] if o.get('interleave', 'off') == 'off' else ['--prefill-decode-interval', o['interleave']]
+
+
+def interleave_tags(o):
+    """Its part of the server's label: only when it is off (on is the default)."""
+    return ['prefill 不穿插'] if o.get('interleave', 'off') == 'off' else []
+
+
 def load_models(names=None, configs=CONFIGS, ports=None):
     """{id: model} from configs/<name>/console.py (every one, or the directories in names) in MODEL['order'];
     ports overrides the listening port by model id."""

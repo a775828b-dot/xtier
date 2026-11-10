@@ -36,6 +36,10 @@ Safety, so that a model never runs out of memory because of the extra slots:
 Per layer (layout): address space for XTIER_CACHE_ELASTIC_MAX (2.0) x its configured slots
 (XTIER_CACHE_ELASTIC_MAX_SLOTS: a number), at most every expert; XTIER_CACHE_ELASTIC_BASE (1.0) x them mapped for good.
 XTIER_CACHE_ELASTIC_IDLE (32): decode forwards after an allocating one before slots are added again.
+XTIER_CACHE_ELASTIC_IDLE_CHUNK (1024): the same after a prefill forward that filled its chunk (--chunked-prefill-size):
+the prompt's next chunk follows. With --prefill-decode-interval N another request decodes N steps between two chunks;
+slots added then went back before every chunk (2026-11-10, DeepSeek V4.1, N = 150: 8.4 GiB released and uploaded again
+at each of ten chunks).
 XTIER_CACHE_ELASTIC_EXTRAPOLATE (2): how far a need seen is scaled up to bound a larger forward.
 XTIER_CACHE_ELASTIC_DEBUG=1: a log line for every need learnt and every prediction made while extra slots are held.
 """
@@ -145,6 +149,8 @@ class Governor:
         self.critical = _env('XTIER_CACHE_ELASTIC_CRITICAL_GIB', 1.0) * GIB
         self.margin = _env('XTIER_CACHE_ELASTIC_MARGIN', 1.25)
         self.idle = int(_env('XTIER_CACHE_ELASTIC_IDLE', 32))
+        self.idle_chunk = int(_env('XTIER_CACHE_ELASTIC_IDLE_CHUNK', 1024))
+        self.chunking = False           # the last prefill forward of the target model filled its chunk: more follow
         self.every = max(1, int(_env('XTIER_CACHE_ELASTIC_CHECK', 16)))
         self.cooldown = _env('XTIER_CACHE_ELASTIC_COOLDOWN_S', 600.0)
         self.lock = threading.Lock()    # one resize at a time
@@ -346,9 +352,12 @@ class Governor:
 
     # --- forward hooks ---
 
-    def before_alloc(self, tokens, draft, ctx):
-        """A forward that allocates: release what its predicted need and the reserve do not leave free."""
+    def before_alloc(self, tokens, draft, ctx, full=False):
+        """A forward that allocates: release what its predicted need and the reserve do not leave free. full: it
+        fills its prefill chunk (the prompt goes on in another forward)."""
         self.since = 0
+        if not draft:
+            self.chunking = full
         self._stop_growth()   # before the free memory is read
         if self.extra <= 0:
             return
@@ -377,7 +386,10 @@ class Governor:
             return
         # not before a request's prefill has been seen: the decode-sized forwards of SGLang's start-up (CUDA graph
         # warm-ups, the adaptive speculation's captures) come before serving, and the captures need the memory
-        if (self.off or not self.seen or self.since < self.idle or self.extra >= self.cap
+        # nor between the chunks of a long prompt (decode steps of another request, --prefill-decode-interval): the next
+        # chunk would take the slots back
+        idle = self.idle_chunk if self.chunking else self.idle
+        if (self.off or not self.seen or self.since < idle or self.extra >= self.cap
                 or time.monotonic() < self.calm_until or (self.grower is not None and self.grower.is_alive())):
             return
         from xtier.cache import pool
@@ -417,6 +429,13 @@ def _context(forward_batch):
     return None if n is None else int(n)
 
 
+def _fills_chunk(runner, tokens):
+    """A prefill forward at the chunk size (--chunked-prefill-size; within a sixteenth: chunks end on page
+    boundaries): the scheduler cut a prompt there, its next chunk follows."""
+    chunk = getattr(getattr(runner, 'server_args', None), 'chunked_prefill_size', None) or 0
+    return chunk > 0 and tokens * 16 >= chunk * 15
+
+
 def _oom(e):
     return isinstance(e, torch.OutOfMemoryError) or (isinstance(e, RuntimeError) and 'out of memory' in str(e))
 
@@ -448,7 +467,7 @@ def _forward(original, runner, forward_batch, *args, **kwargs):
     tokens = int(ids.shape[0]) if ids is not None and ids.dim() > 0 else 0
     draft = bool(getattr(runner, 'is_draft_worker', False))
     ctx = _context(forward_batch)
-    _guarded(g, g.before_alloc, tokens, draft, ctx)
+    _guarded(g, g.before_alloc, tokens, draft, ctx, _fills_chunk(runner, tokens))
     torch.cuda.reset_peak_memory_stats()
     before, held = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
     retry = False

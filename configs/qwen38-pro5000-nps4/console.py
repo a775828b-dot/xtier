@@ -6,7 +6,8 @@ is GPU-bound (2026-10-26, two more resident layers with dynamic slots: decode st
 
 from pathlib import Path
 
-from xtier.console.core import common_options, elastic_option, miss_env, miss_option
+from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                miss_env, miss_option)
 
 HERE = Path(__file__).resolve().parent
 PLE_OPTANE = '/data/fast/p5800x1/qwen38-flash-next-ple'   # the PLE table's rows on an Optane drive (XTIER_PLE_ROWS=nvme)
@@ -42,6 +43,14 @@ MODEL = {
          'choices': [['pinned', '锁页内存'], ['nvme', '傲腾 NVMe · 省 48 GiB 内存']],
          'unavailable': lambda: {} if Path(PLE_OPTANE).is_dir() else {'nvme': f'本机没有 PLE 表的 NVMe 副本（{PLE_OPTANE}）'}},
         miss_option(),
+        # 2026-11-10, a 211K-token cold prompt beside a decoding request (184 tok/s alone), 96 steps measured: the
+        # decoding request's speed while the prompt is read, the prompt's time to its first token against 41.7 s
+        # without; 36 and 288 from the measured cost of a step between chunks (13.1 ms)
+        interleave_option([['96', '96 步 / 块 · 实测 · decode 约 40 tok/s，长提示首字晚 26%'],
+                           ['36', '36 步 / 块 · 估 decode 约 17 tok/s，长提示首字晚约 10%'],
+                           ['288', '288 步 / 块 · 估 decode 约 83 tok/s，长提示首字晚约 83%']], '96',
+                          '一个请求在读长提示时，每读完一块（24K token，约 4.6 秒）先让另一个请求 decode 这么多步；'
+                          '没有请求在 decode 时不生效。关：另一个请求要等整段读完（211K token 实测停 37 秒）'),
     ],
     'notes': [
         {'when': {'packs': 'off'}, 'text': '基线：FP8 KV、16K 分块、不开 hc_mix / PLE / QSA 分段'},
@@ -73,7 +82,7 @@ def build(o, port):
         env.update(XTIER_PLE_ROWS='nvme', XTIER_PLE_MODEL=PLE_OPTANE)
     args = ['--context-length', ctx, '--max-total-tokens', ctx, '--kv-cache-dtype', kv, '--chunked-prefill-size', chunk,
             '--mem-fraction-static', '0.90', '--max-mamba-cache-size', '16', '--mamba-ssm-dtype', 'bfloat16',
-            '--json-model-override-args', YARN]
+            '--json-model-override-args', YARN, *interleave_args(o)]
     if spec:
         return env, [str(HERE / 'run-qwen-mtp.sh'), *args, '--speculative-draft-kv-cache-dtype', 'fp8_e4m3']
     return env, [str(HERE / 'run-qwen-xtier.sh'), *args, '--cuda-graph-max-bs-decode', '2']
@@ -82,8 +91,9 @@ def build(o, port):
 def tags(o):
     """Extra parts of the server's label."""
     if o['packs'] != 'on':
-        return []
-    extra = (['弹性热专家'] if o['elastic'] == 'on' else []) + ([f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else [])
+        return interleave_tags(o)
+    extra = (['弹性热专家'] if o['elastic'] == 'on' else []) + (
+        [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else []) + interleave_tags(o)
     if o['kv'] != 'nvfp4':
         return ['FP8 KV'] + extra
     return (['NVFP4 KV', '自动布局'] if o['layout'] == 'auto' else ['NVFP4 KV']) + extra

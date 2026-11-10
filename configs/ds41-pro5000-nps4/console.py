@@ -3,7 +3,8 @@ README "+ 加速包" row: 50 hot slots per layer, Engram rows on NVMe with a 4 G
 
 from pathlib import Path
 
-from xtier.console.core import common_options, elastic_option, miss_env, miss_option
+from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                miss_env, miss_option)
 
 HERE = Path(__file__).resolve().parent
 # the cold-expert store (XTIER_COLD): four PCIe 5.0 drives (the manifest is in the first)
@@ -37,6 +38,13 @@ MODEL = {
          'unavailable': lambda: {} if all(Path(p).is_dir() for p in COLD_PATHS)
          else {c: '本机没有冷专家盘目录' for c in ('10', '20', '30')}},
         miss_option([{'cold': c} for c in ('10', '20', '30')]),   # not on layers with cold experts
+        # 2026-11-10, a 214K-token cold prompt beside a decoding request (143 tok/s alone): the decoding request's
+        # speed while the prompt is read, and the prompt's time to its first token against 45.4 s without
+        interleave_option([['48', '48 步 / 块 · 实测 · decode 约 32 tok/s，长提示首字晚 27%'],
+                           ['16', '16 步 / 块 · decode 约 14 tok/s，长提示首字晚 8%'],
+                           ['150', '150 步 / 块 · decode 约 67 tok/s，长提示首字晚 86%']], '48',
+                          '一个请求在读长提示时，每读完一块（22K token，约 4.6 秒）先让另一个请求 decode 这么多步；'
+                          '没有请求在 decode 时不生效。关：另一个请求要等整段读完（214K token 实测停 40 秒）'),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'},
               {'when': {'cold': '10'}, 'warn': True,
@@ -64,7 +72,7 @@ def build(o, port):
         env.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(COLD_PATHS), XTIER_COLD_FRACTION=f"0.{o['cold']}")
     else:
         env.update(miss_env(o))
-    return env, [str(HERE / 'run-ds-xtier.sh')]
+    return env, [str(HERE / 'run-ds-xtier.sh'), *interleave_args(o)]
 
 
 def tags(o):
@@ -76,4 +84,4 @@ def tags(o):
         out.append(f"冷专家 {o['cold']}%")
     elif miss_env(o):
         out.append(f"未命中 {o['missgpu']}% GPU 代算")
-    return out
+    return out + interleave_tags(o)

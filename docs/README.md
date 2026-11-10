@@ -84,6 +84,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-10 长 prefill 时让另一个请求继续 decode](reports/2026-11-10-prefill-interleave.md) | 启动台选项「Prefill 中穿插 decode」（默认开）三个模型各挡的实测、弹性热专家槽在分块之间不再加槽、只为长提示加预热不需要 |
 | [2026-11-10 稳定性审阅和修复（v0.1.3）](reports/2026-11-10-stability-fixes.md) | 别的程序抢 CPU、日志和指标文件写盘卡住解码、插件异常被吞、FP4 prefill 重跑、冷存储唯一副本、核心转储；修了什么、怎么验证的 |
 | [2026-11-06 跟进 SGLang 27bc1a0（v0.1.2）](reports/2026-11-06-sglang-27bc1a0.md) | 依赖变化；XTier 改的三处（SM12x 的 DeepSeek 索引器、Engram、变长验证）；三个模型的回归 |
 | [2026-11-01 代码审计和修复](reports/2026-11-01-audit-fixes.md) | v0.1.0：修了什么、查明了什么、试过但没采用什么，三个模型的回归结果 |

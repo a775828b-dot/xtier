@@ -74,6 +74,7 @@ def tags(o):
 
 - 参数是白名单：页面传来的值不在 `choices` 里就拒绝，`build()` 只拿到校验过的值。
 - 开 / 关两个取值的参数（第一个是开）可以加 `'switch': True`，页面上显示成拨动开关，例如 `elastic_option()` 的弹性热专家。
+- `interleave_option(choices, hint)`：「Prefill 中穿插 decode」，SGLang 的 `--prefill-decode-interval N`，默认开（各模型实测的那一档）。一块 prefill 和一步 decode 的耗时各模型不同，所以挡位由各模型的条目给，文字里写实测效果（`bench/interleave_probe.py`，[报告](reports/2026-11-10-prefill-interleave.md)）；`interleave_args(o)` 给出启动参数。
 - 默认值写实测过的配置，`bench` 写 README 测速表里的数；实测配置变了，两处一起改。
 - `python3 tests/console_check.py` 把每个模型每种参数组合都构建一遍，并检查页面和接口。
 

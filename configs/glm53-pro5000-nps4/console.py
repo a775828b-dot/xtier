@@ -6,7 +6,8 @@ cold 255K-token prompt failed); the elastic cache gives decode the two slots bac
 
 from pathlib import Path
 
-from xtier.console.core import common_options, elastic_option, miss_env, miss_option
+from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                miss_env, miss_option)
 
 HERE = Path(__file__).resolve().parent
 GLM_REF = '/data/fast/workspaces/gh-ref/lsglang_glm5.3'   # production's adaptive draft steps and draft token map
@@ -33,6 +34,14 @@ MODEL = {
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '16384', 'choices': [['16384', '16K'], ['8192', '8K']]},
         elastic_option('on', 'decode 时每层多约 12–14 槽（prefill 余量约 6.6 GiB），agent 每步 −1.5%（10-26）'),
         miss_option(),
+        # 2026-11-10, a 119K-token cold prompt beside a decoding request (94 tok/s alone), 64 steps measured: the
+        # decoding request's speed while the prompt is read, the prompt's time to its first token against 47.0 s
+        # without; 24 and 192 from the measured cost of a step between chunks (27.7 ms)
+        interleave_option([['64', '64 步 / 块 · 实测 · decode 约 21 tok/s，长提示首字晚 28%'],
+                           ['24', '24 步 / 块 · 估 decode 约 9 tok/s，长提示首字晚约 11%'],
+                           ['192', '192 步 / 块 · 估 decode 约 43 tok/s，长提示首字晚约 85%']], '64',
+                          '一个请求在读长提示时，每读完一块（16K token，约 6.2 秒）先让另一个请求 decode 这么多步；'
+                          '没有请求在 decode 时不生效。关：另一个请求要等整段读完（119K token 实测停 40 秒）'),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '基线：BF16 权重、55 槽、不开拒绝采样'}],
 }
@@ -50,7 +59,8 @@ def build(o, port):
     env.update(miss_env(o))
     args = ['--context-length', ctx, '--chunked-prefill-size', o['chunk'], '--mamba-ssm-dtype', 'bfloat16',
             '--mem-fraction-static', '0.92', '--max-mamba-cache-size', '10', '--cuda-graph-max-bs-decode', '2',
-            '--dsa-decode-backend', 'tilelang', '--dsa-prefill-backend', 'tilelang', '--kv-cache-dtype', 'fp8_e4m3']
+            '--dsa-decode-backend', 'tilelang', '--dsa-prefill-backend', 'tilelang', '--kv-cache-dtype', 'fp8_e4m3',
+            *interleave_args(o)]
     if spec:
         env['XTIER_DRAFT'] = '1'
         args += ['--speculative-algorithm', 'EAGLE', '--speculative-num-steps', '3', '--speculative-eagle-topk', '1',
@@ -67,4 +77,4 @@ def tags(o):
     on = o['packs'] == 'on'
     return (['拒绝采样'] if on and o['spec'] == 'on' and o['rs'] == 'on' else []) + (
         ['弹性热专家'] if on and o['elastic'] == 'on' else []) + (
-        [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else [])
+        [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else []) + interleave_tags(o)

@@ -98,6 +98,17 @@ env, argv = console.build('qwen38', {**console.defaults('qwen38'), 'packs': 'off
 assert argv[argv.index('--kv-cache-dtype') + 1] == 'fp8_e4m3' and env['XTIER_QSA_FP4'] == '0'
 env, argv = console.build('qwen38', {**console.defaults('qwen38'), 'kv': 'fp8', 'chunk': '32768'})
 assert argv[argv.index('--chunked-prefill-size') + 1] == '24576' and ',27' not in env['XTIER_CACHE_FULL']
+# decode steps between a long prompt's prefill chunks (SGLang's --prefill-decode-interval): on by default at the
+# measured setting of each model; off takes the argument away and shows in the label
+for mid, measured in (('qwen38', '96'), ('glm53', '64'), ('ds41', '48')):
+    d = console.defaults(mid)
+    choices = next(o for o in console.models[mid]['options'] if o['key'] == 'interleave')['choices']
+    assert d['interleave'] == measured == choices[0][0] and choices[-1][0] == 'off' and '穿插' not in console.describe(mid, d)
+    for n, _ in choices[:-1]:
+        argv = console.build(mid, {**d, 'interleave': n})[1]
+        assert argv[argv.index('--prefill-decode-interval') + 1] == n and int(n) > 0
+    off = {**d, 'interleave': 'off'}
+    assert '--prefill-decode-interval' not in console.build(mid, off)[1] and 'prefill 不穿插' in console.describe(mid, off)
 env, argv = console.build('glm53', console.defaults('glm53'))
 assert '--speculative-use-rejection-sampling' in argv and env['XTIER_CACHE_SLOTS'] == '58'
 assert env['XTIER_CACHE_ELASTIC'] == '1'

@@ -2,6 +2,11 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-10（未发版）：长提示在读时让另一个请求继续 decode。SGLang 调度时 prefill 优先，一个请求读 20 万 token 的冷提示时，另一个请求的 decode 停 40 秒左右。
+  启动台加选项「Prefill 中穿插 decode」（SGLang 自带的 `--prefill-decode-interval`），**默认开**：每读完一块先让另一个请求 decode 若干步。默认挡
+  （DeepSeek 48 步、GLM 64 步、Qwen 96 步）实测另一个请求保持约 22% 的速度，长提示首字晚 26–28%；没有请求在 decode 时不生效，单个请求的速度不变。
+  弹性热专家槽在一个提示的两块之间不再加槽（原来每块之间加上、下一块前又释放，DeepSeek 每块白传 8.4 GiB；`XTIER_CACHE_ELASTIC_IDLE_CHUNK`）。
+  新工具 `bench/interleave_probe.py`、测试 `tests/elastic_chunk_check.py`。详见[报告](reports/2026-11-10-prefill-interleave.md)。
 - 2026-11-10（v0.1.3）：稳定性审阅后的修复，正常路径的行为不变：
   - 别的程序抢 CPU 时解码会慢十倍（专家线程占满几乎所有核，Linux 先按控制组分 CPU）：启动台给服务的 scope 设 `CPUWeight=10000`（`--cpu-weight`），
     登录会话里的程序用新的 `tools/low_cpu.sh` 起；
