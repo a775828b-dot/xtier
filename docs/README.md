@@ -124,8 +124,9 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-12 DeepSeek 同时跑 4 个请求（v0.1.5）](reports/2026-11-12-ds-four-requests.md) | 并发上限 2 → 4、KV 池 1M、一次专家调用最多 16 个 token、变长验证成默认；1、2、4 个请求的速度；成本表测到 4 个请求，每步时间按 6 行一档；子 agent 不再挤掉主会话的缓存；三个模型的回归 |
 | [2026-11-11 DeepSeek decode 一步的构成](reports/2026-11-11-decode-step.md) | GPU 上的大头都已按显存带宽读权重；草稿和两个请求的 FP8 投影改走快内核（每步 −0.6–0.8 ms，两个请求同时 −16%）；成本表重测；多个请求同时的估算 |
-| [2026-11-06 DeepSeek 变长验证（compact）](reports/2026-11-06-ds-compact-verify.md) | 来自 #13：要配本机实测的成本表；照抄 0 错，默认仍是 static（当时两个请求同时快 17%；2026-11-11 固定验证变快以后两者差不多） |
+| [2026-11-06 DeepSeek 变长验证（compact）](reports/2026-11-06-ds-compact-verify.md) | 来自 #13：要配本机实测的成本表；照抄 0 错，默认仍是 static（当时两个请求同时快 17%；2026-11-11 固定验证变快以后两者差不多；2026-11-12 成本表测到 4 个请求，变长验证成了启动台的默认） |
 | [2026-10-24 MiniMax 512K](reports/2026-10-24-minimax-512k.md) | NVFP4 KV、DSpark 按置信度截断（已暂停开发） |
 | [2026-10-24 Qwen NVFP4 KV、DeepSeek agent 实测](reports/2026-10-24-qwen-kv-ds-agent.md) | 省下的显存怎么用 |
 | [2026-10-24 DeepSeek decode、分词和 MiniMax](reports/2026-10-24-ds-woa-minimax.md) | FP8 wo_a、分页索引器、deepseek-recipe 分词 |

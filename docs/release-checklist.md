@@ -26,7 +26,7 @@ export CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 PATH=$CUDA_HOME
 
 | 内容 | 命令（都在 `tests/` 下） |
 |---|---|
-| 不需要模型 | `fp4_decode_check` `fp8_decode_check` `fp8_encode_check` `qsa_decode_check` `qsa_fp4_check` `qsa_fp8_check` `qsa_prefill_check` `ds_sparse_mla_check` `ds_fp8_soft_check` `hc_mix_check` `ple_blocks_check` `swiglu_oai_check` `spec_truncate_check` `glm_indexer_torch_check` `draft_bf16_check` `draft_lmhead_fp8_check` `ds_mxfp8_rows_check` `fp8_weights_check` `elastic_check` `elastic_need_check` `elastic_release_check` `elastic_chunk_check` `tables_check` `table_lookup_check` `ds_wo_a_check` `ds_w8a16_check` `direct_load_check` `pool_wrap_check` `prefill_errors_check` `startup_checks_check` |
+| 不需要模型 | `fp4_decode_check` `fp8_decode_check` `fp8_encode_check` `qsa_decode_check` `qsa_fp4_check` `qsa_fp8_check` `qsa_prefill_check` `ds_sparse_mla_check` `ds_fp8_soft_check` `hc_mix_check` `ple_blocks_check` `swiglu_oai_check` `spec_truncate_check` `glm_indexer_torch_check` `draft_bf16_check` `draft_lmhead_fp8_check` `ds_mxfp8_rows_check` `fp8_weights_check` `elastic_check` `elastic_need_check` `elastic_release_check` `elastic_chunk_check` `elastic_critical_check` `tables_check` `table_lookup_check` `ds_wo_a_check` `ds_w8a16_check` `direct_load_check` `pool_wrap_check` `prefill_errors_check` `startup_checks_check` |
 | 每个模型（`--preset ds41_1017`、`glm53`、`qwen38`） | `formats_check`；`mailbox_check --threads N`；`cache_check --threads N --slots 64`；`hybrid_prefill_check --threads N --slots 64 --lengths 100,500,1000`；`resident_prefill_check`；`miss_gpu_check --threads N`；DeepSeek 另跑 `prefill_fp4_retry_check`（SM120 的 FP4 prefill 失败后重跑）、`prefill_cpu_share_check --threads N`（CPU 分担 prefill） |
 | CPU 模拟多卡 | `tp_check --preset glm53 --tp 2` |
 | 冷专家（往盘上写测试数据） | `cold_punch_check DIR`（再用 `XTIER_COLD_UNITS=3` 跑一次）；`cold_sole_copy_check DIR`；`cold_passes_check DIR1 DIR2`；`cold_prefill_check --store DIR1 DIR2` |
@@ -42,7 +42,7 @@ CPU 引擎改了的话，再用线程检查（TSan）和内存检查（ASan、UB
 
 | 测试 | 命令 | 通过标准 |
 |---|---|---|
-| 照抄，单路和两路 | `bench/copy_test.py --port P --model M --chunks 8 --concurrency 1`（再跑 `2`；Qwen 加 `--ignore-first-indent`） | 0 错。温度 0 偶尔翻 1 个 token（[原因](faq.md#温度-0两次输出不完全一样)），有错要重复多次，和上个版本比出错率 |
+| 照抄，单路和两路 | `bench/copy_test.py --port P --model M --chunks 8 --concurrency 1`（再跑 `2`，DeepSeek 再跑 `4`；Qwen 加 `--ignore-first-indent`） | 0 错。温度 0 偶尔翻 1 个 token（[原因](faq.md#温度-0两次输出不完全一样)），有错要重复多次，和上个版本比出错率 |
 | 精度 | `bench/ppl_eval.py --port P --tokenizer T --segments 6 --tokens 4096` | NLL 和上个版本的差在两次启动之间的波动内（约 0.01） |
 | 长上下文 | `bench/context_speed.py --port P --model M --tokenizer T --contexts 65536,65536,520000 --output 1024` | 不 OOM，速度和上个版本接近 |
 | 真实使用 | dsh 连续 15 分钟（填上下文、召回、写代码） | 请求全部成功，召回正确 |
