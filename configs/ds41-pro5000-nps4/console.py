@@ -54,6 +54,12 @@ MODEL = {
          'unavailable': lambda: {} if all(Path(p).is_dir() for p in COLD_PATHS)
          else {c: '本机没有冷专家盘目录' for c in ('10', '20', '30')}},
         miss_option([{'cold': c} for c in ('10', '20', '30')]),   # not on layers with cold experts
+        # XTIER_PREFILL_CPU_SHARE (xtier/backend/prefill.py), 2026-11-11: the cold prefill of a 128K prompt +3% at 48K
+        # chunks, of 64K / 520K prompts +10% / +7% at 22K chunks; not on layers with cold experts
+        {'key': 'cpushare', 'label': 'CPU 分担 prefill', 'default': 'off', 'choices': [['off', '关'], ['on', '开']],
+         'hint': '读长提示时 CPU 是空的：路由少的专家块不传上显卡，交给 CPU 同时算。48K 分块下冷 prefill 约快 3%，22K 分块下快 7–10%'
+                 '（11-11 实测），decode 不变。CPU 算的那部分用 BF16 激活（GPU 是 MXFP8），输出和关着时有微小差别',
+         'off_when': [{'packs': 'off'}, *[{'cold': c} for c in ('10', '20', '30')]]},
         # 2026-11-11 at 48K chunks, a 227K-token cold prompt beside a decoding request (158 tok/s alone), 72 steps
         # measured: the decoding request keeps 20% of its speed and waits 7.4 s at the longest, the prompt's first
         # token comes after 44.5 s against 37.4 s alone (484K tokens: 96.0 against 74.3 s). 48 steps (the default of
@@ -100,7 +106,14 @@ def build(o, port):
         env.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(COLD_PATHS), XTIER_COLD_FRACTION=f"0.{o['cold']}")
     else:
         env.update(miss_env(o))
+    if cpu_share(o):
+        env['XTIER_PREFILL_CPU_SHARE'] = '1'
     return env, [str(HERE / 'run-ds-xtier.sh'), *interleave_args(o)]
+
+
+def cpu_share(o):
+    """The CPU's share of a prefill is on: with the packs, without cold experts."""
+    return o['packs'] == 'on' and o['cold'] == 'off' and o.get('cpushare', 'off') == 'on'
 
 
 def tags(o):
@@ -112,4 +125,6 @@ def tags(o):
         out.append(f"冷专家 {o['cold']}%")
     elif miss_env(o):
         out.append(f"未命中 {o['missgpu']}% GPU 代算")
+    if cpu_share(o):
+        out.append('CPU 分担 prefill')
     return out + interleave_tags(o)

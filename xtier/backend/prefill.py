@@ -8,8 +8,10 @@ returning to attention. Retaining the workspace is an explicit experimental opt-
 """
 import ctypes as C
 import gc
+import logging
 import os
 import threading
+import time
 import weakref
 import torch
 import triton as tr
@@ -185,6 +187,11 @@ _slots = None      # packed staging slots, each [w13, w2, s13, s2] for one exper
 _unpacked = None   # BF16 weights of the chunk being computed (XTIER_PREFILL_UNPACK=1)
 _pending = None    # (plan, upload-done event, slot) of a cross-layer prefetch
 _copy_stream = None
+_share_host = {}   # XTIER_PREFILL_CPU_SHARE: (hidden, top-k) -> pinned host buffers of the CPU part
+_share_cost = {}   # (hidden, intermediate, experts per chunk) -> the measured costs its split balances
+_share_worker = None   # the thread of the last CPU part (joined before the next one: a call that raised left it running)
+_share_seen = dict(calls=0, chunks=0, skipped=0, cpu_chunks=0, routes=0, cpu_routes=0, gpu_s=0.0, cpu_s=0.0, logged=0.0)
+logger = logging.getLogger(__name__)
 _last_plan = None
 _unpack_stream = None  # XTIER_PREFILL_OVERLAP: FP4->BF16 unpack stream
 _unpacked2 = None      # XTIER_PREFILL_OVERLAP: two alternating BF16 weight buffers
@@ -262,6 +269,36 @@ def _shard_layout(H, I, nodes=4, group=16):
     IN, HN = I // nodes, H // nodes
     return [(0, 0, IN, 2 * I, H // 2), (0, I, IN, 2 * I, H // 2), (2, 0, IN, 2 * I, H // group),
             (2, I, IN, 2 * I, H // group), (1, 0, HN, H, I // 2), (3, 0, HN, H, I // group)]
+
+
+def cpu_share():
+    """XTIER_PREFILL_CPU_SHARE=1 (off by default; the FP4 prefill path, _run_fp4): a prefill call uploads only the expert
+    chunks that pay and the CPU engine, idle during a prefill, computes the others at the same time. A chunk's upload
+    costs the same whether one token or five thousand route into it (DeepSeek V4.1: 8 experts, 150 MB, about 2.9 ms on
+    PCIe 5.0 x16), and a 22K-token call spreads unevenly: a fifth of the experts get no token, half of them 2% of the
+    routes (2026-11-10, recorded prefill routes). Chunks without a token are not uploaded; the chunks with the fewest
+    tokens go to the CPU until its predicted time reaches the GPU's (XTIER_PREFILL_CPU_SHARE_TARGET x it, default 1), both
+    from costs measured call by call. The CPU's experts take BF16 activations where the GPU's take MXFP8: the output
+    is not bitwise the GPU-only one. Not on layers with cold experts.
+
+    Measured on DeepSeek V4.1 (2026-11-11, docs/reports/2026-11-11-prefill-chunk.md): cold prefill +7-10% at 22K-token
+    prefill chunks (4 in 10 expert chunks not uploaded, 6% of the routes on the CPU), +3% at 48K-token chunks, nothing
+    at 64K. The CPU computes a route about 15 times slower than the GPU, so the gain is the uploads left out, and a
+    larger chunk routes more tokens to every expert: less is left for the CPU."""
+    return os.environ.get('XTIER_PREFILL_CPU_SHARE', '0') == '1'
+
+
+def _share_buffers(H, k, n):
+    """Pinned host memory for n rows of the CPU part (x, ids, weights in; FP32 out), kept between calls."""
+    b = _share_host.get((H, k))
+    if b is None or b['cap'] < n:
+        cap = -(-max(n, 4096) // 4096) * 4096
+        b = _share_host[(H, k)] = dict(
+            cap=cap, x=torch.empty((cap, H), dtype=torch.bfloat16, pin_memory=True),
+            ids=torch.empty((cap, k), dtype=torch.int32, pin_memory=True),
+            w=torch.empty((cap, k), dtype=torch.float32, pin_memory=True),
+            out=torch.empty((cap, H), dtype=torch.float32, pin_memory=True))
+    return b
 
 
 class Prefill:
@@ -732,6 +769,106 @@ class Prefill:
             for t in (1, 3):
                 slot[t][i].copy_(a[t][r], non_blocking=True)
 
+    def _share_plan(self, tokens, issued, skip):
+        """XTIER_PREFILL_CPU_SHARE: split this call's expert chunks by its routes. tokens[j]: the tokens routed into
+        chunk j; issued: the chunks whose upload has started (they stay on the GPU). Adds to `skip` the chunks that
+        are not uploaded and returns the ones among them the CPU computes (the others have no token)."""
+        key = (self.hidden, self.inter, self.chunk)
+        cost = _share_cost.get(key)
+        if cost is None:   # PCIe 5.0 x16; refined from the calls
+            per_expert = 3 * self.hidden * self.inter * 9 // 16
+            up = self.chunk * per_expert / 52e9 * 1e3
+            cost = _share_cost[key] = dict(up_ms=up, up0=up, gpu_us=0.25, cpu_us=12.0)
+        target = float(os.environ.get('XTIER_PREFILL_CPU_SHARE_TARGET', '1') or 1)
+        # The GPU part of a call is as long as the uploads it still has to wait for: the chunks issued before the
+        # routes were known (the slot ring, the previous layer's prefetch) arrive while the attention computes, the
+        # others one after the other on the copy engine during the call (2026-11-10, DeepSeek V4.1: 36 of 48 chunks,
+        # 94 ms of a layer's 219). Its arithmetic over the uploaded experts only bounds it from below.
+        free = sorted((int(c), j) for j, c in enumerate(tokens) if j not in issued)
+        waits = len(free)
+        gpu_routes = sum(int(c) for c in tokens)
+        cpu, mine = 0.0, []
+        for count, j in free:
+            if count == 0:
+                skip.add(j)
+                waits -= 1
+                continue
+            c_ms = cost['cpu_us'] * 1e-3 * count
+            g_ms = max(cost['up_ms'] * (waits - 1), cost['gpu_us'] * 1e-3 * (gpu_routes - count))
+            if cpu + c_ms > target * g_ms:
+                break   # the chunks after it hold more tokens each
+            cpu, waits, gpu_routes = cpu + c_ms, waits - 1, gpu_routes - count
+            mine.append(j)
+            skip.add(j)
+        return mine
+
+    def _share_start(self, mine, chunk_of, x_t, ids_t, w_t, k, n_chunks):
+        """The CPU part of a call: the rows with a route into the chunks `mine`, staged in pinned host memory, and the
+        engine on them in a thread (routes into other chunks get id -1). Returns (thread, rows, n, buffers, result)."""
+        global _share_worker
+        H = self.hidden
+        mask = torch.zeros(n_chunks + 1, dtype=torch.bool, device='cuda')
+        mask[torch.tensor(mine, dtype=torch.long, device='cuda')] = True
+        routes = mask[chunk_of]
+        rows = routes.any(1).nonzero().squeeze(1)
+        # by expert: the engine reads an expert's weights once for up to 8 of a call's tokens, and a rarely used
+        # expert's tokens lie far apart in the prompt (in prompt order: 13 us a route, three tokens a read)
+        first = torch.where(routes, ids_t, self.experts).index_select(0, rows).min(1).values
+        rows = rows[torch.argsort(first, stable=True)]
+        n = int(rows.numel())
+        buf = _share_buffers(H, k, n)
+        buf['x'][:n].copy_(x_t.index_select(0, rows), non_blocking=True)
+        buf['ids'][:n].copy_(torch.where(routes, ids_t, -1).index_select(0, rows), non_blocking=True)
+        buf['w'][:n].copy_(torch.where(routes, w_t, 0.0).index_select(0, rows), non_blocking=True)
+        staged = torch.cuda.Event()
+        staged.record()
+        result = dict(routes=int(routes.sum()))
+        forward, batch = self.native.forward, 2048   # the engine's largest call
+
+        def work():
+            try:
+                staged.synchronize()
+                t0 = time.perf_counter()
+                for s in range(0, n, batch):
+                    forward(min(batch, n - s), k, buf['x'].data_ptr() + s * H * 2, buf['ids'].data_ptr() + s * k * 4,
+                            buf['w'].data_ptr() + s * k * 4, buf['out'].data_ptr() + s * H * 4)
+                result['s'] = time.perf_counter() - t0
+            except BaseException as e:   # re-raised by the caller after the join
+                result['error'] = e
+
+        worker = _share_worker = threading.Thread(target=work, name='xtier-prefill-cpu')
+        worker.start()
+        return worker, rows, n, buf, result
+
+    def _share_learn(self, tokens, skip, mine, waits, gpu_s, result):
+        """The costs of the next split from this call's times (waits: the chunks uploaded during the call); a log
+        line now and then."""
+        cost = _share_cost[(self.hidden, self.inter, self.chunk)]
+        if waits >= 4:   # the upload time of a chunk, within a factor of four of the link's
+            up = min(max(gpu_s * 1e3 / waits, 0.25 * cost['up0']), 4 * cost['up0'])
+            cost['up_ms'] = 0.8 * cost['up_ms'] + 0.2 * up
+        cpu_routes = sum(int(tokens[j]) for j in mine)
+        if mine and cpu_routes >= 64 and 's' in result:
+            per = result['s'] * 1e6 / cpu_routes
+            cost['cpu_us'] = 0.8 * cost['cpu_us'] + 0.2 * min(max(per, 0.25 * cost['cpu_us']), 4 * cost['cpu_us'])
+        s = _share_seen
+        s['calls'] += 1
+        s['chunks'] += len(tokens)
+        s['skipped'] += len(skip)
+        s['cpu_chunks'] += len(mine)
+        s['routes'] += sum(int(c) for c in tokens)
+        s['cpu_routes'] += cpu_routes
+        s['gpu_s'] += gpu_s
+        s['cpu_s'] += result.get('s', 0.0)
+        if time.monotonic() - s['logged'] > 30 and s['calls'] >= 20:
+            s['logged'] = time.monotonic()
+            logger.info('xtier prefill CPU share: %d calls, %.0f%% of the expert chunks not uploaded (%.0f%% on the CPU '
+                        'with %.1f%% of the routes), GPU part %.0f ms / CPU part %.0f ms a call; costs: upload %.2f ms a '
+                        'chunk, CPU %.1f us a route', s['calls'], 100 * s['skipped'] / s['chunks'],
+                        100 * s['cpu_chunks'] / s['chunks'], 100 * s['cpu_routes'] / max(s['routes'], 1),
+                        1e3 * s['gpu_s'] / s['calls'], 1e3 * s['cpu_s'] / s['calls'], cost['up_ms'], cost['cpu_us'])
+            s.update(calls=0, chunks=0, skipped=0, cpu_chunks=0, routes=0, cpu_routes=0, gpu_s=0.0, cpu_s=0.0)
+
     def _run_fp4(self, x, out, ids, routing, m, k, stream):
         """XTIER_PREFILL_FP4=1 (MXFP4 layers): the experts on the SM120 FP4 tensor cores through
         FlashInfer's CUTLASS fused MoE (MXFP4 weights x MXFP8 activations, block-32 UE8M0, the
@@ -797,6 +934,9 @@ class Prefill:
             freed = [None] * n_slots  # event on the compute stream: slot no longer read
             state = dict(next=0, cross=0)
             issued = set(ready)  # chunks of this layer already uploaded (computed ones leave `ready`)
+            skip = set()         # XTIER_PREFILL_CPU_SHARE: chunks this call does not upload (filled after the rendezvous)
+            if _share_worker is not None and _share_worker.is_alive():   # of a call that raised: its buffers, the engine
+                _share_worker.join()
 
             def upload(j, slot):
                 if freed[slot] is None:
@@ -809,7 +949,7 @@ class Prefill:
                 self.chunk_uploads += 1
 
             def refill(slot):
-                while state['next'] < n_chunks and state['next'] in issued:
+                while state['next'] < n_chunks and (state['next'] in issued or state['next'] in skip):
                     state['next'] += 1
                 if state['next'] < n_chunks:
                     upload(state['next'], slot); state['next'] += 1
@@ -855,6 +995,12 @@ class Prefill:
             for c in host[:n_chunks]:
                 offsets.append(offsets[-1] + int(c))
             self.chunks_skipped += sum(1 for c in host[:n_chunks] if c == 0)
+            share = None
+            if cpu_share() and self.cold is None and self.native is not None and n_chunks > 1:
+                waits = n_chunks - len(issued)   # before the split: the chunks whose upload has not started
+                mine = self._share_plan(host[:n_chunks], issued, skip)
+                share = (self._share_start(mine, chunk_of, x_t, ids_t, w_t, k, n_chunks) if mine else None, mine,
+                         waits - len(skip), time.perf_counter())
             acc = torch.zeros((m, H), dtype=torch.float32, device='cuda')
             ones = torch.ones(CH, dtype=torch.float32, device='cuda')
             limit = (torch.full((CH,), self.swiglu_limit, dtype=torch.float32, device='cuda')
@@ -870,6 +1016,8 @@ class Prefill:
             workspace = torch.empty(self._fp4_ws_bytes, dtype=torch.uint8, device='cuda')
             calls = []
             for j in range(n_chunks):
+                if j in skip:
+                    continue
                 for a in range(offsets[j], offsets[j + 1], cap):
                     calls.append((j, a, min(a + cap, offsets[j + 1])))
             self.fp4_calls = getattr(self, 'fp4_calls', 0) + len(calls)
@@ -877,6 +1025,8 @@ class Prefill:
             for j, a, b in calls:
                 by_chunk.setdefault(j, []).append((a, b))
             for j in range(n_chunks):
+                if j in skip:
+                    continue
                 slot, done = ready.pop(j)
                 compute.wait_event(done)
                 for r0, r1 in by_chunk.get(j, []):
@@ -900,6 +1050,18 @@ class Prefill:
                     acc.index_add_(0, rows, part.float())
                 ev = torch.cuda.Event(); ev.record(compute); freed[slot] = ev
                 refill(slot)
+            if share is not None:
+                started, mine, waits, t0 = share
+                compute.synchronize()
+                gpu_s = time.perf_counter() - t0
+                result = {}
+                if started is not None:   # the CPU part: its rows' FP32 outputs add to the GPU's
+                    worker, rows_c, n_c, buf, result = started
+                    worker.join()
+                    if 'error' in result:
+                        raise result['error']
+                    acc.index_add_(0, rows_c, buf['out'][:n_c].to('cuda', non_blocking=True))
+                self._share_learn(host[:n_chunks], skip, mine, waits, gpu_s, result)
             _emit[(m, tr.cdiv(H, 256))](acc, Pointer(out, torch.bfloat16), 256, H)
             if cross:
                 cross.sort(key=lambda t: t[0])
