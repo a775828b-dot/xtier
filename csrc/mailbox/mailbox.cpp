@@ -30,7 +30,7 @@
 #include <vector>
 
 namespace {
-constexpr int MAX_SLOT_M=8; // decode tokens per slot (DSpark verify uses 6)
+constexpr int MAX_SLOT_M=16; // decode tokens per slot (DSpark verifies 6 a request: two requests in one slot)
 thread_local std::string error;
 // XTIER_ROUTE_TRACE=<file> (research, default off): the dispatcher thread appends one record per CPU
 // decode call: TraceHead (realtime ns at start, wall/gate/down ns, layer = bridge creation order, m, k,
@@ -366,7 +366,8 @@ PoolManager &pool_manager(){static PoolManager *m=new PoolManager();return *m;}
 // a flag; the part joins the CPU output before the mailbox answer. The GPUs hold different experts: the first GPU's
 // policy leaves this one's experts alone, and this one's evicts first what the first has taken before.
 // Calls are serial (one dispatcher), so one control block serves every layer. The residency table lives on the host.
-struct G2Control {int32_t rslot[128],list[128],expert[128];float routing[128];};   // then x: BF16 [8, H]
+struct G2Control {int32_t rslot[128],list[128],expert[128];float routing[128];};   // then x: BF16 [MAX_SLOT_M, H]
+// (cache/second.py stages 8 rows of it: with the second GPU backend/method.py keeps the slots at 8 tokens)
 static_assert(sizeof(G2Control)==2048,"cache/second.py CONTROL");
 struct G2Layer {
     PoolLayer *L=nullptr;

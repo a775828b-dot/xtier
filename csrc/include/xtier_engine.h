@@ -60,7 +60,7 @@ int xtier_cold_attach(void *plan,void *store,const int32_t *files,const long lon
 int xtier_slot_pin(void *plan,int expert);
 void xtier_slot_unpin(void *plan,int slot);
 // out[7]: forwards, experts read from NVMe, seconds the forwards waited for reads; the same for the forwards of at
-// most 8 tokens (decode steps); experts not in RAM XTIER_TAIL_SKIP left out (reads saved, once a forward).
+// most 16 tokens (decode calls); experts not in RAM XTIER_TAIL_SKIP left out (reads saved, once a forward).
 void xtier_cold_plan_stats(void *plan,double *out);
 // table[0..experts): the slot of every expert, -1 if in none. Returns the slot count, or -1 (-3: a forward in progress).
 int xtier_slot_table(void *plan,int32_t *table);

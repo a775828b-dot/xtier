@@ -10,7 +10,8 @@ leaves the expert tensors alone and the shards are read from the checkpoint file
 layer whose cold-store records match the checkpoint fills its RAM slots from the store.
 
 Forward, per call of m tokens:
-- m <= XTIER_DECODE_MAX (and always inside CUDA-graph capture): through the mailbox, in slots of up to 8 tokens.
+- m <= XTIER_DECODE_MAX (and always inside CUDA-graph capture): through the mailbox, in slots of up to 16 tokens
+  (slot_width: XTIER_SLOT_TOKENS, within the 128 routes a slot holds), so the requests of a decode step share calls.
   A packing kernel stores the inputs into the slot's mapped pinned memory, stream memory operations hand the request
   to the CPU dispatcher and wait for it, an unpacking kernel reads the FP32 output. Capturable, no host sync.
   With token flags (active_flags) a caller can drop tokens of these calls: their routes become -1 in the packing.
@@ -27,6 +28,7 @@ input dtype.
 """
 
 import dataclasses
+import functools
 import logging
 import os
 import threading
@@ -42,9 +44,23 @@ from xtier.cache import tail
 from xtier.engine import CpuPlan, Mailbox, placement
 
 logger = logging.getLogger(__name__)
-SLOT_TOKENS = 8      # tokens per mailbox slot (engine DECODE_M)
+SLOT_TOKENS = 16     # tokens per mailbox slot at the most (engine DECODE_M, mailbox MAX_SLOT_M, cache/pool.py MAX_M)
+SLOT_ROUTES = 128    # routes (tokens x top-k) per slot: the width of the packing kernels (kernels.pack, cache/pool.py)
 MAX_TOP_K = 10
 DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured graphs keep its address)
+
+
+@functools.lru_cache
+def slot_width(k):
+    """Tokens of one decode call of top-k k: XTIER_SLOT_TOKENS (16 by default), within the routes a slot holds (16
+    tokens up to top-8, 12 at top-10). Until 2026-11-12 a call held 8: two requests' 12 DSpark verify rows were calls of
+    8 and 4, and an expert both requests routed to was computed in each (DeepSeek V4.1, RTX PRO 5000: a step of two
+    requests 45.3 -> 42.0 ms, of four 81.2 -> 75.7 ms, one request unchanged; docs/reports/2026-11-12-ds-four-requests.md).
+    With the second GPU's pool 8, as measured there: cache/second.py stages 8 rows a call."""
+    width = min(config.slot_tokens(), SLOT_TOKENS, SLOT_ROUTES // k)
+    if os.environ.get('XTIER_GPU2_SLOTS', '') not in ('', '0'):
+        width = min(width, 8)
+    return max(1, width)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -250,10 +266,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
         else:
             prefill_cold = cold.attach(self.plan, lp, inputs, self.format.name) if lp else None
         if lp is not None:   # a mailbox call (decode) reads the experts it misses all at once, it cannot go in passes
-            need = min(self.experts, SLOT_TOKENS * (getattr(layer, 'top_k', None) or MAX_TOP_K))
+            top_k = getattr(layer, 'top_k', None) or MAX_TOP_K
+            need = min(self.experts, slot_width(top_k) * top_k)
             if self.plan.slots < need:
                 raise RuntimeError(f'xtier cold: layer {self.cfg.layer_id} keeps {self.plan.slots} experts in RAM, a '
-                                   f'decode call of {SLOT_TOKENS} tokens can route to {need}: lower XTIER_COLD_FRACTION')
+                                   f'decode call of {slot_width(top_k)} tokens can route to {need}: lower XTIER_COLD_FRACTION')
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
@@ -386,8 +403,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
             out = XTierMoEMethod._decode_out[H] = torch.empty((DECODE_ROWS, H), dtype=torch.float32, device=x.device)
         stream = torch.cuda.current_stream().cuda_stream
         active = XTierMoEMethod._active
-        for start in range(0, m, SLOT_TOKENS):
-            n = min(SLOT_TOKENS, m - start)
+        width = slot_width(k)
+        for start in range(0, m, width):
+            n = min(width, m - start)
             xs, ids_s, ws = x.data_ptr() + start * H * 2, ids.data_ptr() + start * k * 4, weights.data_ptr() + start * k * 4
             act = active.data_ptr() + start * 4 if active is not None else 0
             if self.pool is not None:

@@ -54,10 +54,10 @@ from xtier.arch import HW_FP4, e2m1_f16, e4m3_f32
 from xtier.backend.kernels import Pointer
 
 logger = logging.getLogger(__name__)
-MAX_M = 16             # token tile of the GPU kernels (decode slots hold <= 8 tokens)
+MAX_M = 16             # token tile of the GPU kernels = the tokens of a decode slot at the most
 MAX_LAYERS = 128       # rows of the global residency table
 RING = 4096            # command ring entries (csrc/mailbox POOL_RING)
-MAX_ROUTES = 128       # m*k per call (8 tokens x top-k <= 10)
+MAX_ROUTES = 128       # m*k per call (16 tokens up to top-8, 12 at top-10: backend/method.py slot_width)
 MISS_CHUNK = 8192      # words (8 bytes) per program of _miss_copy
 BLOCK = 1024
 CONFIG = dict(gbn=32, dbn=64, bk=256, gw=4, gs=2, dw=4, ds=2)
@@ -315,12 +315,12 @@ def _scratch(H, I, dev):
         _shared[key] = dict(
             mid=torch.empty((MAX_ROUTES, MAX_M, I), dtype=torch.bfloat16, device=dev),
             part=torch.empty((MAX_ROUTES, MAX_M, H), dtype=torch.float32, device=dev),
-            gout=torch.empty((8, H), dtype=torch.float32, device=dev),
+            gout=torch.empty((MAX_M, H), dtype=torch.float32, device=dev),
             rslot=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             slot_list=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             slot_exp=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             # staging of the GPU-only path (full residency): written by _pack, never read
-            sx=torch.empty((8, H), dtype=torch.int16, device=dev),
+            sx=torch.empty((MAX_M, H), dtype=torch.int16, device=dev),
             sids=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             sroute=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             sorig=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
@@ -544,7 +544,7 @@ class LayerPool:
     def _route(self, m, k, x, ids, routing, act, staging):
         H, sc = self.H, self.scratch
         nk = m * k
-        if nk > MAX_ROUTES or m > 8:
+        if nk > MAX_ROUTES or m > MAX_M:
             raise ValueError('xtier cache: decode slot too large')
         sx, sids, sroute, sorig = staging
         S = max(self.S, 1)
@@ -563,7 +563,7 @@ class LayerPool:
             triton.next_power_of_2(S), BLOCK)
 
     def decode(self, stream, m, k, x, ids, routing, out, act=0):
-        """One decode call of up to 8 tokens on the current stream (device addresses; out: FP32 [m, H])."""
+        """One decode call of up to MAX_M tokens on the current stream (device addresses; out: FP32 [m, H])."""
         sc = self.scratch
         if self.full:   # every expert on the GPU: no CPU part
             self._route(m, k, x, ids, routing, act, (sc['sx'].data_ptr(), sc['sids'].data_ptr(),

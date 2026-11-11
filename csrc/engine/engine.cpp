@@ -3,7 +3,7 @@
 // intermediate size I (both multiples of 64), 10..512 experts, top-k<=10, optional
 // SwiGLU clamp limit, set per plan at creation. Qwen3.8 (2560/640), DeepSeek V4.1
 // (5120/2304) and GLM-5.3 (4096/2048) shapes are template-specialised from the same code;
-// other shapes use the runtime instantiation. Decode uses <=8 tokens; synchronous prefill groups up to 2048.
+// other shapes use the runtime instantiation. Decode calls hold <=16 tokens (DECODE_M); synchronous prefill groups up to 2048.
 // BF16 input; FP32 SiLU, intermediate, down projection, accumulation and output.
 // Kernels: AVX512 BF16 (+VBMI) when compiled for it, else AVX2/FMA (Zen2 and other hosts
 // without AVX512). CMake builds this file once per ISA (XTIER_IMPL_PREFIX set, one library each)
@@ -83,7 +83,7 @@ namespace {
 #endif
 static_assert(XTIER_DOWN_R4==1||XTIER_DOWN_R4==2||XTIER_DOWN_R4==4,"XTIER_DOWN_R4 must be 1, 2 or 4");
 constexpr int MAX_M=XTIER_PREFILL_MICRO_TOKENS,MAX_K=10,MAX_BATCH=2048,MAX_EXPERTS=512,
-              MAX_ROUTES=MAX_EXPERTS+(MAX_BATCH*MAX_K+MAX_M-1)/MAX_M,MAX_NODES=16,DECODE_M=8;
+              MAX_ROUTES=MAX_EXPERTS+(MAX_BATCH*MAX_K+MAX_M-1)/MAX_M,MAX_NODES=16,DECODE_M=16;
 static_assert(MAX_M==4||MAX_M==8,"XTIER_PREFILL_MICRO_TOKENS must be 4 or 8");
 constexpr float fp4[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};
 constexpr uint16_t tobf(float v) { uint32_t u=__builtin_bit_cast(uint32_t,v);u+=0x7fff+((u>>16)&1);return uint16_t(u>>16); }
@@ -643,7 +643,7 @@ template<bool MX> class Plan: public PlanBase {
     double cold_log=0;                       // log of the per-forward decay
     long long cold_forwards=0,cold_loads=0;
     double cold_seconds=0;
-    long long cold_small_forwards=0,cold_small_loads=0;   // the forwards of at most 8 tokens (decode steps)
+    long long cold_small_forwards=0,cold_small_loads=0;   // the forwards of at most DECODE_M tokens (decode calls)
     double cold_small_seconds=0;
     std::mutex resident_lock;
     int nodes=4;
@@ -1324,7 +1324,7 @@ public:
     // started: returns their ticket (finish_reads); else returns nullptr once they landed.
     void *ensure_resident(int tokens,int k,const int32_t *ids) {
         const long long now=++cold_forwards;
-        if(tokens<=8)cold_small_forwards++;
+        if(tokens<=DECODE_M)cold_small_forwards++;
         cold_used.clear();
         for(int j=0;j<tokens*k;j++) {
             const int e=ids[j];
@@ -1415,7 +1415,7 @@ public:
         }
         const double spent=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
         cold_loads+=(long long)cold_miss.size();cold_seconds+=spent;
-        if(tokens<=8){cold_small_loads+=(long long)cold_miss.size();cold_small_seconds+=spent;}
+        if(tokens<=DECODE_M){cold_small_loads+=(long long)cold_miss.size();cold_small_seconds+=spent;}
     }
     int attach_cold(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,const float *scores,
                     float half_life) override {
@@ -1451,7 +1451,7 @@ public:
         std::lock_guard<std::mutex> g(resident_lock);
         if(slot>=0&&slot<int(pins.size())&&pins[slot]>0)pins[slot]--;
     }
-    // forwards, experts read from NVMe, seconds spent reading; the same for the forwards of at most 8 tokens; experts
+    // forwards, experts read from NVMe, seconds spent reading; the same for the forwards of at most 16 tokens; experts
     // not in RAM XTIER_TAIL_SKIP left out (reads saved, once a call)
     void cold_stats(double *out) override {
         out[0]=double(cold_forwards);out[1]=double(cold_loads);out[2]=cold_seconds;

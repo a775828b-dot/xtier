@@ -51,7 +51,7 @@ def gpu_decode(x, ids, rw, out):
 
 
 bad = 0
-for m in range(1, 9):
+for m in range(1, min(16, 128 // K) + 1):   # every size of a decode call (backend/method.py slot_width)
     x, ids, rw, ref = case(m)
     xd, idsd, rwd = x.cuda(), ids.cuda(), rw.cuda()
     out = torch.empty(m, H, device='cuda')

@@ -87,7 +87,8 @@ decode 每步读盘的大头是权重很小的路由。XTier 不限于冷专家�
 - **规则**：decode 路径上一次最多 `XTIER_TAIL_SKIP_TOKENS`（默认 8）个 token 的 CPU 调用（decode 一步、单请求的投机验证窗口、不超过
   `XTIER_DECODE_MAX` 的短 prompt）里，一个专家如果没有任何 token 把它排进前「保留」名（按该 token top-k 里的权重排，同权重按位置），就不读、
   不算：它的路由按 −1 处理（加 0），其余路由保持原来的权重，不重新归一化。在内存还是在盘上都一样；GPU 上的热专家照算（权重仍参与排名），
-  prefill 不跳，DSpark 草稿模型的层（top-3）不动。
+  prefill 不跳，DSpark 草稿模型的层（top-3）不动。2026-11-12 起几个请求的验证行合在一次调用里（两个请求 12 个 token），超过默认的
+  8 个，这时不跳；要跳把 `XTIER_TAIL_SKIP_TOKENS` 设成 16。
 - **实现**：`csrc/engine/engine.cpp` 的 `tail_skip`，只在 `xtier_forward_decode`（mailbox 调用）里、换入冷专家之前改路由。计数用
   `xtier_tail_stats`，日志（`XTIER_CACHE_LOG=N` 时每 N 步）一行 `[xtier] tail skip K/N: ... CPU experts per layer call left out`；冷统计第 7 项是
   省下的读盘数（`xtier cold: last 60 s` 那一行末尾的 `tail skip saved`）。

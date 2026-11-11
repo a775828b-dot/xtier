@@ -110,9 +110,9 @@ int main(int argc, char **argv) {
   }
 
   // the calls, and A's answers to them before the threads start
-  const int shapes[] = {1, 2, 4, 6, 8, 8, 6, 37, 256};
+  const int shapes[] = {1, 2, 4, 6, 8, 12, 16, 6, 37, 256};
   std::vector<Call> calls;
-  for (int i = 0; i < iterations; i++) calls.push_back(make(g, shapes[i % 9]));
+  for (int i = 0; i < iterations; i++) calls.push_back(make(g, shapes[i % 10]));
   std::vector<std::vector<float>> want(calls.size());
   for (size_t i = 0; i < calls.size(); i++) {
     auto &c = calls[i];
@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < calls.size(); i++) {
       auto &c = calls[i];
       y.assign(size_t(c.m) * H, 0.f);
-      const int rc = c.m <= 8 ? xtier_forward_decode(A, c.m, K, c.x.data(), c.ids.data(), c.rw.data(), y.data())
+      const int rc = c.m <= 16 ? xtier_forward_decode(A, c.m, K, c.x.data(), c.ids.data(), c.rw.data(), y.data())
                               : xtier_forward(A, c.m, K, c.x.data(), c.ids.data(), c.rw.data(), y.data());
       CHECK(rc >= 0, "A forward %zu again: %s", i, xtier_last_error());
       CHECK(!std::memcmp(y.data(), want[i].data(), y.size() * 4), "A call %zu: not the same bits twice", i);
@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
       y.assign(size_t(c.m) * H, 0.f);
       int rc = -1;
       if (c.m * K > slots - 2) continue;   // more experts than RAM slots: Python splits such calls (CpuPlan.forward)
-      rc = c.m <= 8 ? xtier_forward_decode(B, c.m, K, c.x.data(), c.ids.data(), c.rw.data(), y.data())
+      rc = c.m <= 16 ? xtier_forward_decode(B, c.m, K, c.x.data(), c.ids.data(), c.rw.data(), y.data())
                     : xtier_forward(B, c.m, K, c.x.data(), c.ids.data(), c.rw.data(), y.data());
       CHECK(rc >= 0, "B forward %zu (m %d): %s", i, c.m, xtier_last_error());
       if (rc < 0) continue;

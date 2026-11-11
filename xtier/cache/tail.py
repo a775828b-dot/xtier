@@ -3,7 +3,8 @@
 every expert the CPU computes, in RAM or on NVMe. N is the model's top-k (checked at the first call of every layer);
 the draft model's layers (DSpark's: top-3) keep every route.
 A decode-path CPU call (xtier_forward_decode: a decode step, a speculative verify window, a prompt of at most
-XTIER_DECODE_MAX tokens; at most XTIER_TAIL_SKIP_TOKENS tokens, 8, one mailbox slot) neither reads nor computes an
+XTIER_DECODE_MAX tokens; at most XTIER_TAIL_SKIP_TOKENS tokens, 8: a call that holds two requests' verify rows, 12
+tokens, is above it and leaves out nothing unless the setting is raised) neither reads nor computes an
 expert that no token of the call has among its K largest routes (by weight within the token's top-N): its routes add
 nothing, the other routes keep their weights (no renormalisation). The experts in the layer's GPU cache are computed on
 the GPU, all of them. Larger calls (prefill) leave out nothing. csrc/engine/engine.cpp tail_skip.

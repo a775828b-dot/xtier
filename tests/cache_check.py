@@ -71,7 +71,7 @@ def rel(a, b):
 
 bad = 0
 none.fill([E - 1], stream)
-for m in range(1, 9):
+for m in range(1, min(16, 128 // K) + 1):   # every size of a decode call (backend/method.py slot_width)
     row = [f'm={m}']
     for name, pool in (('partial', partial), ('full', full), ('cpu-only', none)):
         x, ids, rw, ref = case(m, avoid=E - 1 if pool is none else None)

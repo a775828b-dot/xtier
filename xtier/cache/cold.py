@@ -598,7 +598,7 @@ def save_ranges():
 
 
 def _start_reporter():
-    """XTIER_COLD_LOG=60: every this many seconds with new reads, a log line of what decode (forwards of at most 8
+    """XTIER_COLD_LOG=60: every this many seconds with new reads, a log line of what decode (forwards of at most 16
     tokens: misses per step), the CPU parts of prefills and the GPU prefills read from NVMe since the last line."""
     global _reporter
     every = _float('XTIER_COLD_LOG', 60)

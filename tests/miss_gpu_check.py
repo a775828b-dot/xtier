@@ -120,7 +120,7 @@ def check(share, m, x, ids, rw, act, cpu, out):
 bad = 0
 for share in [float(s) for s in A.shares.split(',')]:
     pool_mod._miss['share'] = share   # read at launch: graphs captured below keep it
-    for m in range(1, 9):
+    for m in range(1, min(16, 128 // K) + 1):   # every size of a decode call (backend/method.py slot_width)
         row = [f'share {share:g} m={m}']
         x, ids, rw, act, cpu = case(m)
         xd, idsd, rwd, actd = x.cuda(), ids.cuda(), rw.cuda(), act.cuda()

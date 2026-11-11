@@ -27,7 +27,7 @@ def _pack(X, IDS, ROUTE, ACT, SX, SIDS, SROUTE, NX: tl.constexpr, NK: tl.constex
     i = tl.program_id(0) * B + tl.arange(0, B)
     tl.store(SX + i, tl.load(X + i, i < NX), i < NX)
     if tl.program_id(0) == 0:
-        j = tl.arange(0, 128)  # m*k <= 8*10 routes
+        j = tl.arange(0, 128)  # m*k <= 128 routes (method.py SLOT_ROUTES)
         ids = tl.load(IDS + j, j < NK)
         if HAS_ACT:  # skipped tokens (method.active_flags): -1 on every route, the engine returns a zero row
             ids = tl.where(tl.load(ACT + j // K, j < NK, other=1) != 0, ids, -1)

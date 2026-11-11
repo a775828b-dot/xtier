@@ -4,7 +4,7 @@
 batches of up to 2048 tokens); with ``slots`` (cold experts, xtier/cache/cold.py) the copies hold only that many
 experts, the others are read from the ``ColdStore`` on NVMe when a forward needs them. ``Mailbox``: connects a plan to CUDA streams through mapped host buffers that GPU
 kernels fill and read and stream memory operations that hand a request to the CPU dispatcher and wait for it
-(CUDA-graph capturable; slots of up to 8 tokens), plus the expert-pool command ring.
+(CUDA-graph capturable; slots of up to 16 tokens), plus the expert-pool command ring.
 The libraries are looked up in ``xtier/engine/lib`` unless ``XTIER_ENGINE_LIB`` names another directory.
 """
 
@@ -210,7 +210,7 @@ class CpuPlan:
             raise RuntimeError(self.lib.xtier_last_error().decode())
 
     def cold_stats(self):
-        """(forwards, experts read from NVMe, seconds spent reading; the same for forwards of at most 8 tokens;
+        """(forwards, experts read from NVMe, seconds spent reading; the same for forwards of at most 16 tokens;
         experts not in RAM XTIER_TAIL_SKIP left out: reads saved)."""
         out = (C.c_double * 7)()
         self.lib.xtier_cold_plan_stats(self.plan, C.cast(out, _P))
