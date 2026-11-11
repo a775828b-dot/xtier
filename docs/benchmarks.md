@@ -1,7 +1,7 @@
 # 测速细节
 
 [README](../README.md)「测速」各表的测法、配置、精度和原始数据。单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）
-+ 384 GiB DDR5，XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测的（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s。后面的版本没有重测这些表，只有 DeepSeek 加速包那两行在 2026-11-11 重测（prefill 分块改成 48K、CPU 分担 prefill）。
++ 384 GiB DDR5，XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测的（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s。后面的版本没有重测这些表，只有 DeepSeek 加速包那两行在 2026-11-11 重测（prefill 分块改成 48K、CPU 分担 prefill、草稿的 FP8 投影走快内核）。
 
 ## 测法
 
@@ -13,10 +13,14 @@
 
 ## DeepSeek V4.1 Flash 1017
 
-- 加速包（2026-11-11 重测，启动台默认：48K 分块、每层 35 槽、弹性热专家槽、CPU 分担 prefill）对基线（2026-10 下旬测，22K 分块、
-  50 槽）：长回复每步 30.4 对 50.9 ms（快 40%），冷 prefill 64K / 500K 5,738 / 6,670 对 3,318 / 3,627（快 73% / 84%）。
+- 加速包（2026-11-11 重测，启动台默认：48K 分块、每层 35 槽、弹性热专家槽、CPU 分担 prefill、固定验证）对基线（2026-10 下旬测，
+  22K 分块、50 槽）：长回复每步 29.5 对 50.9 ms（快 42%），冷 prefill 64K / 500K 5,838 / 6,668 对 3,318 / 3,627（快 76% / 84%）。
+- 草稿和两个请求的 FP8 投影走 b12x（2026-11-11）：FP8 投影的小批量快内核原来只对 1、4、6 行开，DSpark 草稿模型的 5 行、两个请求同时的
+  10 和 12 行走 CUTLASS（125–159 µs 对 39–41 µs）。默认行数改成 1、4、5、6、10、12 以后草稿模型一遍 3.03 → 2.20 ms，固定验证两个请求
+  同时每步 52.3 → 44.0 ms。同一天改之前的两轮（变长验证）：长回复每步 30.5 / 30.3 ms；改之后变长验证 29.9 / 29.6 ms，固定验证是
+  上表的 29.6 / 29.5 ms。变长验证的成本表同时重测。一步的构成和多个请求的估算见[报告](reports/2026-11-11-decode-step.md)。
 - CPU 分担 prefill（2026-11-11，DeepSeek 启动台默认开）：读长提示时路由少的专家块不上传，交给空闲的 CPU 同时算。同一天不开时的
-  两轮：冷 prefill 64K / 500K 5,268–5,886 / 6,576–6,600，长回复每步 30.2–30.7 ms；开着是上表的 5,246–6,230 / 6,620–6,721、
+  两轮：冷 prefill 64K / 500K 5,268–5,886 / 6,576–6,600，长回复每步 30.2–30.7 ms；开着是 5,246–6,230 / 6,620–6,721、
   30.3–30.5 ms，128K 以上的会话快 1–3%。GLM、Qwen 上实测更慢，不开，见同一份[报告](reports/2026-11-11-prefill-chunk.md)。
 - prefill 分块 48K（2026-11-11，原来 22K）：每读一块，每层都要把不在热专家槽里的专家传上显卡，约 2.5 秒，和块的大小无关；块加大后
   摊给更多 token。同一天用原默认（22K、50 槽）跑的一轮：冷 prefill 64K / 500K 4,107 / 4,893，长回复每步 30.3 ms；改成 48K 后
@@ -26,10 +30,11 @@
 - 基线 的 DeepSeek 工具调用解析不逐 token 流式返回参数，工具调用请求量不出 decode（两轮 177 个请求里能计时 13 个），所以只比
   长回复。
 - 加速包精度：无损——块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型
-  验证）、wo_a 存检查点的 FP8（还原逐位一致，kernel 与 cuBLAS 只差求和顺序）、索引器走分页路径（logits 与非分页路径逐位相同，top-k
+  验证）、wo_a 存检查点的 FP8（还原逐位一致，kernel 与 cuBLAS 只差求和顺序）、FP8 投影在 b12x 和 CUTLASS 之间换内核（量化后的
+  权重和激活相同，实测输出逐位相同）、索引器走分页路径（logits 与非分页路径逐位相同，top-k
   只在同分时可能选到不同位置），PPL 3.319 → 3.317（分页索引器之前测），照抄 0 错。
 - 和生产管线（lsglang_ds4.1）的 agent 对比见[报告](reports/2026-10-24-ds-woa-minimax.md)。
-- 原始数据：加速包 `bench/results/agent-bench-ds41-cpushare-r{1,2}-20261111.json`（不开 CPU 分担：`agent-bench-ds41-chunk48k-r{1,2}-20261111.json`；22K 分块：`agent-bench-ds41-chunk22k-r1-20261111.json`、`agent-bench-ds41-elastic-r{1,2}-20261026.json`；不开弹性：`agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`），
+- 原始数据：加速包 `bench/results/agent-bench-ds41-b12xrows-r{1,2}-20261111.json`（变长验证：`agent-bench-ds41-b12xrows-compact-r{1,2}-20261111.json`；改行数之前、变长验证：`agent-bench-ds41-cpushare-r{1,2}-20261111.json`；不开 CPU 分担：`agent-bench-ds41-chunk48k-r{1,2}-20261111.json`；22K 分块：`agent-bench-ds41-chunk22k-r1-20261111.json`、`agent-bench-ds41-elastic-r{1,2}-20261026.json`；不开弹性：`agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`），
   基线 `bench/results/context-ds41-xtier-base-20261023.json`。
 
 ## Qwen3.8 Flash Next

@@ -1,0 +1,1116 @@
+{
+ "steps": 96,
+ "step_ms": 31.111420939127605,
+ "wall_ms": {
+  "moe glue (pack, unpack, combine, commit, pages)": 0.9284701213412824,
+  "mhc (hyper-connections)": 0.7745291015624975,
+  "quantize to mxfp8": 0.3299367540995286,
+  "gemm fp4/fp8 block-scaled (b12x)": 4.658117338562006,
+  "memcpy / memset": 0.0272915814717611,
+  "engram": 0.016646511416965066,
+  "moe hot experts (gate/up, down)": 10.62119414393106,
+  "torch elementwise / index / reduce": 0.5261042548285589,
+  "rmsnorm": 0.07596879492865649,
+  "attention rope / k-norm": 0.19946171739366336,
+  "attention core (sparse mla)": 1.0077231716579862,
+  "other: _einsum_kernel": 1.44266552734375,
+  "other: void sglang::mhc_post_combine_norm_decode_kernel<160, 4, fal": 0.10867384677463109,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<384u, 5120u,": 0.11534347949557772,
+  "other: void sglang::moe::route_warp::route_warp_kernel<384u, 6u, 1u": 0.035932226901583854,
+  "other: void sglang::mhc_post_combine_norm_decode_kernel<128, 5, tru": 0.11189016469319661,
+  "gemm bf16 (cutlass / cublas)": 2.2135968322753907,
+  "other: void cublasLt::splitKreduce_kernel<32, 16, int, float, float": 0.003989428202311198,
+  "other: memcpy_post": 0.002523585001627604,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<128u, 512u, ": 0.0060601959228515625,
+  "other: void sglang::fused_store_flashmla_cache<__nv_bfloat16, long,": 0.0040236968994140625,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<32u, 5120u, ": 0.01828466033935547,
+  "other: void sglang::index_q_kernel<true, 128l, 64l, long, true>(sgl": 0.0038918660481770833,
+  "indexer / top-k of the compressed attention": 1.1382109451293945,
+  "other: void cublasLt::splitKreduce_kernel<32, 16, int, __nv_bfloat1": 0.001491071065266927,
+  "other: void sglang::amax8_varlen_kernel<true, float, float>(sglang:": 0.001997711181640625,
+  "top-k / sort / sampling (torch)": 0.17532671610514322,
+  "other: softcap_inplace_logits_kernel": 0.002629320780436198,
+  "other: void at_cuda_detail::cub::detail::scan::DeviceScanInitKernel": 0.0037182337443033855,
+  "other: void at_cuda_detail::cub::detail::scan::DeviceScanKernel<at_": 0.006697224934895833,
+  "other: _scatter_compact_to_strided_kernel": 0.005787142435709635,
+  "other: _fused_correct_drafts_and_bonus_kernel": 0.0008259836832682292,
+  "other: _cap_correct_len_kernel": 0.0008546880086263021,
+  "other: _gather_row_bonus_kernel": 0.0011021779378255208,
+  "other: _finalize_accept_lens_kernel": 0.0010306447347005207,
+  "other: _build_out_tokens_kernel": 0.0011485646565755207,
+  "other: _commit_inject_layout_kernel": 0.0019140904744466146,
+  "gemm mxfp8 (flashinfer)": 1.304820295969642,
+  "other: assign_extend_cache_locs_uniform": 0.0014257481892903645,
+  "other: _small_copy_kernel": 0.0026000900268554686,
+  "other: _expand_prefill_causally_kernel": 0.0025173873901367188,
+  "other: _block_seq_lens_casual_kernel": 0.0008768361409505209,
+  "other: _window_gather_kernel": 0.001157684326171875,
+  "other: _swa_page_indices_kernel": 0.0021723531087239584,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<128u, 5120u,": 0.004666937510172526,
+  "other: void sglang::moe::route_warp::route_warp_kernel<128u, 3u, 1u": 0.0014451234605577248,
+  "draft sampling (markov)": 0.014001261393229165,
+  "other: void dot_kernel<float, 128, 0, cublasDotParams<cublasGemvTen": 0.0018692270914713541,
+  "other: void reduce_1Block_kernel<float, 128, 7, cublasGemvTensorStr": 0.0013694864908854168,
+  "other: _qo_indptr_kernel": 0.003611864725748698,
+  "other: _compact_row_index_kernel": 0.00218341064453125,
+  "other: assign_extend_cache_locs": 0.0016885121663411458,
+  "other: _ragged_finalize_kernel": 0.0014735616048177083,
+  "other: _compact_verify_ids_gather_kernel": 0.0013471908569335938,
+  "other: _padded_to_bucket_kernel": 0.0027489903767903647,
+  "other: _small_page_table": 0.001800214131673177,
+  "other: _causal_swa_page_indices_kernel": 0.0018896128336588543,
+  "other: _low_ratio_metadata": 0.0010504175821940106,
+  "other: _expand_index_page_table_kernel": 0.0017284876505533856,
+  "other: get_last_loc_kernel": 1.4172871907552084e-05,
+  "other: alloc_extend_kernel": 3.4665425618489584e-05,
+  "other: assign_req_to_token_pool": 1.854451497395833e-05,
+  "other: get_and_clear_swa_pages_kernel": 3.7668863932291665e-05
+ },
+ "kernel_ms": {
+  "moe glue (pack, unpack, combine, commit, pages)": 1.2212510000000265,
+  "mhc (hyper-connections)": 1.8081916979166797,
+  "quantize to mxfp8": 0.5978646041666436,
+  "gemm fp4/fp8 block-scaled (b12x)": 6.004428364583314,
+  "memcpy / memset": 0.036207104166667,
+  "engram": 0.019291343749999978,
+  "moe hot experts (gate/up, down)": 11.684424333333324,
+  "torch elementwise / index / reduce": 0.5315147083332934,
+  "rmsnorm": 0.09362655208333304,
+  "attention rope / k-norm": 0.21651226041666552,
+  "attention core (sparse mla)": 1.010445624999998,
+  "other: _einsum_kernel": 1.4448514374999961,
+  "other: void sglang::mhc_post_combine_norm_decode_kernel<160, 4, fal": 0.11490454166666729,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<384u, 5120u,": 0.2241620000000008,
+  "other: void sglang::moe::route_warp::route_warp_kernel<384u, 6u, 1u": 0.11600215625000036,
+  "other: void sglang::mhc_post_combine_norm_decode_kernel<128, 5, tru": 0.11321692708333382,
+  "gemm bf16 (cutlass / cublas)": 2.2138558958333343,
+  "other: void cublasLt::splitKreduce_kernel<32, 16, int, float, float": 0.004023552083333333,
+  "other: memcpy_post": 0.0025511249999999996,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<128u, 512u, ": 0.006205687499999993,
+  "other: void sglang::fused_store_flashmla_cache<__nv_bfloat16, long,": 0.0044664166666666776,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<32u, 5120u, ": 0.019520166666666748,
+  "other: void sglang::index_q_kernel<true, 128l, 64l, long, true>(sgl": 0.004659520833333339,
+  "indexer / top-k of the compressed attention": 1.138750781249999,
+  "other: void cublasLt::splitKreduce_kernel<32, 16, int, __nv_bfloat1": 0.0014940312500000001,
+  "other: void sglang::amax8_varlen_kernel<true, float, float>(sglang:": 0.0025710937500000013,
+  "top-k / sort / sampling (torch)": 0.1762122187500006,
+  "other: softcap_inplace_logits_kernel": 0.0027658749999999997,
+  "other: void at_cuda_detail::cub::detail::scan::DeviceScanInitKernel": 0.003809208333333332,
+  "other: void at_cuda_detail::cub::detail::scan::DeviceScanKernel<at_": 0.00674275,
+  "other: _scatter_compact_to_strided_kernel": 0.005832635416666673,
+  "other: _fused_correct_drafts_and_bonus_kernel": 0.0008306874999999995,
+  "other: _cap_correct_len_kernel": 0.0008686770833333325,
+  "other: _gather_row_bonus_kernel": 0.0011140208333333323,
+  "other: _finalize_accept_lens_kernel": 0.0010330625000000003,
+  "other: _build_out_tokens_kernel": 0.001163718750000001,
+  "other: _commit_inject_layout_kernel": 0.00195478125,
+  "gemm mxfp8 (flashinfer)": 1.5443181354166684,
+  "other: assign_extend_cache_locs_uniform": 0.0014371875000000005,
+  "other: _small_copy_kernel": 0.002613875,
+  "other: _expand_prefill_causally_kernel": 0.0025217291666666678,
+  "other: _block_seq_lens_casual_kernel": 0.0008769895833333334,
+  "other: _window_gather_kernel": 0.0011647083333333338,
+  "other: _swa_page_indices_kernel": 0.002179385416666667,
+  "other: void sglang::tiny_simt_kernel<sglang::SIMTTrait<128u, 5120u,": 0.01070617708333334,
+  "other: void sglang::moe::route_warp::route_warp_kernel<128u, 3u, 1u": 0.004569624999999999,
+  "draft sampling (markov)": 0.014132666666666653,
+  "other: void dot_kernel<float, 128, 0, cublasDotParams<cublasGemvTen": 0.0018808229166666665,
+  "other: void reduce_1Block_kernel<float, 128, 7, cublasGemvTensorStr": 0.001383729166666666,
+  "other: _qo_indptr_kernel": 0.003648510416666662,
+  "other: _compact_row_index_kernel": 0.002199885416666668,
+  "other: assign_extend_cache_locs": 0.0016954062500000003,
+  "other: _ragged_finalize_kernel": 0.0014780208333333331,
+  "other: _compact_verify_ids_gather_kernel": 0.0013620729166666664,
+  "other: _padded_to_bucket_kernel": 0.0027791874999999974,
+  "other: _small_page_table": 0.0018050625000000007,
+  "other: _causal_swa_page_indices_kernel": 0.0018960937500000006,
+  "other: _low_ratio_metadata": 0.0010586770833333327,
+  "other: _expand_index_page_table_kernel": 0.001739416666666667,
+  "other: get_last_loc_kernel": 2.7010416666666665e-05,
+  "other: alloc_extend_kernel": 6.733333333333335e-05,
+  "other: assign_req_to_token_pool": 4.933333333333333e-05,
+  "other: get_and_clear_swa_pages_kernel": 3.766666666666667e-05
+ },
+ "gap_ms": {
+  "_commit -> _pack": [
+   3.203837076822916e-05,
+   5.661519368489584e-05,
+   0.9583333333333334
+  ],
+  "_pack -> _gate_up": [
+   0.0033131510416666665,
+   0.002572423299153646,
+   0.9479166666666666
+  ],
+  "_gate_up -> _down": [
+   0.0048478495279947915,
+   0.005828379313151042,
+   38.927083333333336
+  ],
+  "_combine -> _unpack": [
+   2.581329391479492,
+   2.1032825571695963,
+   39.510416666666664
+  ],
+  "_unpack -> void at::native::vectorized_elementwise_kern": [
+   0.004043268839518229,
+   0.005266708374023437,
+   40.0
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::vectorized_elementwise_kern": [
+   0.03435059611002604,
+   0.03885760498046875,
+   157.125
+  ],
+  "void at::native::vectorized_elementwise_kern -> _mhc_post_split_h_kernel": [
+   0.0023163553873697916,
+   0.002315704345703125,
+   4.979166666666667
+  ],
+  "_mhc_post_split_h_kernel -> kernel_cutlass_kernel_flashinferquantization": [
+   0.001564727783203125,
+   0.00133587646484375,
+   1.9583333333333333
+  ],
+  "kernel_cutlass_kernel_flashinfergemmkernelsd -> _engram_gate_kernel": [
+   8.004252115885417e-05,
+   5.666097005208333e-06,
+   0.8541666666666666
+  ],
+  "_engram_gate_kernel -> _hc_combine_norm_mxfp8_kernel": [
+   0.00021998087565104166,
+   4.35791015625e-05,
+   1.8333333333333333
+  ],
+  "void sglang::deepseek_rope_kernel<true, fals -> void at::native::vectorized_elementwise_kern": [
+   0.0012588653564453126,
+   0.0003912353515625,
+   4.8125
+  ],
+  "void at::native::vectorized_elementwise_kern -> _page_mark_kernel": [
+   0.0020752970377604166,
+   0.0024000040690104166,
+   41.770833333333336
+  ],
+  "_page_mark_kernel -> _page_split_kernel": [
+   0.00205645751953125,
+   0.0024313710530598958,
+   41.364583333333336
+  ],
+  "_page_split_kernel -> void flashinfer::sparse_mla_sm120::sparse_ml": [
+   0.0018915354410807292,
+   0.002379704793294271,
+   41.09375
+  ],
+  "void flashinfer::sparse_mla_sm120::sparse_ml -> void flashinfer::sparse_mla_sm120::sparse_ml": [
+   0.001985539754231771,
+   0.0024381561279296876,
+   41.104166666666664
+  ],
+  "void sglang::deepseek_rope_kernel<true, true -> _einsum_kernel": [
+   0.0018259836832682293,
+   0.0021975809733072917,
+   40.791666666666664
+  ],
+  "kernel_cutlass_kernel_flashinfergemmkernelsd -> void sglang::mhc_post_combine_norm_decode_ke": [
+   0.00189129638671875,
+   0.002373504638671875,
+   38.21875
+  ],
+  "void at::native::vectorized_elementwise_kern -> void sglang::mhc_post_combine_norm_decode_ke": [
+   0.026497894287109375,
+   0.029302642822265624,
+   37.0
+  ],
+  "void sglang::fused_k_norm_rope_flashmla<__nv -> void cutlass::Kernel2<cutlass_80_wmma_tensor": [
+   0.00020033772786458333,
+   0.0002086181640625,
+   3.8333333333333335
+  ],
+  "void cutlass::Kernel2<cutlass_80_wmma_tensor -> void cublasLt::splitKreduce_kernel<32, 16, i": [
+   0.0001930084228515625,
+   0.0002173309326171875,
+   3.875
+  ],
+  "void cublasLt::splitKreduce_kernel<32, 16, i -> void at::native::vectorized_elementwise_kern": [
+   0.00015258280436197916,
+   0.00015101114908854166,
+   2.875
+  ],
+  "void at::native::vectorized_elementwise_kern -> memcpy32_post": [
+   0.00040125020345052083,
+   0.0004686177571614583,
+   8.510416666666666
+  ],
+  "memcpy32_post -> void at::native::vectorized_elementwise_kern": [
+   0.0003488515218098958,
+   0.00036968994140625,
+   6.666666666666667
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::vectorized_gather_kernel<16": [
+   0.0003890279134114583,
+   0.0004446563720703125,
+   7.760416666666667
+  ],
+  "void at::native::vectorized_gather_kernel<16 -> void at::native::vectorized_elementwise_kern": [
+   0.0001569366455078125,
+   0.000151214599609375,
+   2.9375
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::unrolled_elementwise_kernel": [
+   0.0006797078450520834,
+   0.0007273457845052084,
+   14.385416666666666
+  ],
+  "void at::native::unrolled_elementwise_kernel -> void at::native::vectorized_elementwise_kern": [
+   0.00076751708984375,
+   0.00091033935546875,
+   13.385416666666666
+  ],
+  "memcpy_post -> void at::native::elementwise_kernel<128, 2, ": [
+   0.00016443888346354165,
+   0.00014849853515625,
+   2.8854166666666665
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> void at::native::roll_cuda_kernel<float>(flo": [
+   0.0002879740397135417,
+   0.00029639180501302083,
+   5.739583333333333
+  ],
+  "void at::native::roll_cuda_kernel<float>(flo -> void at::native::elementwise_kernel<128, 2, ": [
+   0.0002999216715494792,
+   0.0003054758707682292,
+   5.71875
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> void at::native::elementwise_kernel<128, 2, ": [
+   0.00017803955078125,
+   0.00019967142740885417,
+   3.8125
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> void at::native::vectorized_elementwise_kern": [
+   0.00020360310872395834,
+   0.00023404947916666667,
+   4.645833333333333
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::(anonymous namespace)::CatA": [
+   0.00037708028157552084,
+   0.0004084676106770833,
+   7.697916666666667
+  ],
+  "void at::native::(anonymous namespace)::CatA -> void at::native::index_elementwise_kernel<12": [
+   0.000212066650390625,
+   0.00021338907877604165,
+   3.875
+  ],
+  "void at::native::index_elementwise_kernel<12 -> void at::native::vectorized_elementwise_kern": [
+   0.00040542093912760416,
+   0.0004660237630208333,
+   4.84375
+  ],
+  "void at::native::(anonymous namespace)::CatA -> void at::native::(anonymous namespace)::CatA": [
+   0.00011963907877604168,
+   0.00013459269205729166,
+   2.84375
+  ],
+  "void at::native::(anonymous namespace)::CatA -> void at::native::(anonymous namespace)::cunn": [
+   0.00013527425130208334,
+   0.0001369171142578125,
+   2.875
+  ],
+  "void at::native::(anonymous namespace)::cunn -> void at::native::vectorized_elementwise_kern": [
+   0.00014922587076822915,
+   0.00015288289388020834,
+   2.8854166666666665
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::reduce_kernel<128, 4, at::n": [
+   0.00013863627115885417,
+   0.0001436614990234375,
+   2.8020833333333335
+  ],
+  "void at::native::reduce_kernel<128, 4, at::n -> void at::native::vectorized_elementwise_kern": [
+   0.0001476898193359375,
+   0.0001422576904296875,
+   2.8645833333333335
+  ],
+  "void at::native::vectorized_elementwise_kern -> _rmsnorm_fp32_kernel": [
+   0.00013579305013020835,
+   0.0001443634033203125,
+   2.8541666666666665
+  ],
+  "_rmsnorm_fp32_kernel -> void at::native::vectorized_gather_kernel<16": [
+   0.000199493408203125,
+   0.00019677225748697915,
+   3.8541666666666665
+  ],
+  "void sglang::tiny_simt_kernel<sglang::SIMTTr -> _rmsnorm_fp32_kernel": [
+   0.0001973724365234375,
+   0.00020068359375,
+   3.875
+  ],
+  "_rmsnorm_fp32_kernel -> _index_k_rope_pack_kernel": [
+   0.0001868438720703125,
+   0.00019137064615885416,
+   3.8541666666666665
+  ],
+  "void sglang::topk_transform_kernel<true>(sgl -> void at::native::vectorized_elementwise_kern": [
+   0.000145751953125,
+   0.00016764322916666666,
+   2.90625
+  ],
+  "void sglang::fused_k_norm_rope_flashmla<__nv -> void at::native::vectorized_elementwise_kern": [
+   0.0017118275960286457,
+   0.0018825785319010416,
+   33.385416666666664
+  ],
+  "void at::native::vectorized_elementwise_kern -> memcpy_post": [
+   0.00016292317708333333,
+   0.0001399383544921875,
+   2.90625
+  ],
+  "_index_k_rope_pack_kernel -> _rope_tail_fake_quant_fp4_kernel": [
+   0.00018684895833333335,
+   0.00020157877604166667,
+   3.78125
+  ],
+  "void cublasLt::splitKreduce_kernel<32, 16, i -> _rmsnorm_fp32_kernel": [
+   5.301920572916666e-05,
+   5.657450358072916e-05,
+   1.0
+  ],
+  "void sglang::fused_store_flashmla_cache<__nv -> void at::native::vectorized_elementwise_kern": [
+   3.897603352864584e-05,
+   6.228129069010416e-05,
+   0.9479166666666666
+  ],
+  "kernel_cutlass_kernel_flashinfergemmkernelsd -> _rope_tail_fake_quant_fp4_kernel": [
+   0.00020308430989583336,
+   0.0002621002197265625,
+   4.78125
+  ],
+  "void sglang::tiny_simt_kernel<sglang::SIMTTr -> void at::native::vectorized_elementwise_kern": [
+   0.00021663411458333335,
+   0.0002790679931640625,
+   4.791666666666667
+  ],
+  "void at::native::unrolled_elementwise_kernel -> _fp4_index_logits_paged_balanced_kernel": [
+   0.000225311279296875,
+   0.0002651214599609375,
+   4.833333333333333
+  ],
+  "_fp4_index_logits_paged_balanced_kernel -> void at::native::vectorized_elementwise_kern": [
+   6.036376953125e-05,
+   8.133951822916667e-05,
+   0.9479166666666666
+  ],
+  "void sglang::topk_mode_1::topk_main_kernel<t -> void at::native::vectorized_elementwise_kern": [
+   3.496297200520834e-05,
+   4.7648111979166664e-05,
+   0.9583333333333334
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::_scatter_gather_elementwise": [
+   4.43267822265625e-05,
+   6.068929036458334e-05,
+   0.9791666666666666
+  ],
+  "void at::native::_scatter_gather_elementwise -> void at::native::elementwise_kernel<128, 4, ": [
+   4.437255859375e-05,
+   5.3721110026041666e-05,
+   0.9479166666666666
+  ],
+  "_finish_paged_indexer_topk_kernel -> void at::native::vectorized_elementwise_kern": [
+   0.00022454325358072915,
+   0.00028383890787760417,
+   4.90625
+  ],
+  "void sglang::topk_mode_1::topk_main_kernel<t -> _finish_paged_indexer_topk_kernel": [
+   0.0002140655517578125,
+   0.000283416748046875,
+   4.8125
+  ],
+  "void sglang::mhc_post_combine_norm_decode_ke -> _mhc_stream_mean_kernel": [
+   0.00012308756510416666,
+   0.00015948486328125,
+   2.875
+  ],
+  "_mhc_post_split_h_kernel -> _mhc_combine_kernel": [
+   4.6045939127604164e-05,
+   5.671183268229166e-05,
+   0.96875
+  ],
+  "_mhc_combine_kernel -> kernel_cutlass_kernel_flashinfernormkernelsr": [
+   0.0003109995524088542,
+   0.0003742828369140625,
+   1.9791666666666667
+  ],
+  "kernel_cutlass_kernel_flashinfernormkernelsr -> void cutlass::Kernel2<cutlass_80_wmma_tensor": [
+   3.859456380208334e-05,
+   4.53033447265625e-05,
+   0.96875
+  ],
+  "void at_cuda_detail::cub::detail::scan::Devi -> void at_cuda_detail::cub::detail::scan::Devi": [
+   0.00036517333984375,
+   0.0005010325113932291,
+   4.822916666666667
+  ],
+  "void at_cuda_detail::cub::detail::scan::Devi -> void at::native::vectorized_elementwise_kern": [
+   0.00012996927897135417,
+   0.00016565958658854165,
+   2.8854166666666665
+  ],
+  "void at::native::vectorized_elementwise_kern -> _scatter_compact_to_strided_kernel": [
+   0.00013328043619791665,
+   0.0001639862060546875,
+   2.875
+  ],
+  "_scatter_compact_to_strided_kernel -> void at_cuda_detail::cub::detail::scan::Devi": [
+   4.7953287760416664e-05,
+   5.202229817708334e-05,
+   1.0
+  ],
+  "_scatter_compact_to_strided_kernel -> void at::native::vectorized_elementwise_kern": [
+   4.195658365885417e-05,
+   5.6681315104166665e-05,
+   0.9791666666666666
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at_cuda_detail::cub::detail::scan::Devi": [
+   4.2399088541666666e-05,
+   5.36956787109375e-05,
+   0.9375
+  ],
+  "void sglang::argmax_finalize_kernel<long, tr -> _fused_correct_drafts_and_bonus_kernel": [
+   4.735819498697916e-05,
+   5.365498860677083e-05,
+   0.9583333333333334
+  ],
+  "_fused_correct_drafts_and_bonus_kernel -> void at::native::vectorized_elementwise_kern": [
+   4.366556803385416e-05,
+   5.40771484375e-05,
+   0.9895833333333334
+  ],
+  "void at::native::vectorized_elementwise_kern -> _cap_correct_len_kernel": [
+   4.065958658854166e-05,
+   6.400553385416666e-05,
+   0.96875
+  ],
+  "_gather_row_bonus_kernel -> _finalize_accept_lens_kernel": [
+   4.701741536458334e-05,
+   4.8365275065104166e-05,
+   0.9791666666666666
+  ],
+  "_finalize_accept_lens_kernel -> void at::native::unrolled_elementwise_kernel": [
+   4.46929931640625e-05,
+   5.06134033203125e-05,
+   0.9895833333333334
+  ],
+  "void at::native::unrolled_elementwise_kernel -> _build_out_tokens_kernel": [
+   4.337565104166667e-05,
+   4.9092610677083334e-05,
+   0.96875
+  ],
+  "_build_out_tokens_kernel -> void at::native::unrolled_elementwise_kernel": [
+   4.00238037109375e-05,
+   5.193074544270833e-05,
+   0.9583333333333334
+  ],
+  "void at::native::unrolled_elementwise_kernel -> memcpy32_post": [
+   4.930623372395834e-05,
+   5.034383138020834e-05,
+   0.96875
+  ],
+  "memcpy32_post -> memcpy32_post": [
+   0.00019167582194010415,
+   0.0002716929117838542,
+   4.78125
+  ],
+  "memcpy32_post -> void at::native::unrolled_elementwise_kernel": [
+   3.603617350260416e-05,
+   5.0699869791666667e-05,
+   0.875
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::elementwise_kernel<128, 2, ": [
+   0.0003167470296223958,
+   0.0004321797688802083,
+   3.8958333333333335
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> _commit_inject_layout_kernel": [
+   3.53851318359375e-05,
+   5.602010091145834e-05,
+   0.9479166666666666
+  ],
+  "void sglang::fused_k_norm_rope_flashmla<__nv -> _engram_commit_history_kernel": [
+   0.0022881622314453124,
+   0.0013376515706380208,
+   1.0
+  ],
+  "_engram_commit_history_kernel -> void at::native::index_elementwise_kernel<12": [
+   0.000134002685546875,
+   0.0001786956787109375,
+   0.9479166666666666
+  ],
+  "void at::native::index_elementwise_kernel<12 -> void at::native::index_elementwise_kernel<12": [
+   0.002290863037109375,
+   0.0006552886962890625,
+   2.3333333333333335
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::index_elementwise_kernel<12": [
+   0.00023762003580729167,
+   0.0003208770751953125,
+   1.9479166666666667
+  ],
+  "void at::native::index_elementwise_kernel<12 -> assign_extend_cache_locs_uniform": [
+   0.00016357421875,
+   0.00010831705729166668,
+   0.9583333333333334
+  ],
+  "assign_extend_cache_locs_uniform -> void at::native::elementwise_kernel<128, 2, ": [
+   0.00019623819986979167,
+   8.263142903645833e-05,
+   0.9895833333333334
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> Memcpy DtoD (Device -> Device)": [
+   0.00016728719075520835,
+   0.00011595662434895833,
+   0.96875
+  ],
+  "Memcpy DtoD (Device -> Device) -> _small_copy_kernel": [
+   0.0001583709716796875,
+   0.00013573201497395833,
+   1.0
+  ],
+  "_small_copy_kernel -> Memcpy DtoD (Device -> Device)": [
+   0.00014670817057291666,
+   0.00014137776692708335,
+   1.0
+  ],
+  "Memcpy DtoD (Device -> Device) -> void at::native::vectorized_elementwise_kern": [
+   0.00014436848958333334,
+   0.00014800008138020834,
+   1.0
+  ],
+  "void at::native::vectorized_elementwise_kern -> Memcpy HtoD (Pinned -> Device)": [
+   0.0022394307454427086,
+   0.0010520121256510418,
+   1.0104166666666667
+  ],
+  "Memcpy HtoD (Pinned -> Device) -> _expand_prefill_causally_kernel": [
+   0.0012233530680338543,
+   0.0004023895263671875,
+   1.0
+  ],
+  "_expand_prefill_causally_kernel -> _page_table_positions_kernel": [
+   9.40093994140625e-05,
+   0.0001947784423828125,
+   1.0
+  ],
+  "_page_table_positions_kernel -> void at::native::unrolled_elementwise_kernel": [
+   0.00013739522298177083,
+   0.00014569091796875,
+   0.9895833333333334
+  ],
+  "void at::native::unrolled_elementwise_kernel -> Memcpy DtoD (Device -> Device)": [
+   0.00011869303385416667,
+   0.00017598978678385414,
+   1.0
+  ],
+  "Memcpy DtoD (Device -> Device) -> Memcpy DtoD (Device -> Device)": [
+   0.0009433135986328125,
+   0.0012843729654947917,
+   7.885416666666667
+  ],
+  "Memcpy DtoD (Device -> Device) -> void at::native::index_elementwise_kernel<12": [
+   0.001852447509765625,
+   0.001519775390625,
+   1.0
+  ],
+  "void at::native::index_elementwise_kernel<12 -> void at::native::unrolled_elementwise_kernel": [
+   8.900960286458333e-05,
+   0.00010097757975260417,
+   1.9791666666666667
+  ],
+  "void at::native::unrolled_elementwise_kernel -> _block_seq_lens_casual_kernel": [
+   4.46319580078125e-05,
+   5.3064982096354164e-05,
+   1.0
+  ],
+  "_block_seq_lens_casual_kernel -> void at::native::elementwise_kernel<128, 2, ": [
+   4.8731486002604166e-05,
+   6.675211588541667e-05,
+   0.9895833333333334
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> _window_gather_kernel": [
+   4.662577311197916e-05,
+   6.85577392578125e-05,
+   1.0
+  ],
+  "_window_gather_kernel -> _swa_page_indices_kernel": [
+   3.8726806640625e-05,
+   5.200703938802084e-05,
+   0.9583333333333334
+  ],
+  "_swa_page_indices_kernel -> void at::native::(anonymous namespace)::inde": [
+   0.0008250630696614584,
+   0.0005568288167317709,
+   1.0
+  ],
+  "void at::native::(anonymous namespace)::inde -> void at::native::elementwise_kernel<128, 4, ": [
+   9.900410970052083e-05,
+   0.000125640869140625,
+   1.0
+  ],
+  "_ZN7cutlass13device_kernelIN10flashinfer4gem -> _mhc_post_split_h_kernel": [
+   0.00012905375162760416,
+   0.00016435750325520835,
+   2.8541666666666665
+  ],
+  "_combine -> void at::native::vectorized_elementwise_kern": [
+   0.00014059956868489585,
+   0.00017159525553385417,
+   2.9270833333333335
+  ],
+  "void at::native::vectorized_elementwise_kern -> void at::native::reduce_kernel<512, 1, at::n": [
+   4.358418782552084e-05,
+   6.1676025390625e-05,
+   0.9583333333333334
+  ],
+  "void at::native::reduce_kernel<512, 1, at::n -> void at::native::vectorized_elementwise_kern": [
+   4.60357666015625e-05,
+   5.738321940104166e-05,
+   0.9583333333333334
+  ],
+  "memcpy32_post -> _ZN7cutlass13device_kernelIN2at4cuda6detail3": [
+   4.0369669596354166e-05,
+   5.6096394856770835e-05,
+   0.9166666666666666
+  ],
+  "std::enable_if<!(false), void>::type interna -> _markov_sample_partial_kernel": [
+   0.000213287353515625,
+   0.0002946624755859375,
+   4.75
+  ],
+  "_markov_sample_finish_kernel -> void at::native::(anonymous namespace)::inde": [
+   0.00017627461751302083,
+   0.00023636372884114584,
+   3.8125
+  ],
+  "void at::native::(anonymous namespace)::inde -> std::enable_if<!(false), void>::type interna": [
+   0.00016259256998697917,
+   0.00022202046712239585,
+   3.8125
+  ],
+  "_markov_sample_partial_kernel -> _markov_sample_finish_kernel": [
+   0.00021649678548177085,
+   0.00029803975423177084,
+   4.729166666666667
+  ],
+  "_markov_sample_finish_kernel -> void at::native::vectorized_elementwise_kern": [
+   3.73382568359375e-05,
+   5.26885986328125e-05,
+   0.96875
+  ],
+  "void at::native::(anonymous namespace)::CatA -> memcpy32_post": [
+   4.494730631510416e-05,
+   6.160481770833334e-05,
+   0.96875
+  ],
+  "memcpy32_post -> void at::native::(anonymous namespace)::CatA": [
+   4.5654296875e-05,
+   6.464131673177082e-05,
+   0.9479166666666666
+  ],
+  "void at::native::(anonymous namespace)::CatA -> void at::native::(anonymous namespace)::inde": [
+   4.2928059895833335e-05,
+   5.2953084309895836e-05,
+   0.9791666666666666
+  ],
+  "void at::native::(anonymous namespace)::inde -> void at::native::(anonymous namespace)::CatA": [
+   4.0044148763020834e-05,
+   5.730183919270834e-05,
+   0.96875
+  ],
+  "void at::native::(anonymous namespace)::CatA -> void at::native::unrolled_elementwise_kernel": [
+   0.0001355743408203125,
+   0.00022096761067708334,
+   1.9270833333333333
+  ],
+  "void at::native::unrolled_elementwise_kernel -> void dot_kernel<float, 128, 0, cublasDotPara": [
+   3.9398193359375e-05,
+   5.429585774739584e-05,
+   0.96875
+  ],
+  "void dot_kernel<float, 128, 0, cublasDotPara -> void reduce_1Block_kernel<float, 128, 7, cub": [
+   3.960673014322916e-05,
+   6.06231689453125e-05,
+   0.9375
+  ],
+  "void reduce_1Block_kernel<float, 128, 7, cub -> void at::native::elementwise_kernel<128, 2, ": [
+   4.332478841145833e-05,
+   6.096903483072917e-05,
+   0.96875
+  ],
+  "memcpy32_post -> _schedule_topk_prep_kernel": [
+   0.0011013234456380208,
+   0.0008390553792317709,
+   1.0
+  ],
+  "_schedule_topk_prep_kernel -> _schedule_topk_selected_extra_kernel": [
+   9.402974446614582e-05,
+   0.00017237345377604167,
+   0.9791666666666666
+  ],
+  "_schedule_topk_finalize_kernel -> _qo_indptr_kernel": [
+   0.00011360677083333333,
+   0.00016030375162760416,
+   0.96875
+  ],
+  "_qo_indptr_kernel -> void at::native::(anonymous namespace)::CatA": [
+   0.000113006591796875,
+   0.00017200724283854166,
+   0.9791666666666666
+  ],
+  "void at::native::unrolled_elementwise_kernel -> void at_cuda_detail::cub::detail::scan::Devi": [
+   0.00021875,
+   0.0003421783447265625,
+   1.9479166666666667
+  ],
+  "void at_cuda_detail::cub::detail::scan::Devi -> _compact_row_index_kernel": [
+   0.0002026519775390625,
+   0.0003365071614583333,
+   1.8854166666666667
+  ],
+  "_compact_row_index_kernel -> void at::native::unrolled_elementwise_kernel": [
+   0.00010662841796875,
+   0.00016337076822916664,
+   0.9479166666666666
+  ],
+  "void at::native::vectorized_elementwise_kern -> assign_extend_cache_locs": [
+   0.00010335795084635417,
+   0.00016931660970052084,
+   0.9583333333333334
+  ],
+  "assign_extend_cache_locs -> _ragged_finalize_kernel": [
+   0.00011471048990885417,
+   0.00015973409016927084,
+   0.9791666666666666
+  ],
+  "_ragged_finalize_kernel -> void at::native::unrolled_elementwise_kernel": [
+   9.898885091145833e-05,
+   0.0001689910888671875,
+   0.96875
+  ],
+  "_compact_row_index_kernel -> _compact_verify_ids_gather_kernel": [
+   0.0001166229248046875,
+   0.00015997314453125,
+   0.9791666666666666
+  ],
+  "_compact_verify_ids_gather_kernel -> void at::native::vectorized_elementwise_kern": [
+   9.702046712239583e-05,
+   0.0001657562255859375,
+   0.9270833333333334
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> void at::native::unrolled_elementwise_kernel": [
+   0.00010168965657552083,
+   0.00015908304850260416,
+   0.9166666666666666
+  ],
+  "void at::native::unrolled_elementwise_kernel -> void at::native::unrolled_elementwise_kernel": [
+   0.00022469075520833333,
+   0.0003280792236328125,
+   1.9375
+  ],
+  "void at::native::elementwise_kernel<128, 2,  -> _padded_to_bucket_kernel": [
+   0.00010401407877604168,
+   0.0001646728515625,
+   0.9583333333333334
+  ],
+  "_padded_to_bucket_kernel -> void at::native::vectorized_elementwise_kern": [
+   0.00022564697265625,
+   0.0003365631103515625,
+   1.9583333333333333
+  ],
+  "void at::native::vectorized_elementwise_kern -> _qo_indptr_kernel": [
+   0.00022538248697916665,
+   0.000327392578125,
+   1.9270833333333333
+  ],
+  "_qo_indptr_kernel -> Memcpy DtoD (Device -> Device)": [
+   0.0003323415120442708,
+   0.0004973297119140626,
+   2.8958333333333335
+  ],
+  "Memcpy DtoD (Device -> Device) -> void at::native::unrolled_elementwise_kernel": [
+   0.0023204549153645836,
+   0.0025039876302083335,
+   2.8958333333333335
+  ],
+  "void at::native::unrolled_elementwise_kernel -> _small_copy_kernel": [
+   0.00010228474934895833,
+   0.0001610565185546875,
+   0.9375
+  ],
+  "_small_copy_kernel -> _padded_to_bucket_kernel": [
+   0.00010132344563802083,
+   0.00016469828287760417,
+   0.9375
+  ],
+  "_padded_to_bucket_kernel -> _qo_indptr_kernel": [
+   0.000100372314453125,
+   0.000169403076171875,
+   0.9583333333333334
+  ],
+  "void at::native::unrolled_elementwise_kernel -> _padded_to_bucket_kernel": [
+   0.00010201517740885417,
+   0.0001629791259765625,
+   0.9375
+  ],
+  "void at::native::unrolled_elementwise_kernel -> _expand_prefill_causally_kernel": [
+   4.1727701822916665e-05,
+   5.9031168619791664e-05,
+   0.9791666666666666
+  ],
+  "_expand_prefill_causally_kernel -> _small_page_table": [
+   3.8721720377604164e-05,
+   5.9727986653645835e-05,
+   0.96875
+  ],
+  "_small_page_table -> _causal_swa_page_indices_kernel": [
+   4.4026692708333336e-05,
+   5.47027587890625e-05,
+   0.96875
+  ],
+  "_causal_swa_page_indices_kernel -> _low_ratio_metadata": [
+   3.7994384765625e-05,
+   6.598409016927082e-05,
+   0.9583333333333334
+  ],
+  "_low_ratio_metadata -> _expand_index_page_table_kernel": [
+   4.02984619140625e-05,
+   6.363932291666668e-05,
+   0.96875
+  ],
+  "_expand_index_page_table_kernel -> void deep_gemm::sched::sm120_paged_mqa_logit": [
+   0.0003070119222005208,
+   0.0004336496988932292,
+   1.96875
+  ],
+  "void deep_gemm::sched::sm120_paged_mqa_logit -> void at::native::index_elementwise_kernel<12": [
+   4.163614908854166e-05,
+   5.797322591145834e-05,
+   0.96875
+  ],
+  "void at::native::unrolled_elementwise_kernel -> void (anonymous namespace)::elementwise_kern": [
+   3.966776529947916e-05,
+   5.9300740559895835e-05,
+   0.9791666666666666
+  ],
+  "void (anonymous namespace)::elementwise_kern -> void at::native::(anonymous namespace)::sear": [
+   3.96881103515625e-05,
+   5.6365966796875e-05,
+   0.9583333333333334
+  ],
+  "void at::native::(anonymous namespace)::sear -> void at::native::vectorized_elementwise_kern": [
+   3.80401611328125e-05,
+   4.973347981770834e-05,
+   0.9583333333333334
+  ],
+  "void at::native::index_elementwise_kernel<12 -> Memcpy HtoD (Pinned -> Device)": [
+   0.0014283599853515624,
+   0.00104278564453125,
+   0.9270833333333334
+  ],
+  "Memcpy HtoD (Pinned -> Device) -> void at::native::(anonymous namespace)::inde": [
+   0.0008804066975911459,
+   0.0005955759684244792,
+   0.9166666666666666
+  ],
+  "void at::native::(anonymous namespace)::inde -> _hc_broadcast_kernel": [
+   1.2654622395833334e-05,
+   5.402119954427083e-05,
+   0.71875
+  ],
+  "_hc_broadcast_kernel -> _engram_hash_kernel": [
+   2.09808349609375e-05,
+   5.224609375e-05,
+   0.7916666666666666
+  ],
+  "_engram_hash_kernel -> void at::native::elementwise_kernel<128, 2, ": [
+   3.830973307291666e-05,
+   5.03082275390625e-05,
+   0.9479166666666666
+  ],
+  "_combine -> Memcpy HtoD (Pinned -> Device)": [
+   0.04912374877929687,
+   0.012035212198893228,
+   0.4270833333333333
+  ],
+  "Memcpy HtoD (Pinned -> Device) -> Memcpy HtoD (Pinned -> Device)": [
+   0.0,
+   0.0004342905680338542,
+   0.6354166666666666
+  ],
+  "Memcpy HtoD (Pinned -> Device) -> _engram_gather_kernel": [
+   0.0015513865152994792,
+   0.0006707204182942708,
+   0.5
+  ],
+  "_engram_gather_kernel -> _unpack": [
+   0.13280821736653647,
+   0.015617324829101562,
+   0.4895833333333333
+  ],
+  "void sglang::argmax_kernel<float, long, true -> void sglang::argmax_finalize_kernel<long, tr": [
+   8.868916829427083e-05,
+   0.000109405517578125,
+   0.9583333333333334
+  ],
+  "_cap_correct_len_kernel -> _gather_row_bonus_kernel": [
+   4.001363118489584e-05,
+   5.403645833333334e-05,
+   0.90625
+  ],
+  "kernel_cutlass_kernel_flashinfernormkernelsr -> void at::native::unrolled_elementwise_kernel": [
+   4.1666666666666665e-05,
+   6.1920166015625e-05,
+   0.9479166666666666
+  ],
+  "_schedule_topk_selected_extra_kernel -> _schedule_topk_finalize_kernel": [
+   0.00011768086751302082,
+   0.0001656646728515625,
+   0.9479166666666666
+  ],
+  "void deep_gemm::sched::sm120_paged_mqa_logit -> _expand_index_page_table_kernel": [
+   4.464213053385416e-05,
+   5.9326171875e-05,
+   0.96875
+  ],
+  "_down -> _combine": [
+   1.2674967447916667e-05,
+   1.3341267903645834e-05,
+   0.25
+  ],
+  "kernel_cutlass_kernel_flashinfergemmkernelsd -> kernel_cutlass_kernel_flashinfernormkernelsr": [
+   1.967366536458333e-05,
+   0.0,
+   0.13541666666666666
+  ],
+  "_combine -> _engram_gather_kernel": [
+   7.733662923177083e-05,
+   4.066975911458333e-05,
+   0.041666666666666664
+  ],
+  "_engram_gather_kernel -> _gate_up": [
+   0.000201995849609375,
+   3.7999471028645836e-05,
+   0.03125
+  ],
+  "kernel_cutlass_kernel_flashinfergemmkernelsd -> _down": [
+   2.1977742513020832e-05,
+   1.0019938151041666e-06,
+   0.08333333333333333
+  ],
+  "_hc_mix_reduce_sinkhorn_kernel -> kernel_cutlass_kernel_flashinfernormkernelsr": [
+   6.998697916666667e-06,
+   0.0,
+   0.03125
+  ],
+  "void sglang::fused_k_norm_rope_flashmla<__nv -> kernel_cutlass_kernel_flashinferquantization": [
+   0.0,
+   3.306070963541667e-07,
+   0.010416666666666666
+  ],
+  "_rope_tail_fake_quant_fp4_kernel -> void sglang::fused_store_flashmla_cache<__nv": [
+   9.969075520833332e-07,
+   0.0,
+   0.010416666666666666
+  ],
+  "_engram_gather_kernel -> Memcpy HtoD (Pinned -> Device)": [
+   0.009628463745117187,
+   0.002278437296549479,
+   0.041666666666666664
+  ],
+  "void sglang::fused_store_flashmla_cache<__nv -> kernel_cutlass_kernel_flashinferquantization": [
+   6.001790364583333e-06,
+   0.0,
+   0.020833333333333332
+  ],
+  "void at::native::index_elementwise_kernel<12 -> void at::native::(anonymous namespace)::inde": [
+   5.066935221354166e-05,
+   6.799825032552083e-05,
+   0.052083333333333336
+  ],
+  "Memcpy HtoD (Pinned -> Device) -> _gate_up": [
+   0.0,
+   2.899678548177083e-05,
+   0.020833333333333332
+  ],
+  "void at::native::index_elementwise_kernel<12 -> void at::native::elementwise_kernel<128, 2, ": [
+   0.0,
+   2.593994140625e-07,
+   0.010416666666666666
+  ],
+  "_mhc_post_split_h_kernel -> Memcpy HtoD (Pinned -> Device)": [
+   0.003080469767252604,
+   0.00019169108072916667,
+   0.041666666666666664
+  ],
+  "_engram_gather_kernel -> kernel_cutlass_kernel_flashinferquantization": [
+   4.400634765625e-05,
+   0.0,
+   0.03125
+  ],
+  "void at::native::index_elementwise_kernel<12 -> get_and_clear_swa_pages_kernel": [
+   3.0339558919270833e-05,
+   6.663004557291667e-06,
+   0.020833333333333332
+  ],
+  "get_and_clear_swa_pages_kernel -> Memcpy DtoD (Device -> Device)": [
+   1.0335286458333333e-05,
+   4.328409830729167e-06,
+   0.020833333333333332
+  ],
+  "Memcpy DtoD (Device -> Device) -> void at::native::(anonymous namespace)::inde": [
+   4.3487548828125e-06,
+   0.0,
+   0.020833333333333332
+  ],
+  "_engram_gather_kernel -> _einsum_kernel": [
+   9.969075520833332e-07,
+   0.0,
+   0.010416666666666666
+  ],
+  "kernel_cutlass_kernel_flashinfernormkernelsr -> void sglang::fused_k_norm_rope_flashmla<__nv": [
+   1.3173421223958333e-06,
+   0.0,
+   0.020833333333333332
+  ],
+  "_page_split_kernel -> Memcpy HtoD (Pinned -> Device)": [
+   0.0,
+   6.663004557291667e-07,
+   0.010416666666666666
+  ],
+  "void at::native::vectorized_gather_kernel<16 -> kernel_cutlass_kernel_flashinferquantization": [
+   3.306070963541667e-07,
+   0.0,
+   0.010416666666666666
+  ],
+  "_mhc_stream_mean_kernel -> kernel_cutlass_kernel_flashinfergemmkernelsd": [
+   1.9938151041666665e-06,
+   0.0,
+   0.010416666666666666
+  ],
+  "_pack -> _engram_gather_kernel": [
+   3.534444173177084e-05,
+   3.997802734375e-06,
+   0.010416666666666666
+  ],
+  "void deep_gemm::sched::sm120_paged_mqa_logit -> void deep_gemm::sched::sm120_paged_mqa_logit": [
+   9.663899739583335e-06,
+   0.0,
+   0.010416666666666666
+  ],
+  "void sglang::deepseek_rope_kernel<true, true -> _engram_gather_kernel": [
+   1.6682942708333332e-06,
+   0.0,
+   0.010416666666666666
+  ]
+ }
+}

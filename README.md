@@ -135,7 +135,7 @@ XTIER_GPU2_SLOTS=auto CUDA_VISIBLE_DEVICES=快卡,慢卡 bash configs/qwen38-rtx
 
 ## 测速
 
-单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）+ 384 GiB DDR5，单位 tok/s，只放最新一次的结果。DeepSeek 加速包那两行是 2026-11-11 重测的（prefill 分块改成 48K、CPU 分担 prefill），其余各行是 XTier 跟 SGLang main 8cd3c494 时
+单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）+ 384 GiB DDR5，单位 tok/s，只放最新一次的结果。DeepSeek 加速包那两行是 2026-11-11 重测的（prefill 分块改成 48K、CPU 分担 prefill、草稿的 FP8 投影走快内核），其余各行是 XTier 跟 SGLang main 8cd3c494 时
 （2026-10 下旬）测的，后面的版本没有重测，每个版本只回归 64K / 512K 速度和精度（最近一次见[报告](docs/reports/2026-11-01-audit-fixes.md)）。
 
 用 [bench/agent_bench.py](bench/agent_bench.py) 模拟编码代理：5 个会话从 64K 到约 500K，铺满 512K KV 池，多步调用工具，同一次启动
@@ -146,13 +146,15 @@ XTIER_GPU2_SLOTS=auto CUDA_VISIBLE_DEVICES=快卡,慢卡 bash configs/qwen38-rtx
 
 | DSpark | 轮 | 冷 prefill 64K 会话 | 冷 prefill 500K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|---:|
-| XTier + 加速包 | 1 | 5,246 | 6,620 | 130.1 | 3.97 | 30.5 ms |
-|  | 2 | 6,230 | 6,721 | 137.2 | 4.16 | 30.3 ms |
+| XTier + 加速包 | 1 | 5,554 | 6,656 | 149.6 | 4.42 | 29.6 ms |
+|  | 2 | 6,122 | 6,681 | 168.1 | 4.96 | 29.5 ms |
 | 基线（关加速包） | 1 | 3,318 | 3,627 | 65.5 | 3.25 | 50.9 ms |
 
-加速包对基线：每步 30.4 对 50.9 ms（快 40%），冷 prefill 64K / 500K 快 73% / 84%；精度无损，照抄正文 0 错（偶尔在一段末尾多输出一个 `</src>`，原来就有）。
+加速包对基线：每步 29.5 对 50.9 ms（快 42%），冷 prefill 64K / 500K 快 76% / 84%；精度无损，照抄正文 0 错（偶尔在一段末尾多输出一个 `</src>`，原来就有）。
 
 **冷 prefill 比上一版快 28–35%，decode 不变（2026-11-11）。** 每读一块提示，每层都要把不在热专家槽里的专家传上显卡，约 2.5 秒，和块里有多少 token 无关。启动台默认的 prefill 分块从 22K 加到 48K，这 2.5 秒摊给两倍多的 token。大块的 forward 多用的显存从热专家槽里让（每层 50 → 35 槽），decode 时弹性热专家槽把它还回去（补到 68 槽），所以 decode 每步不变。520K 提示、两个请求占满 512K KV 池都实跑过，没有显存不足。读长提示时 CPU 是空的，启动台现在默认让它同时算路由少的专家（「CPU 分担 prefill」），这些专家不用传上显卡，128K 以上的会话再快 1–3%（表里是开着测的）。GLM、Qwen 实测分块加大、CPU 分担都没有收益，没有改。见[报告](docs/reports/2026-11-11-prefill-chunk.md)。
+
+**decode 每步再少 0.6–0.8 ms，两个请求同时每步 52.3 → 44.0 ms（2026-11-11）。** 重新剖了 decode 的一步：GPU 上的大头（热专家、FP8 投影、词表头）都已经按显存带宽在读权重。剩下一处是 FP8 投影的小批量快内核只对 1、4、6 行开，DSpark 草稿模型的 5 行、两个请求同时的 10 和 12 行走的是慢 3–4 倍的内核；加速包现在把这几种行数也交给快内核，只换内核，输出不变。变长验证的成本表按新的耗时重测了；两个请求同时，固定验证现在和变长验证差不多快。见[报告](docs/reports/2026-11-11-decode-step.md)。
 
 ### Qwen3.8 Flash Next
 
@@ -242,11 +244,11 @@ SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速
 
 ## 版本更新
 
+- 2026-11-11：DeepSeek V4.1 的 decode 每步少 0.6–0.8 ms，两个请求同时每步 52.3 → 44.0 ms（−16%）。FP8 投影的小批量快内核原来只对 1、4、6 行开，DSpark 草稿模型的 5 行和两个请求同时的 10、12 行走的是慢 3–4 倍的内核；加速包的默认行数改成 1、4、5、6、10、12（`XTIER_MXFP8_B12X_ROWS`），只换内核，照抄 0 错。变长验证的成本表（`sps-table.json`）按新的耗时重测。[报告](docs/reports/2026-11-11-decode-step.md)
 - 2026-11-11：DeepSeek V4.1 的冷 prefill 快 28–35%，decode 不变。启动台默认的 prefill 分块从 22K 改成 48K：每读一块都要花约 2.5 秒把专家传上显卡，块大了这段时间摊给更多 token。每层热专家基础槽 50 → 35，decode 时弹性热专家槽补回到 68；「Prefill 中穿插 decode」默认 48 → 72 步，另一个请求仍保持约 20% 的速度（最长停顿 4.7 → 7.4 秒）。520K 提示和两个请求占满 512K KV 池实跑没有显存不足。GLM、Qwen 实测分块加大没有收益，不改。新增「CPU 分担 prefill」（`XTIER_PREFILL_CPU_SHARE=1`）：读长提示时让空闲的 CPU 算路由少的专家，再快约 3%，DeepSeek 启动台默认开；GLM、Qwen 上实测更慢，不开。[报告](docs/reports/2026-11-11-prefill-chunk.md)
 - 2026-11-10（v0.1.4）：一个请求读长提示时，另一个正在 decode 的请求不再整段停住。SGLang 调度时 prefill 优先，旁边有 20 万 token 的冷提示在读时另一个请求要停 40 秒左右。启动台现在默认加 SGLang 自带的 `--prefill-decode-interval`（DeepSeek 48 / GLM 64 / Qwen 96 步，可改可关）：另一个请求保留约两成速度，最长等一块 prefill 的时间（约 5 秒），长提示首字晚 26–28%，单个请求不变。修复：弹性热专家槽在一个提示的分块之间不再加回又释放（DeepSeek 每块白传 8.4 GiB）。详见[报告](docs/reports/2026-11-10-prefill-interleave.md)。
 - 2026-11-10（v0.1.3）：稳定性审阅后的修复，正常路径不变。别的程序抢 CPU 时解码会慢十倍：启动台给服务高 CPU 权重，登录会话里的程序用 `tools/low_cpu.sh` 起；SGLang 的指标文件挪到内存盘，系统盘卡住不再拖停解码；装钩子出错直接退出，不再带着半套 XTier 起；DeepSeek 的 FP4 prefill 失败后重跑不再段错误；冷存储是唯一副本时不会被别的目录用零重写；崩溃时不再把几百 GiB 内存写进核心转储。详见[报告](docs/reports/2026-11-10-stability-fixes.md)。
 - 2026-11-06（v0.1.2）：跟进官方 SGLang main 27bc1a0（依赖有变化）。修复：SGLang 把 DeepSeek 索引器的 DeepGEMM 路径收窄到 SM100 系列，SM120 显卡（如 RTX PRO 5000）上 520K prefill 慢了 1.8 倍，XTier 加了一个钩子让 SM120 继续走 DeepGEMM，速度恢复；Engram 补上 SGLang 新加的 MXFP4 属性；变长验证改用 SGLang 自己的映射。三个模型回归通过，详见[报告](docs/reports/2026-11-06-sglang-27bc1a0.md)。
-- 2026-11-06（晚）：DeepSeek V4.1 的变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了（感谢 [cyrus-xc](https://github.com/cyrus-xc)，[#13](https://github.com/a775828b-dot/xtier/pull/13)）。要配本机实测的成本表才生效（`tools/sps_profile.py`）：我们的测试机上单请求不变，两个请求同时快 17%，照抄 0 错。默认仍是 static，启动台的 DS 卡可选「变长」；其他机器请先测表。详见[报告](docs/reports/2026-11-06-ds-compact-verify.md)。
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
 ## 许可
