@@ -138,6 +138,13 @@ for other in ({'cpushare': 'off'}, {'packs': 'off'}, {'cold': '30'}):
     assert 'CPU 分担' not in console.describe('ds41', {**ds, **other}), other
 assert 'XTIER_PREFILL_CPU_SHARE' not in console.build('ds41', old)[0]
 assert console.validate('ds41', old)['cpushare'] == 'on'   # the page and a start through validate() fill the default
+# the KV pool of all requests together (KV_POOL, the run script's --max-total-tokens): 1M tokens on this card with
+# the packs, whatever the context of a request (the option's label says so); one context for the baseline
+assert env['KV_POOL'] == '1048576' and env['CONTEXT'] == '524288'
+assert console.build('ds41', {**ds, 'context': '262144'})[0]['KV_POOL'] == '1048576'
+assert console.build('ds41', {**ds, 'packs': 'off'})[0]['KV_POOL'] == '524288'
+assert 'KV 池 1M' in next(o for o in models['ds41']['options'] if o['key'] == 'context')['label']
+assert 'KV 池 1M' not in next(o for o in models['glm53']['options'] if o['key'] == 'context')['label']
 cold = next(o for o in models['ds41']['options'] if o['key'] == 'cold')
 if not console.unavailable(cold):
     env, argv = console.build('ds41', console.validate('ds41', {'cold': '30'}))

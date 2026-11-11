@@ -20,4 +20,6 @@ $D/env/bin/python $HERE/../../tools/vram_limit.py $VRAM_MIB $$ $ready &
 for i in $(seq 1 120); do [ -s $ready ] && break; sleep 0.5; done
 [ -s $ready ] || { echo "run-ds-mini: the GPU memory limit did not come up" >&2; exit 1; }
 rm -f $ready
-exec $HERE/../ds41-pro5000-nps4/run-ds-xtier.sh "$@"
+# two requests at a time, as this configuration was measured: run-ds-xtier.sh's four (since 2026-11-12) take another
+# 0.4 GiB of GPU memory for the decode graphs of 3 and 4 requests, not measured within 32 GB
+exec $HERE/../ds41-pro5000-nps4/run-ds-xtier.sh --max-running-requests 2 "$@"

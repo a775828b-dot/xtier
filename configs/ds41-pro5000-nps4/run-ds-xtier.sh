@@ -42,15 +42,24 @@ if [ "${DSPARK:-0}" = 1 ]; then
   # machine: sps-table.json here, SPS_TABLE=FILE for another (tools/sps_profile.py measures one). Here one request
   # verifies nearly full width (5-6 tokens). Two at a time it was 17% faster than static until 2026-11-11, when the
   # projections of two requests moved to b12x and static caught up: 175 against 184 tok/s for two long answers, 165
-  # against 154 tok/s for sampled chat (docs/reports/2026-11-11-decode-step.md)
+  # against 154 tok/s for sampled chat (docs/reports/2026-11-11-decode-step.md). Since 2026-11-12 (v0.1.5) the table
+  # covers 4 requests and the console starts with compact: four at a time make 254 against 212 tok/s
+  # (docs/reports/2026-11-12-ds-four-requests.md). Static stays the default here: the table is this machine's
   export SGLANG_RAGGED_VERIFY_MODE=${SGLANG_RAGGED_VERIFY_MODE:-static} XTIER_DRAFT=${XTIER_DRAFT:-1}
   SPEC=(--speculative-draft-model-path $P/draft --speculative-algorithm DSPARK --speculative-dspark-block-size 5
         --speculative-num-draft-tokens 6 --speculative-dspark-sps-table-path "${SPS_TABLE:-$(cd "$(dirname "$0")" && pwd)/sps-table.json}")
+  # compact packs the tokens it verifies and pads them to the width of a captured graph (6 rows a request). SGLang's
+  # --speculative-dspark-align-verify-tokens-to-graph-tier fills that width with real draft tokens: the padded rows
+  # are computed anyway. Without it the planner verified fewer tokens than the tier it paid for: four requests at a
+  # time 237-245 tok/s, with it 251-254; two 186-190 and 191-197 (2026-11-12)
+  if [ "$SGLANG_RAGGED_VERIFY_MODE" = compact ]; then
+    SPEC+=(--speculative-dspark-align-verify-tokens-to-graph-tier)
+  fi
 fi
 exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-name DeepSeek-V4.1-Flash-1017 \
   --host 127.0.0.1 --port ${PORT:-18190} --tp-size 1 --trust-remote-code --skip-server-warmup \
-  --max-running-requests 2 --chunked-prefill-size $BATCH --max-prefill-tokens $BATCH \
-  --context-length ${CONTEXT:-524288} --max-total-tokens ${CONTEXT:-524288} --mem-fraction-static ${MEM:-0.85} \
+  --max-running-requests 4 --chunked-prefill-size $BATCH --max-prefill-tokens $BATCH \
+  --context-length ${CONTEXT:-524288} --max-total-tokens ${KV_POOL:-${CONTEXT:-524288}} --mem-fraction-static ${MEM:-0.85} \
   --disable-shared-experts-fusion --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode full \
   --fp8-gemm-backend ${FP8_GEMM:-flashinfer_cutlass} \
   --enable-decoder-swa-bounded-replay --enable-deepseek-v4-fp4-indexer \
@@ -62,3 +71,8 @@ exec $D/env/bin/python -m sglang.launch_server --model-path $M --served-model-na
 # auto), small M on b12x (packs/deepseek_v4); FP8_GEMM=auto for the Triton block kernel with the tuned configs.
 # --tool-call-parser, --enable-cache-report: the API as production (tool calls parsed; usage reports the cached prompt
 # tokens, prompt_tokens_details.cached_tokens, which clients such as dsh show as cache hits).
+# --max-running-requests 4 (2 until 2026-11-12), for an agent and its sub-agents: one request is as fast as with 2
+# (27.3-28.3 against 27.7 ms a step; the decode graphs of 3 and 4 requests take 0.4 GiB), two at a time 42.4 ms a step and
+# 192 tok/s in all, four 75.9 ms a step and 212 tok/s in all (static verification; compact, the console's
+# default: 39.0 ms and 191 tok/s, 49.7 ms and 254 tok/s). --max-total-tokens: KV_POOL, the KV pool of all requests
+# together (the console: 1M tokens, 0.86 GiB more than one context of 512K), or one context when it is not set.

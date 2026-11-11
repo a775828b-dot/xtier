@@ -1,15 +1,17 @@
 """FlashInfer's b12x small-M MXFP8 GEMM against its CUTLASS kernel at the row counts the DeepSeek pack sends to b12x
-(packs/deepseek_v4: _b12x_rows, _mxfp8_linear; XTIER_MXFP8_B12X_ROWS, default 1, 4, 5, 6, 10, 12): the same FP8
-weights, scales and activations at DeepSeek V4.1 Flash's projection shapes, so the two can differ only in the order of
-the FP32 sums (on the RTX PRO 5000 the outputs are bitwise equal). Also checks that the hook picks b12x for exactly
-these row counts, and prints the GPU time of a call of both, replayed from a CUDA graph as a server does (activation
-quantize + GEMM). Here the weights stay in the GPU's cache; in a server, where every layer reads its own, the
-1280 -> 32768 projection at 5 rows takes 159 us on CUTLASS and 39 us on b12x. SM120 only: elsewhere the pack leaves
-every call on SGLang's backend, and the test is skipped.
+(packs/deepseek_v4: _b12x_rows, _mxfp8_linear; XTIER_MXFP8_B12X_ROWS, default 1-24: every width a decode graph of up
+to four requests can have): the same FP8 weights, scales and activations at DeepSeek V4.1 Flash's projection shapes, so
+the two can differ only in the order of the FP32 sums (on the RTX PRO 5000 the outputs are bitwise equal, at 25 to 32
+rows too). Also checks how the setting is read (counts and ranges), that the hook picks b12x for exactly these row
+counts, and prints the GPU time of a call of both, replayed from a CUDA graph as a server does (activation quantize +
+GEMM). Here the weights stay in the GPU's cache; in a server, where every layer reads its own, the 1280 -> 32768
+projection at 5 rows takes 159 us on CUTLASS and 39 us on b12x. SM120 only: elsewhere the pack leaves every call on
+SGLang's backend, and the test is skipped.
 
-  python tests/ds_mxfp8_rows_check.py [--rows 1,4,5,6,10,12]
+  python tests/ds_mxfp8_rows_check.py [--rows 5,6,12]
 """
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -36,6 +38,19 @@ rows_list = [int(r) for r in A.rows.split(',') if r.strip()]
 torch.manual_seed(20261111)
 ok = True
 
+# the setting: counts and ranges, comma separated; empty: no row count
+saved = os.environ.get('XTIER_MXFP8_B12X_ROWS')
+for text, want in (('1,4-6, 12', {1, 4, 5, 6, 12}), ('1-24', set(range(1, 25))), ('6', {6}), ('', set())):
+    os.environ['XTIER_MXFP8_B12X_ROWS'] = text
+    got = pack._b12x_rows.__wrapped__()
+    if got != want:
+        ok = False
+        print(f'FAIL: XTIER_MXFP8_B12X_ROWS={text!r} read as {sorted(got)}')
+if saved is None:
+    del os.environ['XTIER_MXFP8_B12X_ROWS']
+else:
+    os.environ['XTIER_MXFP8_B12X_ROWS'] = saved
+
 # the hook: b12x for the listed row counts, SGLang's backend for the others and for a caller that named another one
 seen = []
 
@@ -44,7 +59,7 @@ def fake(input, *args, **kwargs):
     seen.append(kwargs.get('backend'))
 
 
-for rows in sorted(set(rows_list) | {2, 3, 7, 8, 16, 4096}):
+for rows in sorted(set(rows_list) | {2, 3, 7, 8, 16, 25, 32, 4096}):
     pack._mxfp8_linear(fake, torch.empty(rows, 64), backend='cutlass')
     want = 'b12x' if rows in pack._b12x_rows() else 'cutlass'
     if seen[-1] != want:

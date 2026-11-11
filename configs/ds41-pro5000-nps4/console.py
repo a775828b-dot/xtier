@@ -1,6 +1,7 @@
 """XTier console entry (xtier/console): DeepSeek V4.1 Flash 1017 on one RTX PRO 5000, NPS4 host. Option defaults = the
 README "+ 加速包" row: 48K prefill chunks with 35 hot slots per layer (the elastic expert cache gives decode the slots
-a chunk's forward needs back, up to 68), the CPU's share of prefill, Engram rows on NVMe with a 4 GiB row cache, DSpark.
+a chunk's forward needs back, up to 68), the CPU's share of prefill, Engram rows on NVMe with a 4 GiB row cache, DSpark;
+a KV pool of 1M tokens for the server's four running requests (POOL).
 
 48K chunks, not 22K (2026-11-11, docs/reports/2026-11-11-prefill-chunk.md): every chunk uploads each layer's experts
 that are not in the hot slots, about 2.5 s a chunk whatever its size, so a larger chunk spreads that over more tokens
@@ -20,22 +21,43 @@ COLD_PATHS = [f'/data/fast/cold{i}/xtier-cold' for i in (1, 2, 3, 4)]
 # filling the 512K pool and two agent_bench rounds without an out-of-memory error, 69.0 of 71.7 GiB at the peak;
 # 32K + 43 and 22K + 50 read 520K prompts too. More slots than this are started as this many.
 CHUNK_SLOTS = {'49152': 35, '32768': 43, '22528': 50, '20480': 50, '16384': 50}
+# Tokens of the KV pool of all requests together (KV_POOL, the run script's --max-total-tokens), with the packs. The
+# server runs 4 requests at a time since 2026-11-12 (an agent and its sub-agents), and in a pool of one context what
+# the sub-agents read evicts the main session's cached prompt. 1,673 bytes a token: 0.86 GiB for the 512K tokens above
+# a context, one hot slot per layer less while decoding (27.4 against 27.3-27.8 ms a step: no difference), the GPU
+# memory peak of a 520K prompt 70,776 against 70,596 MiB (docs/reports/2026-11-12-ds-four-requests.md)
+POOL = 1048576
+
+
+def _common():
+    """The options every model has; the context's label and hint say what the KV pool is on this card."""
+    options = common_options('DSpark')
+    context = next(o for o in options if o['key'] == 'context')
+    context.update(label='上下文 · KV 池 1M', hint=(
+        '单个请求的上限。所有请求共用的 KV 池固定 1M token（基线配置和上下文一样大）：池子比上下文大，主会话的缓存就不会被子 agent '
+        '的提示挤掉。约 37 万 token 的会话在 3 个 8 万 token 的请求之后回来，1M 池缓存全在、首字 1.8 秒；512K 池被挤掉 12 万 token、'
+        '要重读 20 秒（11-12 实测）。比 512K 的池多占 0.86 GiB 显存，decode 时每层少 1 个热专家槽，速度没有可测的差别'))
+    return options
+
 
 MODEL = {
     'id': 'ds41', 'order': 30,
     'name': 'DeepSeek V4.1 Flash 1017', 'code': 'DSV4.1-1017', 'port': 18190, 'served': 'DeepSeek-V4.1-Flash-1017',
     'spec': 'DSpark', 'arch': '40 层 · 384 专家 · Engram 189 GB 行放 NVMe · MXFP4',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2400,
-    # README agent speed (production's agent_bench, two rounds, 2026-11-11 with 48K chunks, the CPU's share of
-    # prefill, the draft's projections on b12x; static verification): decode of the long responses (>= 300 tokens),
+    # README agent speed (production's agent_bench, two rounds, 2026-11-12, v0.1.5: these defaults, compact
+    # verification, expert calls of up to 16 tokens): decode of the long responses (>= 300 tokens),
     # cold prefill of the 64K / 500K sessions (mean of the rounds)
-    'bench': {'kind': 'agent', 'dec': '160.2', 'pre': '5838 / 6668',
+    'bench': {'kind': 'agent', 'dec': '156.9', 'pre': '5822 / 6674',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
-    'options': common_options('DSpark') + [
-        {'key': 'verify', 'label': 'DSpark 验证', 'default': 'static',
-         'choices': [['static', '固定（static）'], ['compact', '变长（compact）· 本机实测成本表']],
-         'hint': '变长：按本机实测的成本表（sps-table.json）决定每个请求验证几个草稿 token；单请求和固定差不多。两个请求同时原来比固定快 17%，'
-                 '11-11 固定验证的两请求路径变快以后两者差不多（聊天变长快 7%，代码长回答固定快 5%；照抄 0 错）。换机器要用 tools/sps_profile.py 重测这张表',
+    'options': _common() + [
+        # compact since 2026-11-12, with 4 running requests: a step's time goes by the rows verified in all (a tier of
+        # 6 rows each), so with several requests it pays to verify fewer tokens a request
+        {'key': 'verify', 'label': 'DSpark 验证', 'default': 'compact',
+         'choices': [['compact', '变长（compact）· 实测 · 本机成本表'], ['static', '固定（static）']],
+         'hint': '变长：按本机实测的成本表（sps-table.json，测到 4 个请求）决定每个请求验证几个草稿 token，再补满到图的档位。每步时间按验证的总行数分档，'
+                 '请求多的时候少验更快：4 个请求同时合计 254 对固定的 212 tok/s，2 个请求和单请求两者差不多（11-12 实测）。照抄 0 错。'
+                 '换机器要用 tools/sps_profile.py 重测这张表，没有重测时选固定',
          'off_when': [{'spec': 'off'}]},
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
          'choices': [['4', '4 GiB · 实测'], ['8', '8 GiB'], ['16', '16 GiB']]},
@@ -87,13 +109,19 @@ MODEL = {
 }
 
 
+def _pool(o):
+    """Tokens of the KV pool: POOL with the packs (a context at least), one context for the baseline."""
+    context = int(o['context'])
+    return context if o['packs'] == 'off' else max(context, POOL)
+
+
 def build(o, port):
     """(environment additions, argv) for validated options o."""
     base = o['packs'] == 'off'
     chunk = '22528' if base else o['chunk']   # the baseline: production's chunks and slots, no elastic cache
     slots = '50' if base else str(min(int(o['slots']), CHUNK_SLOTS[chunk]))
     env = {'XTIER_THREADS': o['threads'], 'PORT': str(port), 'DSPARK': '1' if o['spec'] == 'on' else '0',
-           'CONTEXT': o['context'], 'BATCH': chunk, 'XTIER_CACHE_SLOTS': slots,
+           'CONTEXT': o['context'], 'KV_POOL': str(_pool(o)), 'BATCH': chunk, 'XTIER_CACHE_SLOTS': slots,
            'XTIER_ENGRAM_CACHE_GIB': o['engram']}
     if base:   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
