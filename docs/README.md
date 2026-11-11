@@ -23,7 +23,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 |---|---|
 | 从空机器到第一次请求：环境、模型准备、启动命令、测试请求 | [快速开始](quickstart.md)（[English](quickstart.en.md)） |
 | 已经有 SGLang 环境 | [快速上手](../README.md#快速上手) |
-| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v014-的测试环境)、[constraints.txt](../constraints.txt) |
+| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v015-的测试环境)、[constraints.txt](../constraints.txt) |
 | 不加载模型，核对 SGLang 和 XTier 对得上 | `python tools/check_sglang.py --strict` |
 | 单卡 24 GB（RTX 4090 / 3090）和约 120 GB 内存，比如租用的云主机 | [Qwen3.8 配置](../configs/qwen38-rtx4090-3090/README.md) |
 | Zen2 + 双卡（已准备，还没有在这类机器上跑过） | [部署说明](deploy-zen2-dual-gpu.md) |
