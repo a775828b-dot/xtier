@@ -25,8 +25,9 @@ Safety, so that a model never runs out of memory because of the extra slots:
 - XTIER_CACHE_ELASTIC_RESERVE_GIB (2): free device memory never given to slots (lazy kernel loads, workspaces);
 - before every forward that allocates (prefill, mixed, draft extend) the deficit to its predicted need x
   XTIER_CACHE_ELASTIC_MARGIN (1.25) plus the reserve is released;
-- every XTIER_CACHE_ELASTIC_CHECK (16) decode forwards: free memory under XTIER_CACHE_ELASTIC_CRITICAL_GIB (1)
-  releases every extra slot and stops growing for XTIER_CACHE_ELASTIC_COOLDOWN_S (600);
+- every XTIER_CACHE_ELASTIC_CHECK (16) decode forwards: free memory under XTIER_CACHE_ELASTIC_CRITICAL_GIB (1), also
+  once the allocator's cache is emptied, releases every extra slot and stops growing for
+  XTIER_CACHE_ELASTIC_COOLDOWN_S (600);
 - an out-of-memory error in a forward while extra slots are held releases them all, empties the allocator's cache,
   turns the elastic cache off for the process and runs the forward once more. That keeps the server up, but the second
   run is not the first run: the layers before the error have already updated what a forward updates in place (with an
@@ -381,7 +382,11 @@ class Governor:
         self.decodes += 1
         if self.decodes % self.every:
             return
-        if self.extra > 0 and self.free_bytes() < self.critical:
+        # What a prefill left in the allocator's cache is not in use: read again once that is emptied. A 128K prompt's
+        # last chunk that needed 4 GiB more than predicted left 0.9 GiB free on the device, held by the cache alone
+        # (2026-11-12, DeepSeek V4.1 with a 1M-token KV pool): every extra slot went back, none was added for the
+        # cooldown, and decode was 10% slower for one request, 20% for four
+        if self.extra > 0 and self.free_bytes() < self.critical and self.free_bytes(empty=True) < self.critical:
             self.emergency(f'free memory under {self.critical / GIB:.1f} GiB')
             return
         # not before a request's prefill has been seen: the decode-sized forwards of SGLang's start-up (CUDA graph
