@@ -27,7 +27,7 @@ export CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 PATH=$CUDA_HOME
 | 内容 | 命令（都在 `tests/` 下） |
 |---|---|
 | 不需要模型 | `fp4_decode_check` `fp8_decode_check` `fp8_encode_check` `qsa_decode_check` `qsa_fp4_check` `qsa_fp8_check` `qsa_prefill_check` `ds_sparse_mla_check` `ds_fp8_soft_check` `hc_mix_check` `ple_blocks_check` `swiglu_oai_check` `spec_truncate_check` `glm_indexer_torch_check` `draft_bf16_check` `draft_lmhead_fp8_check` `fp8_weights_check` `elastic_check` `elastic_need_check` `elastic_release_check` `elastic_chunk_check` `tables_check` `table_lookup_check` `ds_wo_a_check` `ds_w8a16_check` `direct_load_check` `pool_wrap_check` `prefill_errors_check` `startup_checks_check` |
-| 每个模型（`--preset ds41_1017`、`glm53`、`qwen38`） | `formats_check`；`mailbox_check --threads N`；`cache_check --threads N --slots 64`；`hybrid_prefill_check --threads N --slots 64 --lengths 100,500,1000`；`resident_prefill_check`；`miss_gpu_check --threads N`；DeepSeek 另跑 `prefill_fp4_retry_check`（SM120 的 FP4 prefill 失败后重跑） |
+| 每个模型（`--preset ds41_1017`、`glm53`、`qwen38`） | `formats_check`；`mailbox_check --threads N`；`cache_check --threads N --slots 64`；`hybrid_prefill_check --threads N --slots 64 --lengths 100,500,1000`；`resident_prefill_check`；`miss_gpu_check --threads N`；DeepSeek 另跑 `prefill_fp4_retry_check`（SM120 的 FP4 prefill 失败后重跑）、`prefill_cpu_share_check --threads N`（CPU 分担 prefill） |
 | CPU 模拟多卡 | `tp_check --preset glm53 --tp 2` |
 | 冷专家（往盘上写测试数据） | `cold_punch_check DIR`（再用 `XTIER_COLD_UNITS=3` 跑一次）；`cold_sole_copy_check DIR`；`cold_passes_check DIR1 DIR2`；`cold_prefill_check --store DIR1 DIR2` |
 | 两张卡 | `second_gpu_check` |

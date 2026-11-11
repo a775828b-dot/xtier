@@ -1,0 +1,60 @@
+[
+ {
+  "context": 131072,
+  "prompt_tokens": 131131,
+  "output_tokens": 1024,
+  "ttft_s": 23.63,
+  "prefill_tok_s": 5549.0,
+  "decode_tok_s": 101.9,
+  "decode_runs": [
+   105.3,
+   98.4
+  ],
+  "output_runs": [
+   1024,
+   1024
+  ],
+  "repeat_ttft_s": [
+   5.68
+  ],
+  "step_ms": 29.28,
+  "accept_len": 2.98,
+  "step_ms_runs": [
+   29.52,
+   29.04
+  ],
+  "accept_runs": [
+   3.1,
+   2.85
+  ]
+ },
+ {
+  "context": 131072,
+  "prompt_tokens": 131131,
+  "output_tokens": 1024,
+  "ttft_s": 19.74,
+  "prefill_tok_s": 6643.1,
+  "decode_tok_s": 98.2,
+  "decode_runs": [
+   99.3,
+   97.1
+  ],
+  "output_runs": [
+   1024,
+   1024
+  ],
+  "repeat_ttft_s": [
+   5.77
+  ],
+  "step_ms": 30.65,
+  "accept_len": 3.0,
+  "step_ms_runs": [
+   30.75,
+   30.55
+  ],
+  "accept_runs": [
+   3.05,
+   2.96
+  ]
+ }
+]

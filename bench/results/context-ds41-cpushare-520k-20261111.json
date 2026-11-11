@@ -1,0 +1,31 @@
+[
+ {
+  "context": 520000,
+  "prompt_tokens": 520059,
+  "output_tokens": 1024,
+  "ttft_s": 83.49,
+  "prefill_tok_s": 6229.3,
+  "decode_tok_s": 90.1,
+  "decode_runs": [
+   89.7,
+   90.5
+  ],
+  "output_runs": [
+   1024,
+   1024
+  ],
+  "repeat_ttft_s": [
+   6.23
+  ],
+  "step_ms": 31.58,
+  "accept_len": 2.84,
+  "step_ms_runs": [
+   31.76,
+   31.41
+  ],
+  "accept_runs": [
+   2.84,
+   2.84
+  ]
+ }
+]

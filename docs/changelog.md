@@ -7,7 +7,9 @@
   4,107 / 4,893 → 5,268–5,886 / 6,576–6,600 tok/s，长回复每步 30.3 → 30.2–30.7 ms）。大块的 forward 多用的显存从热专家槽里让：每层
   基础槽 50 → 35，decode 时弹性热专家槽补回到 68；启动台按分块限制槽数（48K 至多 35、32K 至多 43、22K 及以下至多 50），关弹性时给出提示。
   「Prefill 中穿插 decode」默认 48 → 72 步：另一个请求仍保持约 20% 的速度，最长停顿 4.7 → 7.4 秒。520K 提示、两个请求占满 512K KV 池、
-  两轮 agent_bench 实跑没有显存不足。GLM、Qwen 实测分块加大没有收益，不改；让 CPU 分担 prefill 试了三版，只快 5–10%，没有合并。
+  两轮 agent_bench 实跑没有显存不足。GLM、Qwen 实测分块加大没有收益，不改；让空闲的 CPU 分担 prefill 作为可选项合并，默认关
+  （`XTIER_PREFILL_CPU_SHARE=1`，启动台 DeepSeek 卡片「CPU 分担 prefill」）：读长提示时路由少的专家块不上传，交给 CPU 同时算，
+  48K 分块下再快约 3%，22K 分块下快 7–10%，输出和关着时有微小差别（照抄 0 错）。
   `run-ds-xtier.sh` 自己的默认值没有改。[报告](reports/2026-11-11-prefill-chunk.md)
 - 2026-11-10（v0.1.4）：长提示在读时让另一个请求继续 decode。SGLang 调度时 prefill 优先，一个请求读 20 万 token 的冷提示时，另一个请求的 decode 停 40 秒左右。
   启动台加选项「Prefill 中穿插 decode」（SGLang 自带的 `--prefill-decode-interval`），**默认开**：每读完一块先让另一个请求 decode 若干步。默认挡

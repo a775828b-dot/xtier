@@ -242,7 +242,7 @@ SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速
 
 ## 版本更新
 
-- 2026-11-11：DeepSeek V4.1 的冷 prefill 快 28–35%，decode 不变。启动台默认的 prefill 分块从 22K 改成 48K：每读一块都要花约 2.5 秒把专家传上显卡，块大了这段时间摊给更多 token。每层热专家基础槽 50 → 35，decode 时弹性热专家槽补回到 68；「Prefill 中穿插 decode」默认 48 → 72 步，另一个请求仍保持约 20% 的速度（最长停顿 4.7 → 7.4 秒）。520K 提示和两个请求占满 512K KV 池实跑没有显存不足。GLM、Qwen 实测分块加大没有收益，不改。[报告](docs/reports/2026-11-11-prefill-chunk.md)
+- 2026-11-11：DeepSeek V4.1 的冷 prefill 快 28–35%，decode 不变。启动台默认的 prefill 分块从 22K 改成 48K：每读一块都要花约 2.5 秒把专家传上显卡，块大了这段时间摊给更多 token。每层热专家基础槽 50 → 35，decode 时弹性热专家槽补回到 68；「Prefill 中穿插 decode」默认 48 → 72 步，另一个请求仍保持约 20% 的速度（最长停顿 4.7 → 7.4 秒）。520K 提示和两个请求占满 512K KV 池实跑没有显存不足。GLM、Qwen 实测分块加大没有收益，不改。新增可选项「CPU 分担 prefill」（`XTIER_PREFILL_CPU_SHARE=1`，默认关）：读长提示时让空闲的 CPU 算路由少的专家，再快约 3%。[报告](docs/reports/2026-11-11-prefill-chunk.md)
 - 2026-11-10（v0.1.4）：一个请求读长提示时，另一个正在 decode 的请求不再整段停住。SGLang 调度时 prefill 优先，旁边有 20 万 token 的冷提示在读时另一个请求要停 40 秒左右。启动台现在默认加 SGLang 自带的 `--prefill-decode-interval`（DeepSeek 48 / GLM 64 / Qwen 96 步，可改可关）：另一个请求保留约两成速度，最长等一块 prefill 的时间（约 5 秒），长提示首字晚 26–28%，单个请求不变。修复：弹性热专家槽在一个提示的分块之间不再加回又释放（DeepSeek 每块白传 8.4 GiB）。详见[报告](docs/reports/2026-11-10-prefill-interleave.md)。
 - 2026-11-10（v0.1.3）：稳定性审阅后的修复，正常路径不变。别的程序抢 CPU 时解码会慢十倍：启动台给服务高 CPU 权重，登录会话里的程序用 `tools/low_cpu.sh` 起；SGLang 的指标文件挪到内存盘，系统盘卡住不再拖停解码；装钩子出错直接退出，不再带着半套 XTier 起；DeepSeek 的 FP4 prefill 失败后重跑不再段错误；冷存储是唯一副本时不会被别的目录用零重写；崩溃时不再把几百 GiB 内存写进核心转储。详见[报告](docs/reports/2026-11-10-stability-fixes.md)。
 - 2026-11-06（v0.1.2）：跟进官方 SGLang main 27bc1a0（依赖有变化）。修复：SGLang 把 DeepSeek 索引器的 DeepGEMM 路径收窄到 SM100 系列，SM120 显卡（如 RTX PRO 5000）上 520K prefill 慢了 1.8 倍，XTier 加了一个钩子让 SM120 继续走 DeepGEMM，速度恢复；Engram 补上 SGLang 新加的 MXFP4 属性；变长验证改用 SGLang 自己的映射。三个模型回归通过，详见[报告](docs/reports/2026-11-06-sglang-27bc1a0.md)。
