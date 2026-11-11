@@ -34,6 +34,10 @@ export XTIER_CACHE_EVERY=${XTIER_CACHE_EVERY:-2} XTIER_CACHE_SWAPS=${XTIER_CACHE
 # DSpark verify truncated where the draft's survival falls below 0.3 (lossless; packs/speculative/dspark_truncate.py):
 # the dropped verify tokens skip their CPU experts, agent decode +11% at 512K / 8 slots
 export XTIER_DSPARK_TRUNCATE=${XTIER_DSPARK_TRUNCATE:-0.3}
+# MXFP8 projections on FlashInfer's b12x at the row counts measured here (packs/deepseek_v4's default now adds the
+# DSpark draft's 5 rows and two requests' 10 and 12: not measured on this model, its development is paused). An empty
+# value (no b12x) stays empty.
+export XTIER_MXFP8_B12X_ROWS=${XTIER_MXFP8_B12X_ROWS-1,4,6}
 SPEC=()
 if [ "${DSPARK:-1}" = 1 ]; then
   export SGLANG_RAGGED_VERIFY_MODE=static   # M3.1 NVFP4 DSpark requires it (SGLang's MiniMax M3 argument checks)

@@ -28,8 +28,13 @@
   at decode sizes (on the RTX PRO 5000 63 ms of a 68 ms decode step). Files of this directory win over SGLang's own.
 - MXFP8 dense GEMMs at decode sizes on b12x: with --fp8-gemm-backend flashinfer_cutlass SGLang serves the
   32 x 32 block FP8 projections as MXFP8 on FlashInfer CUTLASS (on auto it keeps the Triton block kernel, which on
-  SM120 has no split-K); calls of XTIER_MXFP8_B12X_ROWS rows (default 1, 4, 6: decode and DSpark verify widths,
-  as the 1017 pipeline's verify6 fast path) take FlashInfer's b12x small-M kernels instead.
+  SM120 has no split-K); calls of XTIER_MXFP8_B12X_ROWS rows take FlashInfer's b12x small-M kernels instead. Default
+  1, 4, 5, 6, 10, 12: plain decode and, with DSpark, the draft's block of 5 rows and the verify's 6 rows a request, for
+  one and two requests (the 1017 pipeline's verify6 fast path, and this pack until 2026-11-11, had 1, 4 and 6: the
+  draft's projections and every projection of two requests stayed on CUTLASS, 125-159 us against 39-41 us for the
+  same weights on the RTX PRO 5000, the outputs bitwise equal (tests/ds_mxfp8_rows_check.py); a decode step -0.8 ms,
+  a step of two requests with static verification 52.3 -> 44.0 ms; docs/reports/2026-11-11-decode-step.md). A list,
+  not a bound, so that only the widths the decode graphs use change kernels.
 - Attention wo_a at decode sizes on a Triton grouped einsum, the target's weights in the checkpoint's FP8
   (``XTIER_DS_WO_A``, default on; the 1017 pipeline's LKQMOE_DS41_WO_A_TRITON / _FP8): SGLang dequantizes the 32 x 32
   block FP8 wo_a to BF16 and cuBLAS runs the einsum on an SM80 WMMA kernel, 71-75 us per layer at the DSpark
@@ -317,7 +322,7 @@ def _replay_tail(original, cls, model, *args, **kwargs):
 def _b12x_rows():
     if torch.cuda.get_device_capability()[0] != 12:
         return frozenset()
-    return frozenset(int(r) for r in os.environ.get('XTIER_MXFP8_B12X_ROWS', '1,4,6').split(',') if r.strip())
+    return frozenset(int(r) for r in os.environ.get('XTIER_MXFP8_B12X_ROWS', '1,4,5,6,10,12').split(',') if r.strip())
 
 
 def _mxfp8_linear(original, input, *args, **kwargs):

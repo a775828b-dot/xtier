@@ -26,16 +26,16 @@ MODEL = {
     'name': 'DeepSeek V4.1 Flash 1017', 'code': 'DSV4.1-1017', 'port': 18190, 'served': 'DeepSeek-V4.1-Flash-1017',
     'spec': 'DSpark', 'arch': '40 层 · 384 专家 · Engram 189 GB 行放 NVMe · MXFP4',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2400,
-    # README agent speed (production's agent_bench, two rounds, 2026-11-11 with 48K chunks and the CPU's share of
-    # prefill): decode of the long responses (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the
-    # rounds)
-    'bench': {'kind': 'agent', 'dec': '134.3', 'pre': '5738 / 6670',
+    # README agent speed (production's agent_bench, two rounds, 2026-11-11 with 48K chunks, the CPU's share of
+    # prefill, the draft's projections on b12x; static verification): decode of the long responses (>= 300 tokens),
+    # cold prefill of the 64K / 500K sessions (mean of the rounds)
+    'bench': {'kind': 'agent', 'dec': '160.2', 'pre': '5838 / 6668',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('DSpark') + [
         {'key': 'verify', 'label': 'DSpark 验证', 'default': 'static',
          'choices': [['static', '固定（static）'], ['compact', '变长（compact）· 本机实测成本表']],
-         'hint': '变长：按本机实测的成本表（sps-table.json）决定每个请求验证几个草稿 token；单请求和固定一样，两个请求同时约快 17%'
-                 '（11-06 实测，照抄 0 错）。换机器要用 tools/sps_profile.py 重测这张表',
+         'hint': '变长：按本机实测的成本表（sps-table.json）决定每个请求验证几个草稿 token；单请求和固定差不多。两个请求同时原来比固定快 17%，'
+                 '11-11 固定验证的两请求路径变快以后两者差不多（聊天变长快 7%，代码长回答固定快 5%；照抄 0 错）。换机器要用 tools/sps_profile.py 重测这张表',
          'off_when': [{'spec': 'off'}]},
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
          'choices': [['4', '4 GiB · 实测'], ['8', '8 GiB'], ['16', '16 GiB']]},

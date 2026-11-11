@@ -40,7 +40,9 @@ SPEC=()
 if [ "${DSPARK:-0}" = 1 ]; then
   # SGLANG_RAGGED_VERIFY_MODE=compact (variable-length verification) budgets by an SPS cost table measured on this
   # machine: sps-table.json here, SPS_TABLE=FILE for another (tools/sps_profile.py measures one). Here one request
-  # verifies full width as static does, two at a time 17% faster (docs/reports/2026-11-06-ds-compact-verify.md)
+  # verifies nearly full width (5-6 tokens). Two at a time it was 17% faster than static until 2026-11-11, when the
+  # projections of two requests moved to b12x and static caught up: 175 against 184 tok/s for two long answers, 165
+  # against 154 tok/s for sampled chat (docs/reports/2026-11-11-decode-step.md)
   export SGLANG_RAGGED_VERIFY_MODE=${SGLANG_RAGGED_VERIFY_MODE:-static} XTIER_DRAFT=${XTIER_DRAFT:-1}
   SPEC=(--speculative-draft-model-path $P/draft --speculative-algorithm DSPARK --speculative-dspark-block-size 5
         --speculative-num-draft-tokens 6 --speculative-dspark-sps-table-path "${SPS_TABLE:-$(cd "$(dirname "$0")" && pwd)/sps-table.json}")
