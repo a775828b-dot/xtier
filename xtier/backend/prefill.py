@@ -284,7 +284,11 @@ def cpu_share():
     Measured on DeepSeek V4.1 (2026-11-11, docs/reports/2026-11-11-prefill-chunk.md): cold prefill +7-10% at 22K-token
     prefill chunks (4 in 10 expert chunks not uploaded, 6% of the routes on the CPU), +3% at 48K-token chunks, nothing
     at 64K. The CPU computes a route about 15 times slower than the GPU, so the gain is the uploads left out, and a
-    larger chunk routes more tokens to every expert: less is left for the CPU."""
+    larger chunk routes more tokens to every expert: less is left for the CPU. The console's DeepSeek card sets it.
+
+    Only this path has it. On NVFP4 layers (GLM-5.3, Qwen3.8) the uploads overlap the GEMMs and cost no time: splitting
+    their large prefill calls by experts between the GPU and the CPU engine was measured slower (the cold prefill of a
+    128K prompt -33% on GLM-5.3, -6..11% on Qwen3.8) and was not merged."""
     return os.environ.get('XTIER_PREFILL_CPU_SHARE', '0') == '1'
 
 

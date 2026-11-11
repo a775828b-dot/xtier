@@ -1,7 +1,7 @@
 # 测速细节
 
 [README](../README.md)「测速」各表的测法、配置、精度和原始数据。单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）
-+ 384 GiB DDR5，XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测的（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s。后面的版本没有重测这些表，只有 DeepSeek 加速包那两行在 2026-11-11 重测（v0.1.4，prefill 分块改成 48K）。
++ 384 GiB DDR5，XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测的（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s。后面的版本没有重测这些表，只有 DeepSeek 加速包那两行在 2026-11-11 重测（prefill 分块改成 48K、CPU 分担 prefill）。
 
 ## 测法
 
@@ -13,20 +13,23 @@
 
 ## DeepSeek V4.1 Flash 1017
 
-- 加速包（2026-11-11 重测，启动台默认：48K 分块、每层 35 槽、弹性热专家槽）对基线（2026-10 下旬测，22K 分块、50 槽）：长回复每步
-  30.4 对 50.9 ms（快 40%），冷 prefill 64K / 500K 5,577 / 6,588 对 3,318 / 3,627（快 68% / 82%）。
+- 加速包（2026-11-11 重测，启动台默认：48K 分块、每层 35 槽、弹性热专家槽、CPU 分担 prefill）对基线（2026-10 下旬测，22K 分块、
+  50 槽）：长回复每步 30.4 对 50.9 ms（快 40%），冷 prefill 64K / 500K 5,738 / 6,670 对 3,318 / 3,627（快 73% / 84%）。
+- CPU 分担 prefill（2026-11-11，DeepSeek 启动台默认开）：读长提示时路由少的专家块不上传，交给空闲的 CPU 同时算。同一天不开时的
+  两轮：冷 prefill 64K / 500K 5,268–5,886 / 6,576–6,600，长回复每步 30.2–30.7 ms；开着是上表的 5,246–6,230 / 6,620–6,721、
+  30.3–30.5 ms，128K 以上的会话快 1–3%。GLM、Qwen 上实测更慢，不开，见同一份[报告](reports/2026-11-11-prefill-chunk.md)。
 - prefill 分块 48K（2026-11-11，原来 22K）：每读一块，每层都要把不在热专家槽里的专家传上显卡，约 2.5 秒，和块的大小无关；块加大后
   摊给更多 token。同一天用原默认（22K、50 槽）跑的一轮：冷 prefill 64K / 500K 4,107 / 4,893，长回复每步 30.3 ms；改成 48K 后
   5,268–5,886 / 6,576–6,600，每步 30.2–30.7 ms。大块多用的显存从热专家槽里让（50 → 35），decode 时弹性热专家槽补回到 68。
   2026-10-26 的 22K 数据是 4,420 / 4,806、每步 31.2 ms。各档分块、显存、两个请求时的表现和 GLM / Qwen 的结果见[报告](reports/2026-11-11-prefill-chunk.md)。弹性热专家槽（decode 时把只有 prefill 才用的显存借给热专家，至多 68 槽）把每步
   从 32.6 降到 31.2 ms，见[报告](reports/2026-10-26-elastic-cache.md)。
 - 基线 的 DeepSeek 工具调用解析不逐 token 流式返回参数，工具调用请求量不出 decode（两轮 177 个请求里能计时 13 个），所以只比
-  长回复；加速包第 1 轮可计时的长回复只有 3 个，tok/s 偏低。
+  长回复。
 - 加速包精度：无损——块 FP8 GEMM 的分块配置和内核、Engram 提前查表（取到的行不变）、草稿词表头 FP8（只影响草稿提案，输出仍由主模型
   验证）、wo_a 存检查点的 FP8（还原逐位一致，kernel 与 cuBLAS 只差求和顺序）、索引器走分页路径（logits 与非分页路径逐位相同，top-k
   只在同分时可能选到不同位置），PPL 3.319 → 3.317（分页索引器之前测），照抄 0 错。
 - 和生产管线（lsglang_ds4.1）的 agent 对比见[报告](reports/2026-10-24-ds-woa-minimax.md)。
-- 原始数据：加速包 `bench/results/agent-bench-ds41-chunk48k-r{1,2}-20261111.json`（22K 分块：`agent-bench-ds41-chunk22k-r1-20261111.json`、`agent-bench-ds41-elastic-r{1,2}-20261026.json`；不开弹性：`agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`），
+- 原始数据：加速包 `bench/results/agent-bench-ds41-cpushare-r{1,2}-20261111.json`（不开 CPU 分担：`agent-bench-ds41-chunk48k-r{1,2}-20261111.json`；22K 分块：`agent-bench-ds41-chunk22k-r1-20261111.json`、`agent-bench-ds41-elastic-r{1,2}-20261026.json`；不开弹性：`agent-bench-ds41-xtier-paged-r{1,2}-20261024.json`），
   基线 `bench/results/context-ds41-xtier-base-20261023.json`。
 
 ## Qwen3.8 Flash Next

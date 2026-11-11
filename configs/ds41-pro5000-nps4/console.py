@@ -1,6 +1,6 @@
 """XTier console entry (xtier/console): DeepSeek V4.1 Flash 1017 on one RTX PRO 5000, NPS4 host. Option defaults = the
 README "+ 加速包" row: 48K prefill chunks with 35 hot slots per layer (the elastic expert cache gives decode the slots
-a chunk's forward needs back, up to 68), Engram rows on NVMe with a 4 GiB row cache, DSpark.
+a chunk's forward needs back, up to 68), the CPU's share of prefill, Engram rows on NVMe with a 4 GiB row cache, DSpark.
 
 48K chunks, not 22K (2026-11-11, docs/reports/2026-11-11-prefill-chunk.md): every chunk uploads each layer's experts
 that are not in the hot slots, about 2.5 s a chunk whatever its size, so a larger chunk spreads that over more tokens
@@ -10,7 +10,7 @@ slots: CHUNK_SLOTS."""
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
-                                miss_env, miss_option)
+                                miss_env, miss_option, share_env, share_option, share_tags)
 
 HERE = Path(__file__).resolve().parent
 # the cold-expert store (XTIER_COLD): four PCIe 5.0 drives (the manifest is in the first)
@@ -26,9 +26,10 @@ MODEL = {
     'name': 'DeepSeek V4.1 Flash 1017', 'code': 'DSV4.1-1017', 'port': 18190, 'served': 'DeepSeek-V4.1-Flash-1017',
     'spec': 'DSpark', 'arch': '40 层 · 384 专家 · Engram 189 GB 行放 NVMe · MXFP4',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2400,
-    # README agent speed (production's agent_bench, two rounds, 2026-11-11 with 48K chunks): decode of the long
-    # responses (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the rounds)
-    'bench': {'kind': 'agent', 'dec': '142.5', 'pre': '5577 / 6588',
+    # README agent speed (production's agent_bench, two rounds, 2026-11-11 with 48K chunks and the CPU's share of
+    # prefill): decode of the long responses (>= 300 tokens), cold prefill of the 64K / 500K sessions (mean of the
+    # rounds)
+    'bench': {'kind': 'agent', 'dec': '134.3', 'pre': '5738 / 6670',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('DSpark') + [
         {'key': 'verify', 'label': 'DSpark 验证', 'default': 'static',
@@ -54,12 +55,11 @@ MODEL = {
          'unavailable': lambda: {} if all(Path(p).is_dir() for p in COLD_PATHS)
          else {c: '本机没有冷专家盘目录' for c in ('10', '20', '30')}},
         miss_option([{'cold': c} for c in ('10', '20', '30')]),   # not on layers with cold experts
-        # XTIER_PREFILL_CPU_SHARE (xtier/backend/prefill.py), 2026-11-11: the cold prefill of a 128K prompt +3% at 48K
-        # chunks, of 64K / 520K prompts +10% / +7% at 22K chunks; not on layers with cold experts
-        {'key': 'cpushare', 'label': 'CPU 分担 prefill', 'default': 'off', 'choices': [['off', '关'], ['on', '开']],
-         'hint': '读长提示时 CPU 是空的：路由少的专家块不传上显卡，交给 CPU 同时算。48K 分块下冷 prefill 约快 3%，22K 分块下快 7–10%'
-                 '（11-11 实测），decode 不变。CPU 算的那部分用 BF16 激活（GPU 是 MXFP8），输出和关着时有微小差别',
-         'off_when': [{'packs': 'off'}, *[{'cold': c} for c in ('10', '20', '30')]]},
+        # 2026-11-11: the cold prefill of a 128K prompt +3% at 48K chunks, of 64K / 520K prompts +10% / +7% at 22K
+        # chunks, decode unchanged; on by default since then. Not on layers with cold experts
+        share_option('on', '读长提示时 CPU 是空的：路由少的专家块不传上显卡，交给 CPU 同时算。48K 分块下冷 prefill 约快 3%，'
+                           '22K 分块下快 7–10%（11-11 实测），decode 不变。CPU 算的那部分用 BF16 激活（GPU 是 MXFP8），'
+                           '输出和关着时有微小差别', [{'cold': c} for c in ('10', '20', '30')]),
         # 2026-11-11 at 48K chunks, a 227K-token cold prompt beside a decoding request (158 tok/s alone), 72 steps
         # measured: the decoding request keeps 20% of its speed and waits 7.4 s at the longest, the prompt's first
         # token comes after 44.5 s against 37.4 s alone (484K tokens: 96.0 against 74.3 s). 48 steps (the default of
@@ -104,16 +104,10 @@ def build(o, port):
         env['SGLANG_RAGGED_VERIFY_MODE'] = 'compact'
     if o['cold'] != 'off':   # the store holds every expert: written at the first start, reused after
         env.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(COLD_PATHS), XTIER_COLD_FRACTION=f"0.{o['cold']}")
-    else:
+    else:   # neither on layers with cold experts
         env.update(miss_env(o))
-    if cpu_share(o):
-        env['XTIER_PREFILL_CPU_SHARE'] = '1'
+        env.update(share_env(o))
     return env, [str(HERE / 'run-ds-xtier.sh'), *interleave_args(o)]
-
-
-def cpu_share(o):
-    """The CPU's share of a prefill is on: with the packs, without cold experts."""
-    return o['packs'] == 'on' and o['cold'] == 'off' and o.get('cpushare', 'off') == 'on'
 
 
 def tags(o):
@@ -125,6 +119,6 @@ def tags(o):
         out.append(f"冷专家 {o['cold']}%")
     elif miss_env(o):
         out.append(f"未命中 {o['missgpu']}% GPU 代算")
-    if cpu_share(o):
-        out.append('CPU 分担 prefill')
+    if o['cold'] == 'off':
+        out += share_tags(o)
     return out + interleave_tags(o)

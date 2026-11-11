@@ -129,13 +129,15 @@ assert env0['BATCH'] == '22528' and env0['XTIER_CACHE_SLOTS'] == '50'
 assert env['XTIER_CACHE_ELASTIC'] == '1' and env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '68'
 assert 'XTIER_CACHE_ELASTIC' not in console.build('ds41', {**console.defaults('ds41'), 'packs': 'off'})[0]
 assert 'XTIER_COLD' not in env   # cold experts off by default
-# the CPU's share of a prefill (XTIER_PREFILL_CPU_SHARE): an option of the packs, off by default, not with cold experts
-assert 'XTIER_PREFILL_CPU_SHARE' not in env and 'CPU 分担' not in console.describe('ds41', ds)
-assert console.build('ds41', {**ds, 'cpushare': 'on'})[0]['XTIER_PREFILL_CPU_SHARE'] == '1'
-assert console.describe('ds41', {**ds, 'cpushare': 'on'}).count('CPU 分担 prefill') == 1
-for other in ({'packs': 'off'}, {'cold': '30'}):
-    assert 'XTIER_PREFILL_CPU_SHARE' not in console.build('ds41', {**ds, 'cpushare': 'on', **other})[0]
-    assert 'CPU 分担' not in console.describe('ds41', {**ds, 'cpushare': 'on', **other})
+# the CPU's share of a prefill (XTIER_PREFILL_CPU_SHARE): an option of the packs, on by default on this card, not
+# with cold experts; options saved before it existed start without it
+assert env['XTIER_PREFILL_CPU_SHARE'] == '1' and console.describe('ds41', ds).count('CPU 分担 prefill') == 1
+old = {key: value for key, value in ds.items() if key != 'cpushare'}
+for other in ({'cpushare': 'off'}, {'packs': 'off'}, {'cold': '30'}):
+    assert 'XTIER_PREFILL_CPU_SHARE' not in console.build('ds41', {**ds, **other})[0], other
+    assert 'CPU 分担' not in console.describe('ds41', {**ds, **other}), other
+assert 'XTIER_PREFILL_CPU_SHARE' not in console.build('ds41', old)[0]
+assert console.validate('ds41', old)['cpushare'] == 'on'   # the page and a start through validate() fill the default
 cold = next(o for o in models['ds41']['options'] if o['key'] == 'cold')
 if not console.unavailable(cold):
     env, argv = console.build('ds41', console.validate('ds41', {'cold': '30'}))

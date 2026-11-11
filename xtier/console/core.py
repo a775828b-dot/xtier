@@ -65,6 +65,25 @@ def miss_env(o):
     return {} if o['packs'] == 'off' or o['missgpu'] == 'off' else {'XTIER_DECODE_MISS_GPU': f"0.{o['missgpu']}"}
 
 
+def share_option(default, hint, off_when=()):
+    """The CPU's share of a prefill (XTIER_PREFILL_CPU_SHARE, xtier/backend/prefill.py): while a long prompt is read,
+    the CPU engine, idle then, computes a part of every prefill call that the GPU would otherwise upload and compute.
+    Part of the packs. default and hint per model: what was measured there; off_when: more combinations without
+    effect (cold experts). A toggle switch on the page."""
+    return {'key': 'cpushare', 'label': 'CPU 分担 prefill', 'default': default, 'switch': True,
+            'choices': [['on', '开'], ['off', '关']], 'hint': hint, 'off_when': [{'packs': 'off'}, *off_when]}
+
+
+def share_env(o):
+    """The environment of the share option (with the packs; options saved before it existed: off)."""
+    return {'XTIER_PREFILL_CPU_SHARE': '1'} if o['packs'] == 'on' and o.get('cpushare', 'off') == 'on' else {}
+
+
+def share_tags(o):
+    """Its part of the server's label."""
+    return ['CPU 分担 prefill'] if share_env(o) else []
+
+
 def interleave_option(choices, default, hint):
     """Decode steps between the prefill chunks of a long prompt (SGLang's --prefill-decode-interval N, off there):
     while one request reads a long prompt, the scheduler runs N decode steps of the other request after every chunk
