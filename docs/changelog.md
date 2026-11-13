@@ -2,6 +2,7 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-14（v0.1.6）：跟进官方 SGLang main 084a5e9（27bc1a0 之后 592 个提交），XTier 运行时的代码不用改。依赖：FlashInfer 0.7.4、nvidia-cudnn-frontend 1.32.3、sgl-deep-gemm 0.2.8、sgl-flash-mla 1.0.5。17 个改了源码的被钩函数逐个对过，钩子指纹已更新。三个模型回归通过，decode 持平；DeepSeek 冷 prefill 快约 10%（64K 6,144–6,691、520K 6,761 tok/s，上游改了 DSv4 prefill 的分块），GLM、Qwen 持平。`tools/arch_check.py` 的模拟模式跟着 SGLang JIT 工具链的接口改了一处。换 FlashInfer 后第一次启动要编译内核，会慢几分钟。[报告](reports/2026-11-14-sglang-084a5e9.md)
 - 2026-11-12（v0.1.5）：DeepSeek V4.1 可以同时跑 4 个请求，4 个同时合计 254 tok/s（每步 49.7 ms；原来最多 2 个同时，合计约
   175 tok/s），2 个同时 191 tok/s（每步 39.0 ms，原来 45 ms），只有一个请求时基本不变（每步 27.7–28.2 ms，原来 27.7 ms）。起因是 agent 会
   派子 agent：原来第 3 个请求要排队，子 agent 读进来的内容还会把主会话的缓存挤出只有一个上下文大的 KV 池。改了五处：

@@ -23,7 +23,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 |---|---|
 | 从空机器到第一次请求：环境、模型准备、启动命令、测试请求 | [快速开始](quickstart.md)（[English](quickstart.en.md)） |
 | 已经有 SGLang 环境 | [快速上手](../README.md#快速上手) |
-| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v015-的测试环境)、[constraints.txt](../constraints.txt) |
+| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v016-的测试环境)、[constraints.txt](../constraints.txt) |
 | 不加载模型，核对 SGLang 和 XTier 对得上 | `python tools/check_sglang.py --strict` |
 | 单卡 24 GB（RTX 4090 / 3090）和约 120 GB 内存，比如租用的云主机 | [Qwen3.8 配置](../configs/qwen38-rtx4090-3090/README.md) |
 | Zen2 + 双卡（已准备，还没有在这类机器上跑过） | [部署说明](deploy-zen2-dual-gpu.md) |
@@ -124,6 +124,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-14 跟进 SGLang 084a5e9（v0.1.6）](reports/2026-11-14-sglang-084a5e9.md) | 依赖变化（FlashInfer 0.7.4 等）；17 个改了源码的被钩函数逐个核对、XTier 运行时不用改；模拟 30 系的工具跟着改一处；三个模型的回归；DeepSeek 冷 prefill 快约 10% |
 | [2026-11-12 DeepSeek 同时跑 4 个请求（v0.1.5）](reports/2026-11-12-ds-four-requests.md) | 并发上限 2 → 4、KV 池 1M、一次专家调用最多 16 个 token、变长验证成默认；1、2、4 个请求的速度；成本表测到 4 个请求，每步时间按 6 行一档；子 agent 不再挤掉主会话的缓存；三个模型的回归 |
 | [2026-11-11 DeepSeek decode 一步的构成](reports/2026-11-11-decode-step.md) | GPU 上的大头都已按显存带宽读权重；草稿和两个请求的 FP8 投影改走快内核（每步 −0.6–0.8 ms，两个请求同时 −16%）；成本表重测；多个请求同时的估算 |
 | [2026-11-06 DeepSeek 变长验证（compact）](reports/2026-11-06-ds-compact-verify.md) | 来自 #13：要配本机实测的成本表；照抄 0 错，默认仍是 static（当时两个请求同时快 17%；2026-11-11 固定验证变快以后两者差不多；2026-11-12 成本表测到 4 个请求，变长验证成了启动台的默认） |

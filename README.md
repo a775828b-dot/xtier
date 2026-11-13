@@ -39,7 +39,7 @@ bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟
 从空机器到第一次请求的完整路线（环境、模型准备、启动命令、测试请求）见[快速开始](docs/quickstart.md)。已经有 SGLang 环境时：
 
 ```bash
-git -C /path/to/sglang checkout 27bc1a0615      # 测试过的官方 SGLang main（2026-11-06）
+git -C /path/to/sglang checkout 084a5e9aae      # 测试过的官方 SGLang main（2026-11-13）
 SGLANG_BUILD_RUST_EXTS=none pip install -e /path/to/sglang/python   # 没装 Rust 时跳过 SGLang 可选的 Rust 扩展
 tools/build_engine.sh /path/to/site-packages/nvidia/cu13   # CPU 引擎与信箱库 -> xtier/engine/lib
 pip install --no-deps -e .                      # 注册插件入口 sglang.srt.plugins: xtier
@@ -245,11 +245,11 @@ SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速
 
 ## 版本更新
 
+- 2026-11-14（v0.1.6）：跟进官方 SGLang main 084a5e9（27bc1a0 之后 592 个提交），XTier 运行时的代码不用改。依赖：FlashInfer 0.7.4、nvidia-cudnn-frontend 1.32.3、sgl-deep-gemm 0.2.8、sgl-flash-mla 1.0.5。17 个改了源码的被钩函数逐个对过，钩子指纹已更新。三个模型回归通过，decode 持平；DeepSeek 冷 prefill 快约 10%（64K 6,144–6,691、520K 6,761 tok/s，上游改了 DSv4 prefill 的分块），GLM、Qwen 持平。`tools/arch_check.py` 的模拟模式跟着 SGLang JIT 工具链的接口改了一处。换 FlashInfer 后第一次启动要编译内核，会慢几分钟。[报告](docs/reports/2026-11-14-sglang-084a5e9.md)
 - 2026-11-12（v0.1.5）：DeepSeek V4.1 可以同时跑 4 个请求（原来 2 个）：4 个同时合计 254 tok/s（原来 2 个同时约 175 tok/s），2 个同时 191 tok/s，只有一个请求时基本不变。KV 池加到 1M token（单个请求的上下文仍是 512K），agent 派子 agent 时主会话的缓存不会被挤掉。一次专家调用从最多 8 个 token 改成 16 个（三个模型都一样），几个请求的验证行合在一起算；启动台的 DSpark 验证默认改成变长，成本表测到 4 个请求。多占约 1.2 GiB 显存。三个模型的回归通过。[报告](docs/reports/2026-11-12-ds-four-requests.md)
 - 2026-11-11：DeepSeek V4.1 的 decode 每步少 0.6–0.8 ms，两个请求同时每步 52.3 → 44.0 ms（−16%）。FP8 投影的小批量快内核原来只对 1、4、6 行开，DSpark 草稿模型的 5 行和两个请求同时的 10、12 行走的是慢 3–4 倍的内核；加速包的默认行数改成 1、4、5、6、10、12（`XTIER_MXFP8_B12X_ROWS`），只换内核，照抄 0 错。变长验证的成本表（`sps-table.json`）按新的耗时重测。[报告](docs/reports/2026-11-11-decode-step.md)
 - 2026-11-11：DeepSeek V4.1 的冷 prefill 快 28–35%，decode 不变。启动台默认的 prefill 分块从 22K 改成 48K：每读一块都要花约 2.5 秒把专家传上显卡，块大了这段时间摊给更多 token。每层热专家基础槽 50 → 35，decode 时弹性热专家槽补回到 68；「Prefill 中穿插 decode」默认 48 → 72 步，另一个请求仍保持约 20% 的速度（最长停顿 4.7 → 7.4 秒）。520K 提示和两个请求占满 512K KV 池实跑没有显存不足。GLM、Qwen 实测分块加大没有收益，不改。新增「CPU 分担 prefill」（`XTIER_PREFILL_CPU_SHARE=1`）：读长提示时让空闲的 CPU 算路由少的专家，再快约 3%，DeepSeek 启动台默认开；GLM、Qwen 上实测更慢，不开。[报告](docs/reports/2026-11-11-prefill-chunk.md)
 - 2026-11-10（v0.1.4）：一个请求读长提示时，另一个正在 decode 的请求不再整段停住。SGLang 调度时 prefill 优先，旁边有 20 万 token 的冷提示在读时另一个请求要停 40 秒左右。启动台现在默认加 SGLang 自带的 `--prefill-decode-interval`（DeepSeek 48 / GLM 64 / Qwen 96 步，可改可关）：另一个请求保留约两成速度，最长等一块 prefill 的时间（约 5 秒），长提示首字晚 26–28%，单个请求不变。修复：弹性热专家槽在一个提示的分块之间不再加回又释放（DeepSeek 每块白传 8.4 GiB）。详见[报告](docs/reports/2026-11-10-prefill-interleave.md)。
-- 2026-11-10（v0.1.3）：稳定性审阅后的修复，正常路径不变。别的程序抢 CPU 时解码会慢十倍：启动台给服务高 CPU 权重，登录会话里的程序用 `tools/low_cpu.sh` 起；SGLang 的指标文件挪到内存盘，系统盘卡住不再拖停解码；装钩子出错直接退出，不再带着半套 XTier 起；DeepSeek 的 FP4 prefill 失败后重跑不再段错误；冷存储是唯一副本时不会被别的目录用零重写；崩溃时不再把几百 GiB 内存写进核心转储。详见[报告](docs/reports/2026-11-10-stability-fixes.md)。
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
 ## 许可
