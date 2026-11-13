@@ -37,7 +37,7 @@ einops==0.8.2
 executing==2.3.0
 fastapi==0.159.1
 filelock==3.32.3
-flashinfer-python==0.7.2
+flashinfer-python==0.7.4
 frozenlist==1.8.0
 fsspec==2026.7.0
 gguf==0.19.0
@@ -93,7 +93,7 @@ nvidia-cuda-nvcc==13.0.88
 nvidia-cuda-nvrtc==13.0.88
 nvidia-cuda-runtime==13.0.96
 nvidia-cudnn-cu13==9.24.0.43
-nvidia-cudnn-frontend==1.31.0
+nvidia-cudnn-frontend==1.32.3
 nvidia-cufft==12.0.0.61
 nvidia-cufile==1.15.1.6
 nvidia-curand==10.4.0.35
@@ -162,8 +162,8 @@ setuptools-rust==1.13.0
 setuptools-scm==10.3.4
 setuptools==84.2.1
 sgl-deep-ep==0.1.2.post1
-sgl-deep-gemm==0.2.6
-sgl-flash-mla==1.0.2
+sgl-deep-gemm==0.2.8
+sgl-flash-mla==1.0.5
 sglang-kernel==0.4.10
 shellingham==1.5.4
 six==1.17.0

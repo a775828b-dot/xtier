@@ -157,10 +157,11 @@ def emulate(capability):
     def patch_toolchain(toolchain):
         target_flags = toolchain.target_flags
 
-        def ptx_target_flags():
-            # -gencode=arch=compute_89,code=sm_89 -> code=compute_89: PTX only, the binary is made at load time
+        def ptx_target_flags(*args, **kwargs):
+            # -gencode=arch=compute_89,code=sm_89 -> code=compute_89: PTX only, the binary is made at load time.
+            # The arguments pass through: SGLang 084a5e9 gives the kernel's name (its compile arch may differ)
             return [f.replace(',code=sm_', ',code=compute_') if f.startswith('-gencode=') else f
-                    for f in target_flags()]
+                    for f in target_flags(*args, **kwargs)]
         toolchain.target_flags = ptx_target_flags
 
     _after_import('sglang.kernels.jit.utils.compile.toolchain', patch_toolchain)
