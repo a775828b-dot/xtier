@@ -1,7 +1,7 @@
 # 测速细节
 
 [README](../README.md)「测速」各表的测法、配置、精度和原始数据。单卡 RTX PRO 5000 72GB + 2× EPYC 9334（NPS4）
-+ 384 GiB DDR5，XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测的（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s。后面的版本没有重测这些表，只有 DeepSeek 加速包那两行在 2026-11-11 重测（prefill 分块改成 48K、CPU 分担 prefill、草稿的 FP8 投影走快内核）。
++ 384 GiB DDR5，基线与 Qwen3.8、GLM-5.3 各行在 XTier 跟官方 SGLang main 8cd3c494 时（2026-10 下旬）测得（MiniMax 用 SGLang 的 M3.1 分支），单位 tok/s；DeepSeek 加速包三行在 2026-11-18 按最新默认配置重测（SGLang main 084a5e9aae）。
 
 ## 测法
 
@@ -13,6 +13,7 @@
 
 ## DeepSeek V4.1 Flash 1017
 
+- 无损 prefill 融合、Engram 跨块预热与 DSpark 上下文草稿检索（2026-11-18 重测，启动台默认：48K 分块、35 槽 + 弹性槽、CPU 分担 prefill、变长验证、上下文草稿检索 Recall 开、1M KV 池）：长回复每步 28.8 对基线 50.9 ms（快 43%），冷 prefill 64K / 500K 两轮均值 6,363 / 7,634 对 3,318 / 3,627（快 92% / 110%）；两轮全部 159 个请求合计 decode 180.4 tok/s、接受长度 4.79、每步 26.5 ms；4 个请求同时写 3,000 token 合计 258.3 tok/s，2 个同时 193–195 tok/s，单请求每步 27.1 ms。详见[报告](reports/2026-11-18-lossless-prefill-recall.md)。
 - 加速包（2026-11-12 重测，v0.1.5，启动台默认：48K 分块、每层 35 槽、弹性热专家槽、CPU 分担 prefill、变长验证、1M KV 池）对基线（2026-10 下旬测，
   22K 分块、50 槽）：长回复每步 29.9 对 50.9 ms（快 41%），冷 prefill 64K / 500K 5,822 / 6,674 对 3,318 / 3,627（快 75% / 84%）。
 - 草稿和两个请求的 FP8 投影走 b12x（2026-11-11）：FP8 投影的小批量快内核原来只对 1、4、6 行开，DSpark 草稿模型的 5 行、两个请求同时的

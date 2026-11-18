@@ -21,7 +21,7 @@ xtier/
 ├── planner/   规划器：本机探测的 GPU / CPU 耗时 + 路由档案 → 显存预算内每层的热专家槽数（按 CPU 和 GPU 同时算完分配），可在启动时自动算
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
 ├── packs/     加速包：qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核、QSA 读 NVFP4 KV）、glm5_next（量化排除、DSA、NextN）、
-│              deepseek_v4（Engram 行放 NVMe、SM120 候选索引器、FP8 GEMM 调优配置、FP8 wo_a、recipe 分词、分页索引器）、
+│              deepseek_v4（Engram 行放 NVMe 与跨块预热、SM120 候选索引器、FP8 GEMM 调优配置、FP8 wo_a、分页索引器、DSpark 上下文草稿检索）、
 │              minimax_m3（SM120 通用栈、CUDA 上的 DSpark verify、草稿词表头 FP8、SM120 上读 NVFP4 KV）、
 │              speculative（通用投机解码：EAGLE 的热词表配无损拒绝采样、草稿温度、按置信度截断验证；DSpark 按置信度截断验证）
 ├── tables/    大嵌入表的行放在 NVMe：多段多文件、任意行宽、行缓存、CUDA 图内查表
@@ -146,12 +146,12 @@ XTIER_GPU2_SLOTS=auto CUDA_VISIBLE_DEVICES=快卡,慢卡 bash configs/qwen38-rtx
 
 | DSpark | 轮 | 冷 prefill 64K 会话 | 冷 prefill 500K 会话 | decode（长回复） | 接受长度 | 每步 |
 |---|:-:|---:|---:|---:|---:|---:|
-| XTier + 加速包 | 1 | 5,561 | 6,658 | 151.5 | 4.53 | 29.9 ms |
-|  | 2 | 6,082 | 6,689 | 164.1 | 4.91 | 29.9 ms |
-| XTier + 加速包，4 个请求同时（合计） | — | — | — | 254 | 3.15 | 49.7 ms |
+| XTier + 加速包 | 1 | 5,568 | 7,677 | 153.5 | 4.40 | 28.7 ms |
+|  | 2 | 7,158 | 7,590 | 154.0 | 4.48 | 29.1 ms |
+| XTier + 加速包，4 个请求同时（合计） | — | — | — | 258 | 3.31 | 51.7 ms |
 | 基线（关加速包） | 1 | 3,318 | 3,627 | 65.5 | 3.25 | 50.9 ms |
 
-加速包对基线：每步 29.9 对 50.9 ms（快 41%），冷 prefill 64K / 500K 快 75% / 84%；精度无损，照抄正文 0 错（偶尔在一段末尾多输出一个 `</src>`，原来就有）。第三行是 4 个各约 16K token 的提示同时各写 3,000 token，decode 是 4 个请求合计（每个 57–67 tok/s），接受长度和每步是这 4 个请求的；2 个同时合计 191 tok/s。
+加速包对基线：长回复每步 28.8 对 50.9 ms（快 43%），冷 prefill 64K / 500K 快 92% / 110%；两轮全部 159 个请求（含工具调用，命中上下文草稿检索）合计 decode 180.4 tok/s、接受长度 4.79、每步 26.5 ms；精度无损，照抄正文 0 错（偶尔在一段末尾多输出一个 `</src>`，原来就有）。第三行是 4 个各约 16K token 的提示同时各写 3,000 token，decode 是 4 个请求合计（每个 56–74 tok/s），接受长度和每步是这 4 个请求的；2 个同时合计 193–195 tok/s，单请求每步 27.1 ms。
 
 **冷 prefill 比上一版快 28–35%，decode 不变（2026-11-11）。** 每读一块提示，每层都要把不在热专家槽里的专家传上显卡，约 2.5 秒，和块里有多少 token 无关。启动台默认的 prefill 分块从 22K 加到 48K，这 2.5 秒摊给两倍多的 token。大块的 forward 多用的显存从热专家槽里让（每层 50 → 35 槽），decode 时弹性热专家槽把它还回去（补到 68 槽），所以 decode 每步不变。520K 提示、两个请求占满 512K KV 池都实跑过，没有显存不足。读长提示时 CPU 是空的，启动台现在默认让它同时算路由少的专家（「CPU 分担 prefill」），这些专家不用传上显卡，128K 以上的会话再快 1–3%（表里是开着测的）。GLM、Qwen 实测分块加大、CPU 分担都没有收益，没有改。见[报告](docs/reports/2026-11-11-prefill-chunk.md)。
 
@@ -245,11 +245,11 @@ SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速
 
 ## 版本更新
 
+- 2026-11-18（v0.1.7）：全链路无损加速与 DSpark 上下文草稿检索（Recall）。通用层：①FP4 prefill 在 1K–6K 长度不再落入 `_split_prefill` 慢路径（4K 冷 prefill +75%，多轮工具回传首字缩短 14%）；②`_run_fp4` 每层单次 MXFP8 激活量化加融合 Triton Gather / 无原子累加，并按当层实际分片行数收敛 CUTLASS 工作空间显存；③NVMe 行表（`csrc/tables`）批内去重、按 LBA 升序大轮次并发读并支持后台缓存预热；④弹性热专家槽禁止从 `<1K` 的混合 prefill 向 GPU prefill 跨模态外推显存，避免多轮变长会话误触回收。DeepSeek 加速包：①第 14 层后后台提前预热下一块 48K 的 Engram 行（`XTIER_ENGRAM_LOOKAHEAD`），加通用项后 128K–500K 冷 prefill 升至 7,341–7,677 tok/s、第 2 轮 64K 升至 7,158 tok/s；②接入 DSpark 上下文草稿检索（`XTIER_RECALL`，启动台默认开、主模型逐词验证无损、未命中零 GPU 开销），`agent_bench` 两轮合计 180.4 tok/s（每步 26.5 ms），代码改写与多路编辑并发 332–382 tok/s；③`wo_a` 分组投影放宽到 64 行、`b12x` 到 1–32 行、草稿 `markov_w2` 单行补齐走 Tensor Core。三个模型的整模型回归、PPL 和各 15 分钟 dsh 真实任务均 0 错通过。[报告](docs/reports/2026-11-18-lossless-prefill-recall.md)
 - 2026-11-14（v0.1.6）：跟进官方 SGLang main 084a5e9（27bc1a0 之后 592 个提交），XTier 运行时的代码不用改。依赖：FlashInfer 0.7.4、nvidia-cudnn-frontend 1.32.3、sgl-deep-gemm 0.2.8、sgl-flash-mla 1.0.5。17 个改了源码的被钩函数逐个对过，钩子指纹已更新。三个模型回归通过，decode 持平；DeepSeek 冷 prefill 快约 10%（64K 6,144–6,691、520K 6,761 tok/s，上游改了 DSv4 prefill 的分块），GLM、Qwen 持平。`tools/arch_check.py` 的模拟模式跟着 SGLang JIT 工具链的接口改了一处。换 FlashInfer 后第一次启动要编译内核，会慢几分钟。[报告](docs/reports/2026-11-14-sglang-084a5e9.md)
 - 2026-11-12（v0.1.5）：DeepSeek V4.1 可以同时跑 4 个请求（原来 2 个）：4 个同时合计 254 tok/s（原来 2 个同时约 175 tok/s），2 个同时 191 tok/s，只有一个请求时基本不变。KV 池加到 1M token（单个请求的上下文仍是 512K），agent 派子 agent 时主会话的缓存不会被挤掉。一次专家调用从最多 8 个 token 改成 16 个（三个模型都一样），几个请求的验证行合在一起算；启动台的 DSpark 验证默认改成变长，成本表测到 4 个请求。多占约 1.2 GiB 显存。三个模型的回归通过。[报告](docs/reports/2026-11-12-ds-four-requests.md)
 - 2026-11-11：DeepSeek V4.1 的 decode 每步少 0.6–0.8 ms，两个请求同时每步 52.3 → 44.0 ms（−16%）。FP8 投影的小批量快内核原来只对 1、4、6 行开，DSpark 草稿模型的 5 行和两个请求同时的 10、12 行走的是慢 3–4 倍的内核；加速包的默认行数改成 1、4、5、6、10、12（`XTIER_MXFP8_B12X_ROWS`），只换内核，照抄 0 错。变长验证的成本表（`sps-table.json`）按新的耗时重测。[报告](docs/reports/2026-11-11-decode-step.md)
 - 2026-11-11：DeepSeek V4.1 的冷 prefill 快 28–35%，decode 不变。启动台默认的 prefill 分块从 22K 改成 48K：每读一块都要花约 2.5 秒把专家传上显卡，块大了这段时间摊给更多 token。每层热专家基础槽 50 → 35，decode 时弹性热专家槽补回到 68；「Prefill 中穿插 decode」默认 48 → 72 步，另一个请求仍保持约 20% 的速度（最长停顿 4.7 → 7.4 秒）。520K 提示和两个请求占满 512K KV 池实跑没有显存不足。GLM、Qwen 实测分块加大没有收益，不改。新增「CPU 分担 prefill」（`XTIER_PREFILL_CPU_SHARE=1`）：读长提示时让空闲的 CPU 算路由少的专家，再快约 3%，DeepSeek 启动台默认开；GLM、Qwen 上实测更慢，不开。[报告](docs/reports/2026-11-11-prefill-chunk.md)
-- 2026-11-10（v0.1.4）：一个请求读长提示时，另一个正在 decode 的请求不再整段停住。SGLang 调度时 prefill 优先，旁边有 20 万 token 的冷提示在读时另一个请求要停 40 秒左右。启动台现在默认加 SGLang 自带的 `--prefill-decode-interval`（DeepSeek 48 / GLM 64 / Qwen 96 步，可改可关）：另一个请求保留约两成速度，最长等一块 prefill 的时间（约 5 秒），长提示首字晚 26–28%，单个请求不变。修复：弹性热专家槽在一个提示的分块之间不再加回又释放（DeepSeek 每块白传 8.4 GiB）。详见[报告](docs/reports/2026-11-10-prefill-interleave.md)。
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
 ## 许可
