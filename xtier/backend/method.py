@@ -371,7 +371,10 @@ class XTierMoEMethod(FusedMoEMethodBase):
         elif 0 < config.gpu_prefill_min() <= m or (self.pool is not None and self.pool.full):
             self._cache_start()
             split = config.split_prefill_max()
-            if (self.pool is None or not self.pool.full) and m <= split and self.prefill.chunk < self.experts:
+            fp4_direct = (os.environ.get('XTIER_FP4_BYPASS_SPLIT', '1') != '0'
+                          and os.environ.get('XTIER_PREFILL_FP4') == '1'
+                          and self.prefill._fp4_ready(torch.bfloat16))
+            if (self.pool is None or not self.pool.full) and m <= split and self.prefill.chunk < self.experts and not fp4_direct:
                 out = self._split_prefill(x, ids, weights, m, k)
                 self.calls['split_prefill'] += 1
             else:

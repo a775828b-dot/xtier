@@ -37,6 +37,7 @@ def lib():
         c.xtier_rows_preload_scales.argtypes = [_P]
         c.xtier_rows_preload_scales.restype = C.c_int
         c.xtier_rows_lookup.argtypes = [_P]
+        c.xtier_rows_prefetch.argtypes = [_P, _P, _U]
         for name in ('xtier_rows_stats', 'xtier_rows_io_stats', 'xtier_rows_timing'):
             getattr(c, name).argtypes = [_P, C.POINTER(_U)]
         c.xtier_rows_close.argtypes = [_P]
@@ -103,6 +104,13 @@ class RowStore:
         work = Work(self.store, ids.data_ptr(), weights.data_ptr(), scales.data_ptr(), n)
         self.lib.xtier_rows_lookup(C.addressof(work))
         return weights, scales[:, :self.scale_bytes]
+
+    def prefetch(self, ids):
+        """Warm the row cache for host int64 tensor `ids` without allocating output buffers."""
+        if not self.store or ids.numel() == 0:
+            return
+        ids = ids.to(device='cpu', dtype=torch.int64).contiguous()
+        self.lib.xtier_rows_prefetch(self.store, ids.data_ptr(), ids.numel())
 
     def _counters(self, name, keys):
         out = (_U * 4)()

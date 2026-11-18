@@ -59,6 +59,10 @@ MODEL = {
                  '请求多的时候少验更快：4 个请求同时合计 254 对固定的 212 tok/s，2 个请求和单请求两者差不多（11-12 实测）。照抄 0 错。'
                  '换机器要用 tools/sps_profile.py 重测这张表，没有重测时选固定',
          'off_when': [{'spec': 'off'}]},
+        {'key': 'recall', 'label': '上下文草稿检索', 'default': 'on', 'switch': True,
+         'choices': [['on', '开 · 上下文记忆草稿'], ['off', '关']],
+         'hint': '在主机内存检索当前会话上下文与近期回复中的重复 token 片段送入 DSpark 验证，主模型逐词核对（无损），未命中零 GPU 开销；代码改写与多子 agent 编辑显著提速',
+         'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
          'choices': [['4', '4 GiB · 实测'], ['8', '8 GiB'], ['16', '16 GiB']]},
         elastic_option('on', 'decode 时多 13–15 槽 / 层（至多 68），agent 每步 −4%（10-26）；超过约 66 槽 GPU 一侧成瓶颈'),
@@ -123,11 +127,13 @@ def build(o, port):
     env = {'XTIER_THREADS': o['threads'], 'PORT': str(port), 'DSPARK': '1' if o['spec'] == 'on' else '0',
            'CONTEXT': o['context'], 'KV_POOL': str(_pool(o)), 'BATCH': chunk, 'XTIER_CACHE_SLOTS': slots,
            'XTIER_ENGRAM_CACHE_GIB': o['engram']}
-    if base:   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head
+    if base:   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head / recall
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
-                   XTIER_DRAFT_LMHEAD_FP8='0')
+                   XTIER_DRAFT_LMHEAD_FP8='0', XTIER_ENGRAM_LOOKAHEAD='0', XTIER_DS_MARKOV_PAD2='0', XTIER_RECALL='0')
     elif o['elastic'] == 'on':   # past ~66 slots the GPU side of a layer is the slower one (planner, 10-26)
         env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68')
+    if not base and o['spec'] == 'on':
+        env['XTIER_RECALL'] = '1' if o.get('recall', 'on') == 'on' else '0'
     if o['spec'] == 'on' and o['verify'] == 'compact':   # budgeted by sps-table.json (run-ds-xtier.sh)
         env['SGLANG_RAGGED_VERIFY_MODE'] = 'compact'
     if o['cold'] != 'off':   # the store holds every expert: written at the first start, reused after
@@ -143,6 +149,8 @@ def tags(o):
     out = ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []
     if o['spec'] == 'on' and o['verify'] == 'compact':
         out.append('变长验证')
+    if o['packs'] == 'on' and o['spec'] == 'on' and o.get('recall', 'on') == 'on':
+        out.append('Recall')
     if o['cold'] != 'off':
         out.append(f"冷专家 {o['cold']}%")
     elif miss_env(o):

@@ -182,6 +182,45 @@ def _emit(ACC, OUT, B: tl.constexpr, HID: tl.constexpr):
     tl.store(OUT + t * HID + n, tl.load(ACC + t * HID + n, n < HID, 0), n < HID)
 
 
+@tr.jit
+def _add_bf16_rows(ACC, PART, ROWS, B: tl.constexpr, HID: tl.constexpr):
+    """Deterministic non-atomic accumulation of unique chunk rows `PART` (BF16) into `ACC` (FP32)."""
+    i = tl.program_id(0).to(tl.int64)
+    row = tl.load(ROWS + i).to(tl.int64)
+    n = tl.program_id(1) * B + tl.arange(0, B)
+    mask = n < HID
+    acc = tl.load(ACC + row * HID + n, mask, 0.0)
+    val = tl.load(PART + i * HID + n, mask, 0.0).to(tl.float32)
+    tl.store(ACC + row * HID + n, acc + val, mask)
+
+
+@tr.jit
+def _gather_fp8_and_ids(XQ_ALL, XSF_LIN, IDS_ALL, W_ALL, ROWS, XQ_OUT, XSF_OUT, IDS_OUT, W_OUT,
+                        HAS_SKIP: tl.constexpr, DUMMY_ID, B_H: tl.constexpr, B_SF: tl.constexpr,
+                        HID: tl.constexpr, K: tl.constexpr):
+    """Fused gather of pre-quantized MXFP8 rows, linear UE8M0 scales, expert ids and routing weights."""
+    i = tl.program_id(0).to(tl.int64)
+    row = tl.load(ROWS + i).to(tl.int64)
+    p = tl.program_id(1)
+    if p == 0:
+        ks = tl.arange(0, 16)
+        km = ks < K
+        idv = tl.load(IDS_ALL + row * K + ks, km, 0)
+        wv = tl.load(W_ALL + row * K + ks, km, 0.0)
+        if HAS_SKIP:
+            sk = idv < 0
+            idv = tl.where(sk, DUMMY_ID, idv)
+            wv = tl.where(sk, 0.0, wv)
+        tl.store(IDS_OUT + i * K + ks, idv, km)
+        tl.store(W_OUT + i * K + ks, wv, km)
+        sfs = tl.arange(0, B_SF)
+        sfm = sfs < (HID // 32)
+        tl.store(XSF_OUT + i * (HID // 32) + sfs, tl.load(XSF_LIN + row * (HID // 32) + sfs, sfm, 0), sfm)
+    c = p * B_H + tl.arange(0, B_H)
+    cm = c < HID
+    tl.store(XQ_OUT + i * HID + c, tl.load(XQ_ALL + row * HID + c, cm, 0), cm)
+
+
 _lock = threading.Lock()
 _slots = None      # packed staging slots, each [w13, w2, s13, s2] for one expert chunk
 _unpacked = None   # BF16 weights of the chunk being computed (XTIER_PREFILL_UNPACK=1)
@@ -888,7 +927,7 @@ class Prefill:
         - the slot ring and the cross-layer prefetch work as in _run_overlap (owner _Fp4Prefetch).
         """
         global _slots, _pending, _copy_stream
-        from flashinfer import mxfp8_quantize
+        from flashinfer import block_scale_interleave, mxfp8_quantize
         from flashinfer.fused_moe import cutlass_fused_moe, cutlass_fused_moe_workspace_size
         from flashinfer.fused_moe.core import ActivationType
         H, E, CH = self.hidden, self.experts, self.chunk
@@ -1009,15 +1048,8 @@ class Prefill:
             ones = torch.ones(CH, dtype=torch.float32, device='cuda')
             limit = (torch.full((CH,), self.swiglu_limit, dtype=torch.float32, device='cuda')
                      if self.swiglu_limit > 0 else None)
-            # At most `cap` tokens per call, one workspace of that size for every call of the layer.
+            # At most `cap` tokens per call; size the CUTLASS workspace to the largest slice this layer actually runs.
             cap = max(256, int(os.environ.get('XTIER_PREFILL_FP4_ROWS', '4096')))
-            ws_key = (cap, H, self.inter, E, k, n_chunks)
-            if getattr(self, '_fp4_ws_key', None) != ws_key:
-                self._fp4_ws_bytes = cutlass_fused_moe_workspace_size(
-                    cap, H, self.inter, E, k, x_dtype=torch.float8_e4m3fn, weight_dtype=torch.int64,
-                    use_mxfp8_act_scaling=True, ep_size=n_chunks, ep_rank=0)
-                self._fp4_ws_key = ws_key
-            workspace = torch.empty(self._fp4_ws_bytes, dtype=torch.uint8, device='cuda')
             calls = []
             for j in range(n_chunks):
                 if j in skip:
@@ -1028,30 +1060,71 @@ class Prefill:
             by_chunk = {}
             for j, a, b in calls:
                 by_chunk.setdefault(j, []).append((a, b))
+            max_nr = max((b - a for _, a, b in calls), default=0)
+            ws_cap = min(cap, max(256, ((max_nr + 255) // 256) * 256))
+            if max_nr > 0:
+                ws_key = (ws_cap, H, self.inter, E, k, n_chunks)
+                if getattr(self, '_fp4_ws_key', None) != ws_key:
+                    self._fp4_ws_bytes = cutlass_fused_moe_workspace_size(
+                        ws_cap, H, self.inter, E, k, x_dtype=torch.float8_e4m3fn, weight_dtype=torch.int64,
+                        use_mxfp8_act_scaling=True, ep_size=n_chunks, ep_rank=0)
+                    self._fp4_ws_key = ws_key
+                workspace = torch.empty(self._fp4_ws_bytes, dtype=torch.uint8, device='cuda')
+            else:
+                workspace = None
+            fast_glue = max_nr > 0 and H % 32 == 0 and os.environ.get('XTIER_PREFILL_FP4_FAST_GLUE', '1') != '0'
+            if fast_glue:
+                xq_all, xsf_all = mxfp8_quantize(x_t, is_sf_swizzled_layout=False, alignment=32)
+                if xq_all.shape == (m, H) and xsf_all.numel() == m * (H // 32):
+                    xsf_all = xsf_all.view(m, H // 32).view(torch.uint8)
+                    xq_buf = torch.empty((max_nr, H), dtype=torch.float8_e4m3fn, device='cuda')
+                    xsf_buf = torch.empty((max_nr, H // 32), dtype=torch.uint8, device='cuda')
+                    ids_buf = torch.empty((max_nr, k), dtype=torch.int32, device='cuda')
+                    w_buf = torch.empty((max_nr, k), dtype=torch.float32, device='cuda')
+                    part_buf = torch.empty((max_nr, H), dtype=torch.bfloat16, device='cuda')
+                    b_sf = tr.next_power_of_2(max(16, H // 32))
+                else:
+                    fast_glue = False
             for j in range(n_chunks):
                 if j in skip:
                     continue
                 slot, done = ready.pop(j)
                 compute.wait_event(done)
                 for r0, r1 in by_chunk.get(j, []):
+                    nr = r1 - r0
                     rows = rows_all[r0:r1]
-                    ids_j, w_j = ids_t.index_select(0, rows), w_t.index_select(0, rows)
-                    if has_skipped:  # route computed elsewhere: an id outside this chunk, weight 0
-                        skip = ids_j < 0
-                        ids_j = torch.where(skip, ((j + 1) % n_chunks) * CH, ids_j)
-                        w_j = torch.where(skip, 0.0, w_j)
-                    xq, xsf = mxfp8_quantize(x_t.index_select(0, rows), is_sf_swizzled_layout=True, alignment=32)
+                    if fast_glue:
+                        xq = xq_buf[:nr]
+                        xsf_lin = xsf_buf[:nr]
+                        ids_j = ids_buf[:nr]
+                        w_j = w_buf[:nr]
+                        part = part_buf[:nr]
+                        _gather_fp8_and_ids[(nr, tr.cdiv(H, 512))](
+                            xq_all.view(torch.uint8), xsf_all, ids_t, w_t, rows,
+                            xq.view(torch.uint8), xsf_lin, ids_j, w_j,
+                            has_skipped, ((j + 1) % n_chunks) * CH, 512, b_sf, H, k, num_warps=4)
+                        xsf = block_scale_interleave(xsf_lin)
+                    else:
+                        ids_j, w_j = ids_t.index_select(0, rows), w_t.index_select(0, rows)
+                        if has_skipped:  # route computed elsewhere: an id outside this chunk, weight 0
+                            skip_mask = ids_j < 0
+                            ids_j = torch.where(skip_mask, ((j + 1) % n_chunks) * CH, ids_j)
+                            w_j = torch.where(skip_mask, 0.0, w_j)
+                        xq, xsf = mxfp8_quantize(x_t.index_select(0, rows), is_sf_swizzled_layout=True, alignment=32)
+                        part = torch.empty((nr, H), dtype=torch.bfloat16, device='cuda')
                     w = _slots[slot]
-                    part = torch.empty((r1 - r0, H), dtype=torch.bfloat16, device='cuda')
                     cutlass_fused_moe(input=xq, token_selected_experts=ids_j, token_final_scales=w_j,
                                       fc1_expert_weights=w[0].view(torch.int64), fc2_expert_weights=w[1].view(torch.int64),
                                       output_dtype=torch.bfloat16,
                                       quant_scales=[w[2].view(torch.int32), ones, w[3].view(torch.int32), ones],
                                       input_sf=xsf, swiglu_limit=limit, use_w4_group_scaling=False,
                                       use_mxfp8_act_scaling=True, activation_type=ActivationType.Swiglu,
-                                      ep_size=n_chunks, ep_rank=j, tune_max_num_tokens=cap, output=part,
+                                      ep_size=n_chunks, ep_rank=j, tune_max_num_tokens=ws_cap, output=part,
                                       workspace_buffer=workspace)
-                    acc.index_add_(0, rows, part.float())
+                    if fast_glue:
+                        _add_bf16_rows[(nr, tr.cdiv(H, 256))](acc, part, rows, 256, H, num_warps=8)
+                    else:
+                        acc.index_add_(0, rows, part.float())
                 ev = torch.cuda.Event(); ev.record(compute); freed[slot] = ev
                 refill(slot)
             if share is not None:

@@ -68,6 +68,7 @@ import functools
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 import torch
@@ -76,6 +77,8 @@ logger = logging.getLogger(__name__)
 ENGRAM = 'sglang.srt.layers.engram.EngramEmbedding'
 ENGRAM_LAYER = 'sglang.srt.layers.engram.Engram'
 HASHER = 'sglang.srt.layers.engram.EngramHasher'
+FORWARD_BATCH_INIT = 'sglang.srt.model_executor.forward_batch_info.ForwardBatch.init_new'
+TAIL_LAYOUT = 'sglang.srt.layers.attention.deepseek_v4_backend.late_layer_tail_layout'
 DSPARK_DRAFT = 'sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark'
 DRAFT_PROJECT = 'sglang.srt.models.dspark.project_through_lm_head'
 INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
@@ -90,6 +93,13 @@ ENGRAM_LAYERS = 2   # DeepSeek V4.1 Flash has two Engram layers (1 and 14); the 
 ROW_BYTES, SCALE_BYTES, BLOCK = 256, 8, 32   # an FP8 E4M3 row of 256 with one E8M0 scale per 32
 FP8_MAX = 448.0
 _prefetching = {}   # Engram layer's hash index -> (its EngramEmbedding on the row table, side stream); one target model
+_next_chunk_windows = [None]
+_last_hasher = [None]
+_swa_tail_override = [None]
+_lookahead_lock = threading.Lock()
+_lookahead_cv = threading.Condition(_lookahead_lock)
+_lookahead_job = [None]
+_lookahead_started = [False]
 
 
 def model_dir():
@@ -195,12 +205,103 @@ def _engram_layer_init(result, self, *args, **kwargs):
     return result
 
 
+def _lookahead_loop():
+    while True:
+        with _lookahead_cv:
+            while _lookahead_job[0] is None:
+                _lookahead_cv.wait()
+            job = _lookahead_job[0]
+            _lookahead_job[0] = None
+        try:
+            windows, hasher = job
+            n = int(hasher.max_ngram_size)
+            shifts = torch.arange(n, dtype=torch.int64)
+            for seg_ids, lo0, start, end in windows:
+                lo = max(0, start - (n - 1))
+                sub = seg_ids[lo - lo0:]
+                pad_left = (n - 1) - (start - lo)
+                padded = ([0] * pad_left + list(sub)) if pad_left > 0 else list(sub)
+                seg = torch.tensor(padded, dtype=torch.int64)
+                tokens = seg.unfold(0, n, 1).flip(-1)
+                pos = torch.arange(start, end, dtype=torch.int64)
+                blocked = pos.unsqueeze(-1) < shifts
+                hash_ids, _ = hasher.hash_windows(tokens, blocked)
+                for index, (embedding, _) in sorted(_prefetching.items()):
+                    if index < hash_ids.shape[1]:
+                        embedding._xtier_rows.prefetch(hash_ids[:, index])
+        except Exception as exc:
+            logger.debug('xtier: Engram cross-chunk lookahead skipped: %s', exc)
+
+
+def _submit_lookahead(windows, hasher):
+    with _lookahead_cv:
+        if not _lookahead_started[0]:
+            t = threading.Thread(target=_lookahead_loop, name='xtier-engram-lookahead', daemon=True)
+            t.start()
+            _lookahead_started[0] = True
+        _lookahead_job[0] = (windows, hasher)
+        _lookahead_cv.notify()
+
+
+def _on_forward_batch_init(ret, cls, batch, model_runner=None, *args, **kwargs):
+    _next_chunk_windows[0] = None
+    _swa_tail_override[0] = None
+    if not batch.forward_mode.is_extend_without_speculative():
+        return ret
+    reqs = getattr(batch, 'reqs', None)
+    finals = getattr(ret, 'extend_is_final_cpu', None)
+    if not reqs or not finals:
+        return ret
+    decoding_ids = {id(r) for r in (getattr(batch, 'decoding_reqs', None) or ())}
+    if _prefetching and os.environ.get('XTIER_ENGRAM_LOOKAHEAD', '1') != '0':
+        extend_lens = getattr(batch, 'extend_lens', None) or getattr(ret, 'extend_seq_lens_cpu', None) or ()
+        budget_left = max(int(sum(extend_lens)), 4096)
+        windows = []
+        for req, is_final in zip(reqs, finals):
+            if budget_left <= 0 or is_final or id(req) in decoding_ids:
+                continue
+            full = getattr(req, 'full_untruncated_fill_ids', None)
+            start = getattr(req, 'extend_end', None)
+            if not full or start is None or start >= len(full):
+                continue
+            end = min(len(full), start + budget_left)
+            if end > start:
+                lo0 = max(0, start - 8)
+                windows.append((tuple(full[lo0:end]), lo0, start, end))
+                budget_left -= (end - start)
+        if windows:
+            _next_chunk_windows[0] = windows
+    swa_mode = os.environ.get('XTIER_DS_SKIP_INTERMEDIATE_SWA_REPLAY', 'auto')
+    radix_disabled = bool(getattr(getattr(model_runner, 'tree_cache', None), 'disable', False))
+    if (swa_mode == '1' or (swa_mode == 'auto' and radix_disabled)) and len(reqs) == 1 and not finals[0]:
+        req0 = reqs[0]
+        if id(req0) not in decoding_ids:
+            full0 = getattr(req0, 'full_untruncated_fill_ids', None)
+            end0 = getattr(req0, 'extend_end', None)
+            if full0 and end0 is not None and end0 < len(full0):
+                rem = len(full0) - end0
+                if rem > 0:
+                    _swa_tail_override[0] = max(1, 128 - rem)
+    return ret
+
+
+def _late_layer_tail_layout(original, *args, **kwargs):
+    override = _swa_tail_override[0]
+    if override is not None and 'tail_len' in kwargs and override < kwargs['tail_len']:
+        kwargs = dict(kwargs, tail_len=override)
+    return original(*args, **kwargs)
+
+
 def _prefetch(hash_ids, self, input_ids, *args, **kwargs):
     """After ``EngramHasher.forward`` (hash ids [T, Engram layers, hash columns]): every Engram layer's lookup starts
     on its side stream. The ids are made contiguous and the output allocated on the current stream, and both stay
     referenced until the layer has waited for the lookup."""
     if not _prefetching or hash_ids.dim() != 3 or hash_ids.shape[0] == 0 or not hash_ids.is_cuda:
         return hash_ids
+    if _next_chunk_windows[0] is not None:
+        if getattr(self, '_cpu_hash_params', None) is None:
+            self._cpu_hash_params = tuple(t.cpu() for t in (self.token_map, self.multipliers, self.primes, self.offsets))
+        _last_hasher[0] = self
     main = torch.cuda.current_stream()
     for index, (embedding, side) in _prefetching.items():
         if index >= hash_ids.shape[1]:
@@ -219,13 +320,25 @@ def _prefetch(hash_ids, self, input_ids, *args, **kwargs):
 
 def _owned_rows(self, indices):
     prefetched = getattr(self, '_xtier_prefetched', None)
+    done = None
+    hit_out = None
     if prefetched is not None:
         self._xtier_prefetched = None
         key, out, done, _ = prefetched
         torch.cuda.current_stream().wait_event(done)   # also orders an inline lookup after it (shared staging)
         if key == _view_key(indices):
-            return out
-    return self._xtier_lookup(indices)
+            hit_out = out
+    out_rows = hit_out if hit_out is not None else self._xtier_lookup(indices)
+    if (_next_chunk_windows[0] is not None and _last_hasher[0] is not None
+            and _prefetching and not torch.cuda.is_current_stream_capturing()):
+        last_embed = _prefetching[max(_prefetching)][0]
+        if self is last_embed:
+            windows, hasher = _next_chunk_windows[0], _last_hasher[0]
+            _next_chunk_windows[0] = None
+            if done is not None:
+                done.synchronize()
+            _submit_lookahead(windows, hasher)
+    return out_rows
 
 
 def _quantize_lm_head(lm_head):
@@ -325,7 +438,7 @@ def _b12x_rows():
     if torch.cuda.get_device_capability()[0] != 12:
         return frozenset()
     rows = set()
-    for part in os.environ.get('XTIER_MXFP8_B12X_ROWS', '1-24').split(','):   # counts and ranges: 5,10-12
+    for part in os.environ.get('XTIER_MXFP8_B12X_ROWS', '1-32').split(','):   # counts and ranges: 5,10-12
         first, _, last = part.strip().partition('-')
         if first:
             rows.update(range(int(first), int(last or first) + 1))
@@ -338,8 +451,25 @@ def _mxfp8_linear(original, input, *args, **kwargs):
     return original(input, *args, **kwargs)
 
 
+def _markov_step_bias(original, self, prev_tokens, *, hidden_states=None, state=None):
+    """On SM120, cuBLAS dispatches a 530 us legacy GEMV for M=1 [1, 256] x [129280, 256] BF16, whereas M=2 dispatches
+    its L2-resident Tensor-Core kernel in 230 us (-0.30 ms per decode step, bitwise-identical tokens)."""
+    if (getattr(self, '_opt_markov_w2_bf16', False) and prev_tokens.numel() == 1 and prev_tokens.is_cuda):
+        latent = self.get_prev_embeddings(prev_tokens)
+        if latent.dim() == 2 and latent.shape[0] == 1:
+            shard = getattr(self, '_tp_shard', None)
+            if shard is None:
+                w = self.markov_w2.weight
+                bias = torch.nn.functional.linear(latent.to(w.dtype).expand(2, -1).contiguous(), w)[:1].float()
+                return bias, state
+            w_local = self.markov_w2.weight[shard.org_vocab_start:shard.org_vocab_end]
+            bias = torch.nn.functional.linear(latent.to(w_local.dtype).expand(2, -1).contiguous(), w_local)[:1]
+            return bias, state
+    return original(self, prev_tokens, hidden_states=hidden_states, state=state)
+
+
 def install(registry, hook_type):
-    from xtier.packs.deepseek_v4 import ragged_verify, paged_indexer, wo_a
+    from xtier.packs.deepseek_v4 import ragged_verify, paged_indexer, recall, wo_a
 
     registry.register('sglang.srt.speculative.dspark_components.dspark_planner.DSparkVerifyPlanner.set_forced_budget_frac',
                       ragged_verify.forced_budget, hook_type.AFTER)
@@ -369,6 +499,15 @@ def install(registry, hook_type):
         if os.environ.get('XTIER_ENGRAM_PREFETCH', '1') != '0':
             registry.register(f'{ENGRAM_LAYER}.__init__', _engram_layer_init, hook_type.AFTER)
             registry.register(f'{HASHER}.forward', _prefetch, hook_type.AFTER)
+            registry.register(FORWARD_BATCH_INIT, _on_forward_batch_init, hook_type.AFTER)
+    if os.environ.get('XTIER_DS_SKIP_INTERMEDIATE_SWA_REPLAY', 'auto') != '0':
+        if os.environ.get('XTIER_ENGRAM_ROWS', '') != 'nvme' or os.environ.get('XTIER_ENGRAM_PREFETCH', '1') == '0':
+            registry.register(FORWARD_BATCH_INIT, _on_forward_batch_init, hook_type.AFTER)
+        registry.register(TAIL_LAYOUT, _late_layer_tail_layout, hook_type.AROUND)
     if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0' and torch.cuda.get_device_capability() >= (8, 9):
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)
+    if os.environ.get('XTIER_DS_MARKOV_PAD2', '1') != '0' and torch.cuda.get_device_capability()[0] == 12:
+        registry.register('sglang.srt.models.deepseek_v4_dspark.DSparkV4MarkovHead.step_bias',
+                          _markov_step_bias, hook_type.AROUND)
+    recall.install(registry, hook_type)

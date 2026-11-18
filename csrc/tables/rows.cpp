@@ -4,11 +4,12 @@
 // Grown out of the Engram row store of the DeepSeek V4.1 1017 pipeline (adapter/row_store.cpp, 2026-10-22): rows of
 // any width with an optional block of scale bytes per row (DeepSeek V4.1 Engram: 256 FP8 bytes + 8 E8M0 scales;
 // Qwen3.8 PLE n-gram table: 160 FP8 bytes, no scales), one table split over segments (checkpoint tensors) in one or
-// more files. Misses are read with O_DIRECT by a pool of reader threads (XTIER_ROWS_IO_THREADS, default 16) in rounds
-// of up to kBatchPages 4 KiB pages; a bounded direct-mapped cache keeps recent rows; the scales of the owned rows can
-// be preloaded. XTIER_ROWS_MODE=ram maps and locks the files instead (no cache, no reads). A lookup returns zero bytes
-// for ids outside the owned range [lo, hi) (TP shards: the all-reduce adds them up) and aborts the process on ids
-// outside the table or on failed reads: a generation never continues with wrong rows.
+// more files. Misses are deduplicated by 4 KiB page, sorted in ascending LBA order, and read with O_DIRECT by a pool
+// of reader threads (XTIER_ROWS_IO_THREADS, default 32) in rounds of up to kBatchPages 4 KiB pages; a bounded
+// direct-mapped cache keeps recent rows; the scales of the owned rows can be preloaded. XTIER_ROWS_MODE=ram maps and
+// locks the files instead (no cache, no reads). A lookup returns zero bytes for ids outside the owned range [lo, hi)
+// (TP shards: the all-reduce adds them up) and aborts the process on ids outside the table or on failed reads: a
+// generation never continues with wrong rows.
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -26,15 +27,15 @@
 #include <thread>
 #include <time.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #define XTIER_API extern "C" __attribute__((visibility("default")))
 
 static constexpr size_t kPage = 4096;
-// Misses of one lookup share read rounds of up to kBatchPages pages (2026-10-19: one round per 32 rows cost ~40K
-// serial rounds per layer for a fresh 93K-token prefill).
-static constexpr size_t kBatchPages = 512;
-static constexpr size_t kBounce = 8u << 20;   // read size of the scale preload
+static constexpr size_t kLegacyBatchPages = 512;
+static constexpr size_t kBatchPages = 16384;   // 64 MiB staging per store: avoids ~500 barriers on 49K-token chunks
+static constexpr size_t kBounce = 8u << 20;    // read size of the scale preload
 
 struct Segment {
   int file;                               // index into Store::fds
@@ -119,9 +120,8 @@ static uint64_t now_ns() {
   return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
 }
 
-// Persistent reader threads (XTIER_ROWS_IO_THREADS, default 16): the O_DIRECT reads of one round run concurrently, so
-// the drive sees real queue depth (native AIO completed them one by one here). The calling (CUDA callback) thread
-// takes part as well. One round at a time.
+// Persistent reader threads (XTIER_ROWS_IO_THREADS, default 32): the O_DIRECT reads of one round run concurrently, so
+// the drive sees real queue depth. The calling (CUDA callback) thread takes part as well. One round at a time.
 struct IoPool {
   std::mutex job_lock, m;
   std::condition_variable start, finish;
@@ -136,10 +136,10 @@ struct IoPool {
   std::atomic<bool> failed{false};
 
   void run_share() {
-    for (size_t j; (j = next.fetch_add(1)) < count;) {
+    for (size_t j; (j = next.fetch_add(1, std::memory_order_relaxed)) < count;) {
       ssize_t got;
       do { got = pread(fds[j], pages + j * kPage, kPage, offsets[j]); } while (got < 0 && errno == EINTR);
-      if (got < 0 || uint64_t(got) < required[j]) failed = true;
+      if (got < 0 || uint64_t(got) < required[j]) failed.store(true, std::memory_order_relaxed);
     }
   }
   void worker() {
@@ -157,22 +157,34 @@ struct IoPool {
   }
   IoPool() {
     const char *env = std::getenv("XTIER_ROWS_IO_THREADS");
-    const int n = env ? std::atoi(env) : 16;
+    const int n = env ? std::atoi(env) : 32;
     for (int k = 0; k < std::max(0, n); ++k) threads.emplace_back([this] { worker(); });
     for (auto &t : threads) t.detach();
   }
   void read(const int *fds_, const uint64_t *offsets_, const uint32_t *required_, uint8_t *pages_, size_t count_) {
+    if (count_ == 0) return;
+    if (count_ == 1 || threads.empty()) {
+      for (size_t j = 0; j < count_; ++j) {
+        ssize_t got;
+        do { got = pread(fds_[j], pages_ + j * kPage, kPage, offsets_[j]); } while (got < 0 && errno == EINTR);
+        if (got < 0 || uint64_t(got) < required_[j]) fail("short or failed direct read");
+      }
+      return;
+    }
     std::lock_guard<std::mutex> job(job_lock);
     {
       std::lock_guard<std::mutex> lock(m);
       fds = fds_; offsets = offsets_; required = required_; pages = pages_; count = count_;
-      next = 0; failed = false; active = threads.size(); ++generation;
+      next.store(0, std::memory_order_relaxed);
+      failed.store(false, std::memory_order_relaxed);
+      active = threads.size();
+      ++generation;
     }
     start.notify_all();
     run_share();
     std::unique_lock<std::mutex> lock(m);
     finish.wait(lock, [&] { return active == 0; });
-    if (failed) fail("short or failed direct read");
+    if (failed.load(std::memory_order_relaxed)) fail("short or failed direct read");
   }
 };
 
@@ -191,20 +203,18 @@ static void copy_pages(const Store *s, uint32_t page, uint64_t offset, uint8_t *
   }
 }
 
-struct Miss { uint64_t index, id, weight_offset, scale_offset; uint32_t weight_page, scale_page; };
+struct LegacyMiss { uint64_t index, id, weight_offset, scale_offset; uint32_t weight_page, scale_page; };
 
-static void lookup_direct(Work *work) {
+static void lookup_direct_legacy(Work *work) {
   Store *s = work->store;
-  std::lock_guard<std::mutex> guard(s->batch_lock);
-  static thread_local std::vector<int> fds(kBatchPages);
-  static thread_local std::vector<uint64_t> offsets(kBatchPages);
-  static thread_local std::vector<uint32_t> required(kBatchPages);
-  static thread_local std::vector<Miss> misses(kBatchPages);
+  static thread_local std::vector<int> fds(kLegacyBatchPages);
+  static thread_local std::vector<uint64_t> offsets(kLegacyBatchPages);
+  static thread_local std::vector<uint32_t> required(kLegacyBatchPages);
+  static thread_local std::vector<LegacyMiss> misses(kLegacyBatchPages);
   const uint64_t W = s->row_bytes, SB = s->scale_bytes;
   const bool read_scales = SB && !s->scale_data;
-  // pages one miss can need: n bytes touch at most n / 4096 + 2 pages
   const size_t need = W / kPage + 2 + (read_scales ? SB / kPage + 2 : 0);
-  if (need > kBatchPages) fail("row wider than a read round");
+  if (need > kLegacyBatchPages) fail("row wider than a read round");
   size_t pages = 0, miss_count = 0;
   auto add_pages = [&](int fd, uint64_t offset, size_t length) {
     const uint32_t first = uint32_t(pages);
@@ -225,7 +235,7 @@ static void lookup_direct(Work *work) {
       if (pages > s->peak_pages.load(std::memory_order_relaxed)) s->peak_pages.store(pages, std::memory_order_relaxed);
     }
     for (size_t k = 0; k < miss_count; ++k) {
-      const Miss &m = misses[k];
+      const LegacyMiss &m = misses[k];
       uint8_t *row = work->weights + m.index * W, *scales = SB ? work->scales + m.index * SB : nullptr;
       copy_pages(s, m.weight_page, m.weight_offset, row, W);
       if (SB) {
@@ -259,16 +269,224 @@ static void lookup_direct(Work *work) {
         continue;
       }
     }
-    if (pages + need > kBatchPages || miss_count == kBatchPages) flush();
+    if (pages + need > kLegacyBatchPages || miss_count == kLegacyBatchPages) flush();
     const Segment &g = segment_of(s, uint64_t(id));
     const uint64_t r = uint64_t(id) - g.first;
-    Miss m{i, uint64_t(id), g.weight_offset + r * W, g.scale_offset + r * SB, 0, 0};
+    LegacyMiss m{i, uint64_t(id), g.weight_offset + r * W, g.scale_offset + r * SB, 0, 0};
     m.weight_page = add_pages(s->fds[g.file], m.weight_offset, W);
     if (read_scales) m.scale_page = add_pages(s->fds[g.file], m.scale_offset, SB);
     misses[miss_count++] = m;
     s->misses.fetch_add(1, std::memory_order_relaxed);
   }
   flush();
+}
+
+struct MissItem {
+  uint64_t out_idx;
+  uint64_t id;
+  uint64_t w_off;
+  uint64_t s_off;
+  int file;
+};
+
+struct DupItem {
+  uint64_t dst_idx;
+  uint64_t src_idx;
+};
+
+struct PagePiece {
+  uint64_t page_key;   // (uint64_t(file) << 52) | (base >> 12)
+  uint8_t *dst;
+  uint16_t delta;
+  uint16_t take;
+  bool operator<(const PagePiece &o) const { return page_key < o.page_key; }
+};
+
+struct SeenTable {
+  std::vector<uint64_t> keys;
+  std::vector<uint64_t> vals;
+  std::vector<uint32_t> gens;
+  uint32_t gen = 1;
+
+  void reset(size_t max_items) {
+    size_t cap = 256;
+    while (cap < max_items * 2) cap <<= 1;
+    if (keys.size() < cap) {
+      keys.assign(cap, 0);
+      vals.assign(cap, 0);
+      gens.assign(cap, 0);
+      gen = 1;
+    } else if (++gen == 0) {
+      std::fill(gens.begin(), gens.end(), 0);
+      gen = 1;
+    }
+  }
+
+  bool find_or_insert(uint64_t key, uint64_t val_new, uint64_t *existing) {
+    const size_t mask = keys.size() - 1;
+    size_t h = (key * 11400714819323198485ull) & mask;
+    for (;;) {
+      if (gens[h] != gen) {
+        gens[h] = gen;
+        keys[h] = key;
+        vals[h] = val_new;
+        return false;
+      }
+      if (keys[h] == key) {
+        if (existing) *existing = vals[h];
+        return true;
+      }
+      h = (h + 1) & mask;
+    }
+  }
+};
+
+static void emit_pieces_into(std::vector<PagePiece> &pieces, int file, uint64_t offset, size_t length, uint8_t *dst) {
+  uint64_t cur_off = offset;
+  size_t left = length;
+  uint8_t *cur_dst = dst;
+  while (left) {
+    const uint64_t base = cur_off & ~uint64_t(kPage - 1);
+    const size_t delta = size_t(cur_off - base);
+    const size_t take = std::min(left, kPage - delta);
+    const uint64_t key = (uint64_t(uint32_t(file)) << 52) | (base >> 12);
+    pieces.push_back({key, cur_dst, uint16_t(delta), uint16_t(take)});
+    cur_off += take;
+    cur_dst += take;
+    left -= take;
+  }
+}
+
+static void read_sorted_pieces(Store *s, std::vector<PagePiece> &pieces) {
+  if (pieces.empty()) return;
+  static thread_local std::vector<int> u_fds;
+  static thread_local std::vector<uint64_t> u_offsets;
+  static thread_local std::vector<uint32_t> u_required;
+  static thread_local std::vector<size_t> u_bounds;
+
+  std::sort(pieces.begin(), pieces.end());
+
+  u_fds.clear();
+  u_offsets.clear();
+  u_required.clear();
+  u_bounds.clear();
+  const size_t np = pieces.size();
+  u_bounds.push_back(0);
+  for (size_t p = 0; p < np;) {
+    const uint64_t key = pieces[p].page_key;
+    const int file = int(key >> 52);
+    const uint64_t base = (key & ((1ull << 52) - 1)) << 12;
+    uint32_t req = 0;
+    size_t q = p;
+    while (q < np && pieces[q].page_key == key) {
+      const uint32_t end = uint32_t(pieces[q].delta) + uint32_t(pieces[q].take);
+      if (end > req) req = end;
+      ++q;
+    }
+    u_fds.push_back(s->fds[file]);
+    u_offsets.push_back(base);
+    u_required.push_back(req);
+    u_bounds.push_back(q);
+    p = q;
+  }
+
+  const size_t total_pages = u_fds.size();
+  for (size_t u0 = 0; u0 < total_pages; u0 += kBatchPages) {
+    const size_t batch_n = std::min(kBatchPages, total_pages - u0);
+    io_pool().read(u_fds.data() + u0, u_offsets.data() + u0, u_required.data() + u0, s->pages, batch_n);
+    s->reads.fetch_add(batch_n, std::memory_order_relaxed);
+    s->batches.fetch_add(1, std::memory_order_relaxed);
+    if (batch_n > s->peak_pages.load(std::memory_order_relaxed))
+      s->peak_pages.store(batch_n, std::memory_order_relaxed);
+    for (size_t b = 0; b < batch_n; ++b) {
+      const uint8_t *page_ptr = s->pages + b * kPage;
+      const size_t p0 = u_bounds[u0 + b], p1 = u_bounds[u0 + b + 1];
+      for (size_t p = p0; p < p1; ++p) {
+        std::memcpy(pieces[p].dst, page_ptr + pieces[p].delta, pieces[p].take);
+      }
+    }
+  }
+}
+
+static void lookup_direct(Work *work) {
+  Store *s = work->store;
+  std::lock_guard<std::mutex> guard(s->batch_lock);
+  const char *leg = std::getenv("XTIER_ROWS_LEGACY");
+  if (leg && std::strcmp(leg, "1") == 0) {
+    lookup_direct_legacy(work);
+    return;
+  }
+  const uint64_t W = s->row_bytes, SB = s->scale_bytes;
+  const bool read_scales = SB && !s->scale_data;
+  static thread_local std::vector<MissItem> miss_list;
+  static thread_local std::vector<DupItem> dup_list;
+  static thread_local std::vector<PagePiece> pieces;
+  static thread_local SeenTable seen;
+
+  miss_list.clear();
+  dup_list.clear();
+  seen.reset(work->count);
+  uint64_t hits_local = 0;
+  for (uint64_t i = 0; i < work->count; ++i) {
+    const int64_t id = work->ids[i];
+    if (id < 0 || uint64_t(id) >= s->rows) fail("row id out of bounds");
+    uint8_t *row = work->weights + i * W;
+    if (uint64_t(id) < s->row_lo || uint64_t(id) >= s->row_hi) {
+      std::memset(row, 0, W);
+      if (SB) std::memset(work->scales + i * SB, 0, SB);
+      continue;
+    }
+    if (s->slots) {
+      const uint64_t slot = uint64_t(id) % s->slots;
+      if (s->keys[slot] == uint64_t(id) + 1) {
+        std::memcpy(row, s->cache + slot * s->entry, W);
+        if (SB) std::memcpy(work->scales + i * SB, s->cache + slot * s->entry + W, SB);
+        ++hits_local;
+        continue;
+      }
+    }
+    uint64_t first_idx = 0;
+    if (seen.find_or_insert(uint64_t(id) + 1, i, &first_idx)) {
+      dup_list.push_back({i, first_idx});
+      ++hits_local;
+      continue;
+    }
+    const Segment &g = segment_of(s, uint64_t(id));
+    if (g.file >= 4096) fail("too many segment files for page key");
+    const uint64_t r = uint64_t(id) - g.first;
+    miss_list.push_back({i, uint64_t(id), g.weight_offset + r * W, g.scale_offset + r * SB, g.file});
+  }
+  if (hits_local) s->hits.fetch_add(hits_local, std::memory_order_relaxed);
+  if (miss_list.empty()) return;
+  s->misses.fetch_add(miss_list.size(), std::memory_order_relaxed);
+
+  pieces.clear();
+  pieces.reserve(miss_list.size() * (read_scales ? 2 : 1) + 16);
+  for (const MissItem &m : miss_list) {
+    emit_pieces_into(pieces, m.file, m.w_off, W, work->weights + m.out_idx * W);
+    if (SB) {
+      uint8_t *scales = work->scales + m.out_idx * SB;
+      if (s->scale_data) std::memcpy(scales, s->scale_data + (m.id - s->scale_row_lo) * SB, SB);
+      else emit_pieces_into(pieces, m.file, m.s_off, SB, scales);
+    }
+  }
+
+  read_sorted_pieces(s, pieces);
+
+  for (const DupItem &d : dup_list) {
+    std::memcpy(work->weights + d.dst_idx * W, work->weights + d.src_idx * W, W);
+    if (SB) std::memcpy(work->scales + d.dst_idx * SB, work->scales + d.src_idx * SB, SB);
+  }
+
+  if (s->slots) {
+    for (const MissItem &m : miss_list) {
+      const uint64_t slot = m.id % s->slots;
+      const uint8_t *row = work->weights + m.out_idx * W;
+      std::memcpy(s->cache + slot * s->entry, row, W);
+      if (SB) std::memcpy(s->cache + slot * s->entry + W, work->scales + m.out_idx * SB, SB);
+      s->keys[slot] = m.id + 1;
+    }
+  }
 }
 
 static void lookup_resident(Work *work) {
@@ -391,6 +609,44 @@ XTIER_API void xtier_rows_lookup(void *opaque) {
   s->lookups.fetch_add(1, std::memory_order_relaxed);
   uint64_t seen = s->lookup_max_ns.load(std::memory_order_relaxed);
   while (took > seen && !s->lookup_max_ns.compare_exchange_weak(seen, took)) {}
+}
+
+// Warm `s->cache` for `ids[0..count)` on a background thread without output buffers (cross-chunk Engram lookahead).
+XTIER_API void xtier_rows_prefetch(Store *s, const int64_t *ids, uint64_t count) {
+  if (!s || s->ram || !s->slots || count == 0) return;
+  std::lock_guard<std::mutex> guard(s->batch_lock);
+  const uint64_t W = s->row_bytes, SB = s->scale_bytes;
+  static thread_local SeenTable seen_slots;
+  static thread_local std::vector<std::pair<uint64_t, uint64_t>> fill_slots;   // (slot, id)
+  static thread_local std::vector<PagePiece> pieces;
+
+  seen_slots.reset(count);
+  fill_slots.clear();
+  pieces.clear();
+  for (uint64_t rev = count; rev > 0; --rev) {
+    const int64_t id = ids[rev - 1];
+    if (id < 0 || uint64_t(id) >= s->rows) continue;
+    if (uint64_t(id) < s->row_lo || uint64_t(id) >= s->row_hi) continue;
+    const uint64_t slot = uint64_t(id) % s->slots;
+    if (seen_slots.find_or_insert(slot + 1, uint64_t(id), nullptr)) continue;
+    if (s->keys[slot] == uint64_t(id) + 1) continue;
+    const Segment &g = segment_of(s, uint64_t(id));
+    if (g.file >= 4096) continue;
+    const uint64_t r = uint64_t(id) - g.first;
+    s->keys[slot] = 0;   // invalidate until read completes
+    uint8_t *dst = s->cache + slot * s->entry;
+    emit_pieces_into(pieces, g.file, g.weight_offset + r * W, W, dst);
+    if (SB) {
+      if (s->scale_data) std::memcpy(dst + W, s->scale_data + (uint64_t(id) - s->scale_row_lo) * SB, SB);
+      else emit_pieces_into(pieces, g.file, g.scale_offset + r * SB, SB, dst + W);
+    }
+    fill_slots.emplace_back(slot, uint64_t(id));
+  }
+  if (fill_slots.empty()) return;
+  read_sorted_pieces(s, pieces);
+  for (const auto &kv : fill_slots) {
+    s->keys[kv.first] = kv.second + 1;
+  }
 }
 
 // Reads the scales of the owned rows [row_lo, row_hi) into memory (the whole table on one GPU; a TP rank never looks

@@ -53,6 +53,8 @@ import time
 
 import torch
 
+from xtier import config
+
 logger = logging.getLogger(__name__)
 GIB = 2 ** 30
 RING_EVICTIONS = 2048   # evictions xtier_mailbox_pool_shrink posts at once: half the command ring (csrc/mailbox POOL_RING)
@@ -178,7 +180,10 @@ class Governor:
         if ctx is None or tokens < 1:
             return None
         best = None
+        hm = 0 if draft else max(config.hybrid_prefill_max(), config.gpu_prefill_min())
         for (t, c), n in self.seen.get(draft, {}).items():
+            if hm > 0 and t < hm <= tokens:   # hybrid/cpu prefill (no GPU staging/workspace) cannot bound gpu_prefill
+                continue
             f = max(1.0, tokens / t) * max(1.0, ctx / c)
             if f <= self.extrapolate and (best is None or n * f < best):
                 best = n * f

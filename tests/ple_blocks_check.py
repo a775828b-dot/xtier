@@ -64,7 +64,8 @@ def run(fn, hidden, embeddings, track_offset):
                             req_indices=torch.zeros(T, dtype=torch.long, device='cuda'),
                             token_offsets=torch.arange(T, device='cuda'),
                             valid_tokens=torch.ones(T, dtype=torch.bool, device='cuda'),
-                            state_indices=torch.tensor([2], device='cuda'))
+                            state_indices=torch.tensor([2], device='cuda'),
+                            query_start_loc=None)
     layer.ple_embedding = type('E', (), {'enable_ple_fusion': False, '__call__': lambda self, b, fb: embeddings})()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
