@@ -124,6 +124,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-19 全双工零同步预填突破 9,000 tok/s、SM120 mHC 精确核与工具回传提速](reports/2026-11-19-lossless-9k-prefill.md) | 不改 48K 默认分块、100% 无损：通用层（`_run_fp4` 预重排纯 DMA 24 槽、零同步位图/直方图、单遍 `_reduce_band`、全双工 `CPU_SHARE`、`engine.cpp` 动态窃取、并行 BPE 分词、`elastic` 2048 边界）与 DeepSeek 加速包（PTX `mhc.post` 消除 +22.5 GiB 尖峰、24-bit `bf16x3` mHC、`>=512` 行 CUTLASS MXFP8 自调优、分组 BF16 `wo_a`、中间块 SWA 剪枝、640 阈值）；实测排除 `SLOT_TOKENS=24`；500K 冷 prefill 升至 8,930–9,085 tok/s（458K 达 9,180 tok/s）、工具回传 2.07 → 1.12 s |
 | [2026-11-18 全链路无损预填、Engram 跨块预热与 DSpark 上下文检索（v0.1.7）](reports/2026-11-18-lossless-prefill-recall.md) | 通用层（1K–6K 绕过 `_split_prefill`、`_run_fp4` 单次量化融合、NVMe 行表 LBA 去重与预热、弹性缓存跨模态边界保护）与 DeepSeek 加速包（第 14 层后跨块预热 Engram 行、DSpark 上下文草稿检索 Recall、`wo_a` / `b12x` / `markov_w2`）；实测排除项；三个模型在 SGLang 084a5e9 下的回归、两轮 `agent_bench` 与各 15 分钟 dsh 真实任务 |
 | [2026-11-14 跟进 SGLang 084a5e9（v0.1.6）](reports/2026-11-14-sglang-084a5e9.md) | 依赖变化（FlashInfer 0.7.4 等）；17 个改了源码的被钩函数逐个核对、XTier 运行时不用改；模拟 30 系的工具跟着改一处；三个模型的回归；DeepSeek 冷 prefill 快约 10% |
 | [2026-11-12 DeepSeek 同时跑 4 个请求（v0.1.5）](reports/2026-11-12-ds-four-requests.md) | 并发上限 2 → 4、KV 池 1M、一次专家调用最多 16 个 token、变长验证成默认；1、2、4 个请求的速度；成本表测到 4 个请求，每步时间按 6 行一档；子 agent 不再挤掉主会话的缓存；三个模型的回归 |
