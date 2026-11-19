@@ -244,14 +244,18 @@ def _submit_lookahead(windows, hasher):
 
 
 def _on_forward_batch_init(ret, cls, batch, model_runner=None, *args, **kwargs):
+    from xtier.backend import prefill as _backend_prefill
     _next_chunk_windows[0] = None
     _swa_tail_override[0] = None
+    _backend_prefill.set_more_chunks(False)
     if not batch.forward_mode.is_extend_without_speculative():
         return ret
     reqs = getattr(batch, 'reqs', None)
     finals = getattr(ret, 'extend_is_final_cpu', None)
     if not reqs or not finals:
         return ret
+    if not getattr(model_runner, 'is_draft_worker', False) and not all(finals):
+        _backend_prefill.set_more_chunks(True)
     decoding_ids = {id(r) for r in (getattr(batch, 'decoding_reqs', None) or ())}
     if _prefetching and os.environ.get('XTIER_ENGRAM_LOOKAHEAD', '1') != '0':
         extend_lens = getattr(batch, 'extend_lens', None) or getattr(ret, 'extend_seq_lens_cpu', None) or ()
@@ -272,8 +276,8 @@ def _on_forward_batch_init(ret, cls, batch, model_runner=None, *args, **kwargs):
         if windows:
             _next_chunk_windows[0] = windows
     swa_mode = os.environ.get('XTIER_DS_SKIP_INTERMEDIATE_SWA_REPLAY', 'auto')
-    radix_disabled = bool(getattr(getattr(model_runner, 'tree_cache', None), 'disable', False))
-    if (swa_mode == '1' or (swa_mode == 'auto' and radix_disabled)) and len(reqs) == 1 and not finals[0]:
+    if (swa_mode in ('1', 'auto') and not getattr(batch, 'return_logprob', False)
+            and len(reqs) == 1 and not finals[0]):
         req0 = reqs[0]
         if id(req0) not in decoding_ids:
             full0 = getattr(req0, 'full_untruncated_fill_ids', None)
@@ -287,7 +291,9 @@ def _on_forward_batch_init(ret, cls, batch, model_runner=None, *args, **kwargs):
 
 def _late_layer_tail_layout(original, *args, **kwargs):
     override = _swa_tail_override[0]
-    if override is not None and 'tail_len' in kwargs and override < kwargs['tail_len']:
+    whole = kwargs.get('whole_extend')
+    if (override is not None and not (whole is not None and any(whole))
+            and 'tail_len' in kwargs and override < kwargs['tail_len']):
         kwargs = dict(kwargs, tail_len=override)
     return original(*args, **kwargs)
 
@@ -469,7 +475,7 @@ def _markov_step_bias(original, self, prev_tokens, *, hidden_states=None, state=
 
 
 def install(registry, hook_type):
-    from xtier.packs.deepseek_v4 import ragged_verify, paged_indexer, recall, wo_a
+    from xtier.packs.deepseek_v4 import mhc_sm120, paged_indexer, ragged_verify, recall, wo_a
 
     registry.register('sglang.srt.speculative.dspark_components.dspark_planner.DSparkVerifyPlanner.set_forced_budget_frac',
                       ragged_verify.forced_budget, hook_type.AFTER)
@@ -477,6 +483,7 @@ def install(registry, hook_type):
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
     wo_a.install(registry, hook_type)
+    mhc_sm120.install(registry, hook_type)
     paged_indexer.install(registry, hook_type)
     if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)

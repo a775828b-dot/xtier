@@ -956,7 +956,7 @@ template<bool MX> class Plan: public PlanBase {
     template<int HC,int IC> void run(int node,int lane,int lanes) {
         const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes,HN=H/nodes;
         if(phase==1) {
-            if(dynamic&&m<=DECODE_M) {
+            if(dynamic) {
                 const int total=groups_n*IN;
                 for(int q,size;(size=claim(node,total,gate_grain,2,lanes,q))>0;) {
                     int stop=q+size;
@@ -1003,7 +1003,7 @@ template<bool MX> class Plan: public PlanBase {
                 gate_any<HC,IC>(groups[g].count,node,g,begin,end);
             }
         } else {
-            if(dynamic&&m<=DECODE_M) {
+            if(dynamic&&size_t(m)*H<=16777216) {
                 // Chunks keep the four-row microkernel boundaries and the private
                 // accumulation of the static split below.
                 float *local=local_buffer(size_t(m)*H);

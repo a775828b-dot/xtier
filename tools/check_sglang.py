@@ -34,6 +34,9 @@ FEATURES = dict(XTIER='1', XTIER_ENGRAM_ROWS='nvme', XTIER_ENGRAM_PREFETCH='1', 
 SOURCES = ROOT / 'tools' / 'hook_sources.json'
 _FB, _MOE = 'sglang.srt.model_executor.forward_batch_info.ForwardBatch', 'sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE'
 ATTRIBUTES = [   # (class, attribute, what XTier loses without it)
+    ('sglang.srt.managers.tokenizer_manager.TokenizerManager', 'tokenizer', 'parallel BPE tokenization falls back to single-thread'),
+    ('sglang.srt.managers.tokenizer_manager.TokenizerManager', 'async_dynamic_batch_tokenizer', 'the same'),
+    ('sglang.srt.managers.tokenizer_manager.TokenizerManager', 'model_config', 'the same'),
     (_FB, 'seq_lens_sum', "the elastic cache's estimate of a prefill's memory: every extra slot released before each one"),
     (_FB, 'seq_lens_cpu', 'the same (the fallback)'),
     (_FB, 'input_ids', "the elastic cache's token count of a forward"),

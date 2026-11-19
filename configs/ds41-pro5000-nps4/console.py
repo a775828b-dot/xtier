@@ -129,9 +129,13 @@ def build(o, port):
            'XTIER_ENGRAM_CACHE_GIB': o['engram']}
     if base:   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head / recall
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
-                   XTIER_DRAFT_LMHEAD_FP8='0', XTIER_ENGRAM_LOOKAHEAD='0', XTIER_DS_MARKOV_PAD2='0', XTIER_RECALL='0')
+                   XTIER_DRAFT_LMHEAD_FP8='0', XTIER_ENGRAM_LOOKAHEAD='0', XTIER_DS_MARKOV_PAD2='0', XTIER_RECALL='0',
+                   XTIER_DS_MHC_BF16X3='0', XTIER_DS_MXFP8_AUTOTUNE='0', XTIER_DS_SKIP_INTERMEDIATE_SWA_REPLAY='0',
+                   XTIER_DS_WO_A_PREFILL='0', XTIER_GPU_PREFILL_MIN='1024', XTIER_HYBRID_PREFILL_MAX='1024')
     elif o['elastic'] == 'on':   # past ~66 slots the GPU side of a layer is the slower one (planner, 10-26)
         env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68')
+    if not base and o['cold'] == 'off':
+        env.update(XTIER_GPU_PREFILL_MIN='640', XTIER_HYBRID_PREFILL_MAX='640')
     if not base and o['spec'] == 'on':
         env['XTIER_RECALL'] = '1' if o.get('recall', 'on') == 'on' else '0'
     if o['spec'] == 'on' and o['verify'] == 'compact':   # budgeted by sps-table.json (run-ds-xtier.sh)

@@ -131,72 +131,102 @@ def resident_prefill(prefill, arena, x, ids, weights):
     return out
 
 
+import threading
+
+_hybrid_lock = threading.Lock()
+_hybrid_host = {}
+_hybrid_worker = None
+
+
+def _get_hybrid_buffers(H, k, m):
+    buf = _hybrid_host.get((H, k))
+    if buf is None or buf['x'].shape[0] < m:
+        cap = 1 << max(8, (m - 1).bit_length())
+        buf = _hybrid_host[(H, k)] = dict(
+            x=torch.empty((cap, H), dtype=torch.bfloat16, pin_memory=True),
+            ids=torch.empty((cap, k), dtype=torch.int32, pin_memory=True),
+            w=torch.empty((cap, k), dtype=torch.float32, pin_memory=True),
+            out=torch.empty((cap, H), dtype=torch.float32, pin_memory=True),
+        )
+    return buf
+
+
 def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     """Prefill of a partly cached layer: routes to cached experts on the GPU (the tile kernels on the slots, W4A16),
     the others at the same time on the CPU engine (FP32); the two partial sums are added in FP32.
     x: BF16 [m, H], ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current stream) -> FP32 [m, H].
     The residency is read once at the start: swaps are applied only by decode windows, which do not run meanwhile."""
-    import threading
+    global _hybrid_worker
+    from xtier.backend.prefill import _PersistentWorker
 
     H, I, S = pool.H, pool.I, pool.S
     prefill = pool.prefill
     g13, g2 = prefill._globals()
     m, k = ids.shape
-    slot = pool.table[ids.long()]                       # [m, k]: slot of each route, -1 = on the CPU
-    on_gpu = slot >= 0
-    # CPU part: inputs staged in pinned memory, GPU routes as id -1 (the engine skips them)
-    x_h = torch.empty((m, H), dtype=torch.bfloat16, pin_memory=True)
-    ids_h = torch.empty((m, k), dtype=torch.int32, pin_memory=True)
-    w_h = torch.empty((m, k), dtype=torch.float32, pin_memory=True)
-    out_h = torch.empty((m, H), dtype=torch.float32, pin_memory=True)
-    x_h.copy_(x, non_blocking=True)
-    ids_h.copy_(torch.where(on_gpu, -1, ids).to(torch.int32), non_blocking=True)
-    w_h.copy_(weights, non_blocking=True)
-    # GPU part: routes sorted by slot (CPU routes last, no tile), one host rendezvous for the tile metadata
-    key = torch.where(on_gpu, slot, S).reshape(-1)
-    order = torch.argsort(key, stable=True).to(torch.int32)
-    counts = torch.bincount(key, minlength=S + 1)[:S]
-    host = torch.cat([counts, pool.owner[:S].to(counts.dtype)]).cpu().tolist()   # also completes the staging copies
-    errors = []
+    with _hybrid_lock:
+        slot = pool.table[ids.long()]                       # [m, k]: slot of each route, -1 = on the CPU
+        on_gpu = slot >= 0
+        # CPU part: inputs staged in persistent pinned memory, GPU routes as id -1 (the engine skips them)
+        buf = _get_hybrid_buffers(H, k, m)
+        x_h, ids_h, w_h, out_h = buf['x'], buf['ids'], buf['w'], buf['out']
+        x_h[:m].copy_(x, non_blocking=True)
+        ids_h[:m].copy_(torch.where(on_gpu, -1, ids).to(torch.int32), non_blocking=True)
+        w_h[:m].copy_(weights, non_blocking=True)
+        # GPU part: routes sorted by slot (CPU routes last, no tile), one host rendezvous for the tile metadata
+        key = torch.where(on_gpu, slot, S).reshape(-1)
+        order = torch.argsort(key, stable=True).to(torch.int32)
+        counts = torch.bincount(key, minlength=S + 1)[:S]
+        host = torch.cat([counts, pool.owner[:S].to(counts.dtype)]).cpu().tolist()   # also completes the staging copies
+        errors = []
 
-    def cpu_part():
+        prev_ev = buf.get('ev')
+
+        def cpu_part():
+            try:
+                if prev_ev is not None:
+                    prev_ev.synchronize()
+                for s0 in range(0, m, cpu_batch):
+                    n = min(cpu_batch, m - s0)
+                    plan.forward(n, k, x_h.data_ptr() + s0 * H * 2, ids_h.data_ptr() + s0 * k * 4,
+                                 w_h.data_ptr() + s0 * k * 4, out_h.data_ptr() + s0 * H * 4)
+            except BaseException as e:   # re-raised by the caller after the join
+                errors.append(e)
+
+        if _hybrid_worker is None:
+            _hybrid_worker = _PersistentWorker('xtier-hybrid-prefill')
+        worker = _hybrid_worker.launch(cpu_part)
         try:
-            for s0 in range(0, m, cpu_batch):
-                n = min(cpu_batch, m - s0)
-                plan.forward(n, k, x_h.data_ptr() + s0 * H * 2, ids_h.data_ptr() + s0 * k * 4,
-                             w_h.data_ptr() + s0 * k * 4, out_h.data_ptr() + s0 * H * 4)
-        except BaseException as e:   # re-raised by the caller after the join
-            errors.append(e)
-
-    worker = threading.Thread(target=cpu_part, name='xtier-hybrid-prefill')
-    worker.start()
-    try:
-        counts, owner = host[:S], host[S:]
-        bm = 64 if sum(counts) >= 48 * max(1, sum(1 for c in counts if c)) else 32
-        small = bm == 32
-        gbn, gw, gs = (64, 8, 2) if small else (32, 4, 3)
-        dbn, dw = (64, 4) if small else (128, 8)
-        tiles, offset = [], 0
-        for s in range(S):
-            c = counts[s]
-            for q in range(0, c, bm):
-                tiles.append((owner[s], s, offset + q, offset + c))
-            offset += c
-        out_g = torch.zeros((m, H), dtype=torch.float32, device=x.device)
-        if tiles:
-            meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
-            mid = torch.empty((max(offset, 1), I), dtype=torch.bfloat16, device=x.device)
-            routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)   # CPU routes stay 0 for the sum
-            nt = len(tiles)
-            _gate_up_tiles[(nt, I // gbn)](x, order, meta[0], meta[1], meta[2], meta[3], pool.arena[0], pool.arena[2], g13,
-                                           mid, k, H, I, prefill.swiglu_limit, bm, gbn, _tile_k(H), MX=prefill.mxfp4,
-                                           ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
-                                           num_warps=gw, num_stages=gs)
-            _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], meta[3], pool.arena[1], pool.arena[3], g2,
-                                        routes, H, I, bm, dbn, _tile_k(I), MX=prefill.mxfp4, num_warps=dw, num_stages=2)
-            _reduce[(m, triton.cdiv(H, 256))](routes, torch.where(on_gpu, weights, 0.0), out_g, k, 256, H)
-    finally:   # before the caller may run this layer again (elastic cache): the CPU plan takes one caller
-        worker.join()
-    if errors:
-        raise errors[0]
-    return out_g + out_h.to(x.device, non_blocking=True)
+            counts, owner = host[:S], host[S:]
+            bm = 64 if sum(counts) >= 48 * max(1, sum(1 for c in counts if c)) else 32
+            small = bm == 32
+            gbn, gw, gs = (64, 8, 2) if small else (32, 4, 3)
+            dbn, dw = (64, 4) if small else (128, 8)
+            tiles, offset = [], 0
+            for s in range(S):
+                c = counts[s]
+                for q in range(0, c, bm):
+                    tiles.append((owner[s], s, offset + q, offset + c))
+                offset += c
+            out_g = torch.zeros((m, H), dtype=torch.float32, device=x.device)
+            if tiles:
+                meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
+                mid = torch.empty((max(offset, 1), I), dtype=torch.bfloat16, device=x.device)
+                routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)   # CPU routes stay 0 for the sum
+                nt = len(tiles)
+                _gate_up_tiles[(nt, I // gbn)](x, order, meta[0], meta[1], meta[2], meta[3], pool.arena[0], pool.arena[2], g13,
+                                               mid, k, H, I, prefill.swiglu_limit, bm, gbn, _tile_k(H), MX=prefill.mxfp4,
+                                               ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                               num_warps=gw, num_stages=gs)
+                _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], meta[3], pool.arena[1], pool.arena[3], g2,
+                                            routes, H, I, bm, dbn, _tile_k(I), MX=prefill.mxfp4, num_warps=dw, num_stages=2)
+                _reduce[(m, triton.cdiv(H, 256))](routes, torch.where(on_gpu, weights, 0.0), out_g, k, 256, H)
+        finally:   # before the caller may run this layer again (elastic cache): the CPU plan takes one caller
+            worker.join()
+        if errors:
+            raise errors[0]
+        res = out_g + out_h[:m].to(x.device, non_blocking=True)
+        # Ensure async H2D of out_h[:m] completes before next call under _hybrid_lock can overwrite out_h!
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(x.device))
+        _hybrid_host[(H, k)]['ev'] = ev
+        return res

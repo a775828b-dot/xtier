@@ -41,7 +41,9 @@ def build(o, port):
            'XTIER_COLD_FRACTION': f"0.{o['cold']}", 'XTIER_SIM_VRAM_MIB': '32000', 'XTIER_SIM_HOST_MAX': '128G'}
     if o['packs'] == 'off':   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head / recall
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
-                   XTIER_DRAFT_LMHEAD_FP8='0', XTIER_ENGRAM_LOOKAHEAD='0', XTIER_DS_MARKOV_PAD2='0', XTIER_RECALL='0')
+                   XTIER_DRAFT_LMHEAD_FP8='0', XTIER_ENGRAM_LOOKAHEAD='0', XTIER_DS_MARKOV_PAD2='0', XTIER_RECALL='0',
+                   XTIER_DS_MHC_BF16X3='0', XTIER_DS_MXFP8_AUTOTUNE='0', XTIER_DS_SKIP_INTERMEDIATE_SWA_REPLAY='0',
+                   XTIER_DS_WO_A_PREFILL='0')
     elif o['elastic'] == 'on':
         env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='30')
     return env, [str(HERE / 'run-ds-mini.sh')]

@@ -167,7 +167,8 @@ class Governor:
         self.extrapolate = _env('XTIER_CACHE_ELASTIC_EXTRAPOLATE', 2.0)
         self.debug = os.environ.get('XTIER_CACHE_ELASTIC_DEBUG', '0') == '1'
         self.recent = []                # the needs of the last small allocating forwards
-        self.small = int(_env('XTIER_CACHE_ELASTIC_SMALL', 4096))
+        hm0 = max(config.hybrid_prefill_max(), config.gpu_prefill_min())
+        self.small = int(_env('XTIER_CACHE_ELASTIC_SMALL', min(512, max(64, hm0 - 1)) if hm0 > 0 else 512))
         self.released = self.added = 0
         self.last_log = 0.0
 
@@ -182,7 +183,7 @@ class Governor:
         best = None
         hm = 0 if draft else max(config.hybrid_prefill_max(), config.gpu_prefill_min())
         for (t, c), n in self.seen.get(draft, {}).items():
-            if hm > 0 and t < hm <= tokens:   # hybrid/cpu prefill (no GPU staging/workspace) cannot bound gpu_prefill
+            if hm > 0 and (t < hm <= tokens or t < 2048 <= tokens):   # staging regime changes at hm and 2048
                 continue
             f = max(1.0, tokens / t) * max(1.0, ctx / c)
             if f <= self.extrapolate and (best is None or n * f < best):
@@ -411,6 +412,10 @@ class Governor:
             return
         self.grower = threading.Thread(target=self._grow, args=(target, 2), name='xtier-elastic-grow', daemon=True)
         self.grower.start()
+
+
+def is_chunking() -> bool:
+    return _governor is not None and _governor.chunking
 
 
 def register(pools, lib, commit):

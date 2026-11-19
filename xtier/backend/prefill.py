@@ -9,6 +9,7 @@ returning to attention. Retaining the workspace is an explicit experimental opt-
 import ctypes as C
 import gc
 import logging
+import math
 import os
 import threading
 import time
@@ -195,6 +196,36 @@ def _add_bf16_rows(ACC, PART, ROWS, B: tl.constexpr, HID: tl.constexpr):
 
 
 @tr.jit
+def _reduce_band(PARTS, PERM, OFF, ACC, CPU_OUT, CPU_IDX, OUT,
+                 IS_FIRST: tl.constexpr, IS_LAST: tl.constexpr, HAS_CPU: tl.constexpr,
+                 B: tl.constexpr, HID: tl.constexpr):
+    """Chunk-ordered FP32 reduction of a band of per-(chunk, token) BF16 outputs.
+    Preserves exact IEEE-754 left-to-right addition order across chunks (bitwise identical to _add_bf16_rows + _emit)."""
+    t = tl.program_id(0).to(tl.int64)
+    n = tl.program_id(1) * B + tl.arange(0, B)
+    mask = n < HID
+    s0 = tl.load(OFF + t)
+    s1 = tl.load(OFF + t + 1)
+    if IS_FIRST:
+        acc = tl.zeros((B,), dtype=tl.float32)
+    else:
+        if not IS_LAST and s0 == s1:
+            return
+        acc = tl.load(ACC + t * HID + n, mask, 0.0)
+    for idx in range(s0, s1):
+        p = tl.load(PERM + idx).to(tl.int64)
+        acc += tl.load(PARTS + p * HID + n, mask, 0.0).to(tl.float32)
+    if IS_LAST:
+        if HAS_CPU:
+            ci = tl.load(CPU_IDX + t)
+            if ci >= 0:
+                acc += tl.load(CPU_OUT + ci.to(tl.int64) * HID + n, mask, 0.0)
+        tl.store(OUT + t * HID + n, acc.to(tl.bfloat16), mask)
+    else:
+        tl.store(ACC + t * HID + n, acc, mask)
+
+
+@tr.jit
 def _gather_fp8_and_ids(XQ_ALL, XSF_LIN, IDS_ALL, W_ALL, ROWS, XQ_OUT, XSF_OUT, IDS_OUT, W_OUT,
                         HAS_SKIP: tl.constexpr, DUMMY_ID, B_H: tl.constexpr, B_SF: tl.constexpr,
                         HID: tl.constexpr, K: tl.constexpr):
@@ -220,18 +251,136 @@ def _gather_fp8_and_ids(XQ_ALL, XSF_LIN, IDS_ALL, W_ALL, ROWS, XQ_OUT, XSF_OUT, 
     cm = c < HID
     tl.store(XQ_OUT + i * HID + c, tl.load(XQ_ALL + row * HID + c, cm, 0), cm)
 
+@tr.jit
+def _mark_chunk_tokens(IDS, TOUCH, FLAGS, M, E, CH: tl.constexpr, NC: tl.constexpr, K: tl.constexpr, BM: tl.constexpr):
+    """Mark touch[chunk, token] = 1 in an L2-resident uint8 bitmap and flag out-of-range / skipped (-1) ids."""
+    t = tl.program_id(0) * BM + tl.arange(0, BM)
+    tm = t < M
+    t64 = t.to(tl.int64)
+    bad = tl.zeros((BM,), dtype=tl.int32)
+    sk = tl.zeros((BM,), dtype=tl.int32)
+    for q in tl.static_range(K):
+        idv = tl.load(IDS + t64 * K + q, mask=tm, other=0)
+        bad = bad | tl.where(tm & ((idv < -1) | (idv >= E)), 1, 0)
+        sk = sk | tl.where(tm & (idv == -1), 1, 0)
+        c = tl.where(idv >= 0, idv // CH, NC).to(tl.int64)
+        tl.store(TOUCH + c * M + t64, 1, mask=tm)
+    if tl.sum(bad, 0) > 0:
+        tl.atomic_or(FLAGS, 1)
+    if tl.sum(sk, 0) > 0:
+        tl.atomic_or(FLAGS + 1, 1)
+
+
+@tr.jit
+def _compact_chunk_rows(TOUCH, OFFSETS, ROWS_GPU, M, BT: tl.constexpr):
+    """Compact each non-skipped chunk's touched tokens into ascending int32 rows_gpu[offsets[j]:offsets[j+1]]."""
+    j = tl.program_id(0).to(tl.int64)
+    w0 = tl.load(OFFSETS + j)
+    w1 = tl.load(OFFSETS + j + 1)
+    if w0 == w1:
+        return
+    base = TOUCH + j * M
+    for t0 in range(0, M, BT):
+        cols = t0 + tl.arange(0, BT)
+        cm = cols < M
+        fl = tl.load(base + cols, mask=cm, other=0).to(tl.int32)
+        ps = tl.cumsum(fl, 0) - fl
+        tl.store(ROWS_GPU + w0 + ps, cols, mask=fl != 0)
+        w0 += tl.sum(fl, 0)
+
+
+@tr.jit
+def _hist_rows(ROWS, RC, N, BLOCK: tl.constexpr):
+    """Zero-sync histogram of int32 token indices in ROWS[0..N) into RC."""
+    p = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = p < N
+    r = tl.load(ROWS + p, mask=m, other=0)
+    tl.atomic_add(RC + r, 1, mask=m)
+
+
+@tr.jit
+def _copy_pool_chunk8(A0, A1, S0, S1, PACK0: tl.int64, PACK1: tl.int64, I_HALF_Q, W2_Q, BLOCK: tl.constexpr):
+    """Fused 64-bit D2D copy of up to 8 pool-resident experts into staging slot ([gate; up] -> [up; gate] + down)."""
+    i = tl.program_id(0)
+    p = tl.program_id(1)
+    shift = (i & 3).to(tl.int64) * 16
+    raw = tl.where(i < 4, (PACK0 >> shift) & 0x3FFF, (PACK1 >> shift) & 0x3FFF)
+    if raw == 0x3FFF:
+        return
+    r = raw.to(tl.int64)
+    i64 = i.to(tl.int64)
+    off = p.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    w13_q = 2 * I_HALF_Q
+    if p * BLOCK < w13_q:
+        m0 = off < I_HALF_Q
+        tl.store(S0 + i64 * w13_q + off, tl.load(A0 + r * w13_q + I_HALF_Q + off, mask=m0, other=0), mask=m0)
+        m1 = (off >= I_HALF_Q) & (off < w13_q)
+        tl.store(S0 + i64 * w13_q + off, tl.load(A0 + r * w13_q + (off - I_HALF_Q), mask=m1, other=0), mask=m1)
+    if p * BLOCK < W2_Q:
+        m2 = off < W2_Q
+        tl.store(S1 + i64 * W2_Q + off, tl.load(A1 + r * W2_Q + off, mask=m2, other=0), mask=m2)
+
+
+
+class _PersistentWorker:
+    """Single daemon worker thread reused across prefill calls; exposes .is_alive() and .join()."""
+
+    def __init__(self, name):
+        self._start_ev = threading.Event()
+        self._done_ev = threading.Event()
+        self._done_ev.set()
+        self._fn = None
+        self._busy = False
+        self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            self._start_ev.wait()
+            self._start_ev.clear()
+            fn, self._fn = self._fn, None
+            try:
+                if fn is not None:
+                    fn()
+            finally:
+                self._busy = False
+                self._done_ev.set()
+
+    def launch(self, fn):
+        self._done_ev.wait()
+        self._done_ev.clear()
+        self._fn = fn
+        self._busy = True
+        self._start_ev.set()
+        return self
+
+    def is_alive(self):
+        return self._busy
+
+    def join(self):
+        self._done_ev.wait()
+
 
 _lock = threading.Lock()
 _slots = None      # packed staging slots, each [w13, w2, s13, s2] for one expert chunk
+_slot_res = None   # per-slot (residency_slice, pre_swizzled) metadata for _upload_chunk_fp4_dma
+_slot_free_ev = None  # per-slot compute completion event when release_workspace=0
 _unpacked = None   # BF16 weights of the chunk being computed (XTIER_PREFILL_UNPACK=1)
 _pending = None    # (plan, upload-done event, slot) of a cross-layer prefetch
 _copy_stream = None
+_d2h_stream = None
 _share_host = {}   # XTIER_PREFILL_CPU_SHARE: (hidden, top-k) -> pinned host buffers of the CPU part
 _share_cost = {}   # (hidden, intermediate, experts per chunk) -> the measured costs its split balances
 _share_worker = None   # the thread of the last CPU part (joined before the next one: a call that raised left it running)
 _share_seen = dict(calls=0, chunks=0, skipped=0, cpu_chunks=0, routes=0, cpu_routes=0, gpu_s=0.0, cpu_s=0.0, logged=0.0)
 logger = logging.getLogger(__name__)
+_first_plan = None
+_more_chunks = [False]
 _last_plan = None
+
+
+def set_more_chunks(flag: bool) -> None:
+    _more_chunks[0] = bool(flag)
 _unpack_stream = None  # XTIER_PREFILL_OVERLAP: FP4->BF16 unpack stream
 _unpacked2 = None      # XTIER_PREFILL_OVERLAP: two alternating BF16 weight buffers
 
@@ -454,6 +603,7 @@ class Prefill:
         self.registered = True
 
     def close(self):
+        self._fp4_swizzled_scales = None
         if self.shards is not None:
             if self.registered:
                 torch.cuda.synchronize()
@@ -474,17 +624,19 @@ class Prefill:
         # call's virtual order (run), which no other caller may see.
         return self._cold_globals if self._cold_globals is not None else self._globals()
 
-    def _upload_chunk(self, slot, e0, e1, stream, up_first=False, virtual=True):
+    def _upload_chunk(self, slot, e0, e1, stream, up_first=False, virtual=True, indices=None):
         """Copy experts [e0, e1) into a staging slot on `stream` (bytes unchanged). up_first: W13 and
         its scales as [up; gate] (FlashInfer CUTLASS) instead of the engine's [gate; up]. With cold experts
         (virtual) e0..e1 are this call's virtual experts: the RAM slots first, then the cold staging; without
-        (virtual=False: the hot pool's fill) they are RAM slots."""
+        (virtual=False: the hot pool's fill) they are RAM slots. `indices`: optional subset of {0,1,2,3}."""
         self.ensure_registered()
         n = e1 - e0
         I = self.inter
         if self.shards is None:
             with torch.cuda.stream(torch.cuda.ExternalStream(stream)):
                 for i, (dst, src) in enumerate(zip(slot, self.weights[:4])):
+                    if indices is not None and i not in indices:
+                        continue
                     if up_first and i in (0, 2):  # per expert: contiguous halves (async from pinned memory)
                         for e in range(n):
                             dst[e, :I].copy_(src[e0 + e, I:], non_blocking=True)
@@ -508,16 +660,21 @@ class Prefill:
                 self.cold.wait(s0, s1)
             for node, row in enumerate(shards):
                 for (address, size), (index, first, rows, total, width) in zip(row, layout):
+                    if indices is not None and index not in indices:
+                        continue
                     dst = slot[index].data_ptr() + d0 * total * width + (first + node * rows) * width
                     _check(cudart.cudaMemcpy2DAsync(dst, total * width, address + s0 * rows * width, rows * width,
                                                     rows * width, s1 - s0, 1, stream), 'cudaMemcpy2DAsync')
 
     def run(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16, cold_table=None):
-        global _last_plan
+        global _first_plan, _last_plan
         if self.learned_ring:
+            first = _first_plan() if _first_plan is not None else None
+            if first is None or self.order < first.order:
+                _first_plan = weakref.ref(self)
             previous = _last_plan() if _last_plan is not None else None
             # Forward links only (layer order): no prefetch from the last layer back to
-            # the first, so the staging buffer is released between requests.
+            # the first unless another chunk of the same chunked prefill follows immediately.
             if previous is not None and previous is not self and previous.order < self.order:
                 previous.next_prefill = weakref.ref(self)
             _last_plan = weakref.ref(self)
@@ -774,42 +931,131 @@ class Prefill:
             self._fp4_ok = ok
         return ok and output_dtype == torch.bfloat16
 
-    def _upload_chunk_fp4(self, slot, e0, e1, stream):
-        """Upload in the CUTLASS layout: [up; gate] rows, then the UE8M0 scales interleaved in place.
-        Experts resident in the hot pool (self._fp4_residency, set per call) are copied from its arena."""
+    def _ensure_fp4_scales(self, compute):
+        """Lazily build a pinned host copy of all experts' [up; gate] CUTLASS-interleaved UE8M0 scales when experts
+        are static in RAM (cold is None). Eliminates all 3,840 per-chunk GPU scale-swizzle kernels on both streams."""
+        if self.cold is not None or os.environ.get('XTIER_PREFILL_FP4_PRESWIZZLE', '1') == '0':
+            return None
+        swiz = getattr(self, '_fp4_swizzled_scales', None)
+        if swiz is not None:
+            return swiz
         from flashinfer import block_scale_interleave
+        self.ensure_registered()
+        CH, E = self.chunk, self.experts
+        s13_h = torch.empty(self.shapes[2], dtype=torch.uint8, pin_memory=True)
+        s2_h = torch.empty(self.shapes[3], dtype=torch.uint8, pin_memory=True)
+        dummy = torch.empty((1,), dtype=torch.uint8, device='cuda')
+        s13_d = torch.empty(self.slot_shapes[2], dtype=torch.uint8, device='cuda')
+        s2_d = torch.empty(self.slot_shapes[3], dtype=torch.uint8, device='cuda')
+        tmp_slot = [dummy, dummy, s13_d, s2_d]
+        raw = compute.cuda_stream
+        for e0 in range(0, E, CH):
+            e1 = min(E, e0 + CH)
+            n = e1 - e0
+            self._upload_chunk(tmp_slot, e0, e1, raw, up_first=True, virtual=False, indices=(2, 3))
+            s13_h[e0:e1].copy_(block_scale_interleave(s13_d[:n]).reshape_as(s13_d[:n]), non_blocking=True)
+            s2_h[e0:e1].copy_(block_scale_interleave(s2_d[:n]).reshape_as(s2_d[:n]), non_blocking=True)
+        compute.synchronize()
+        self._fp4_swizzled_scales = (s13_h, s2_h)
+        return self._fp4_swizzled_scales
+
+    def _upload_chunk_fp4_dma(self, slot, e0, e1, stream):
+        """Pure H2D DMA upload on _copy_stream (zero SM kernels on _copy_stream so Attention/GEMM never blocks PCIe
+        Copy Engine DMA). Uploads pre-swizzled scales when available and skips pool-resident expert weights."""
+        swiz = getattr(self, '_fp4_swizzled_scales', None) if self.cold is None else None
+        pre_swiz = swiz is not None
+        w_indices = (0, 1) if pre_swiz else None
+        n = e1 - e0
+        if pre_swiz:
+            cudart = _runtime()
+            for idx, sh in ((2, swiz[0]), (3, swiz[1])):
+                nb = n * sh[0].numel()
+                _check(cudart.cudaMemcpy2DAsync(slot[idx].data_ptr(), nb, sh.data_ptr() + e0 * sh[0].numel(),
+                                                nb, nb, 1, 1, stream), 'cudaMemcpy2DAsync')
         res = getattr(self, '_fp4_residency', None)
         pool = getattr(self.native, 'pool', None) if res is not None else None
         if pool is None:
-            self._upload_chunk(slot, e0, e1, stream, up_first=True)
-        else:
-            e = e0
-            while e < e1:
-                if res[e] >= 0:
-                    self._copy_from_pool(slot, e - e0, pool, res[e], stream)
-                    self.pool_reused = getattr(self, 'pool_reused', 0) + 1
-                    e += 1
-                else:
-                    f = e
-                    while f < e1 and res[f] < 0:
-                        f += 1
-                    self._upload_chunk([t[e - e0:] for t in slot], e, f, stream, up_first=True)
-                    e = f
-        n = e1 - e0
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream)):
+            self._upload_chunk(slot, e0, e1, stream, up_first=True, indices=w_indices)
+            return (None, pre_swiz)
+        rslice = tuple(int(res[e]) for e in range(e0, e1))
+        e = e0
+        while e < e1:
+            if rslice[e - e0] >= 0:
+                e += 1
+            else:
+                f = e + 1
+                while f < e1 and rslice[f - e0] < 0:
+                    f += 1
+                self._upload_chunk([t[e - e0:] for t in slot], e, f, stream, up_first=True, indices=w_indices)
+                e = f
+        return (rslice, pre_swiz)
+
+    def _prepare_chunk_fp4(self, slot, e0, e1, rinfo, compute):
+        """On compute stream right before cutlass_fused_moe: fill pool-resident experts from the live pool arena
+        (falling back to H2D if evicted since prefetch); swizzle scales only on cold fallback."""
+        rslice, pre_swiz = rinfo if rinfo is not None else (None, False)
+        if rslice is not None:
+            cur_res = getattr(self, '_fp4_residency', None)
+            pool = getattr(self.native, 'pool', None)
+            raw = compute.cuda_stream
+            w_indices = (0, 1) if pre_swiz else None
+            n = len(rslice)
+            i_half_b = self.inter * (self.hidden // 2)
+            w2_b = self.hidden * (self.inter // 2)
+            if (pre_swiz and n <= 8 and pool is not None and cur_res is not None
+                    and (i_half_b & 7) == 0 and (w2_b & 7) == 0
+                    and pool.arena[0].dtype == torch.uint8 and pool.arena[0].is_contiguous()
+                    and pool.arena[1].dtype == torch.uint8 and pool.arena[1].is_contiguous()
+                    and slot[0].dtype == torch.uint8 and slot[1].dtype == torch.uint8):
+                pack = [0x3FFF] * 8
+                n_hit = 0
+                for i, r_prev in enumerate(rslice):
+                    if r_prev >= 0:
+                        r_now = int(cur_res[e0 + i])
+                        if 0 <= r_now < 0x3FFF:
+                            pack[i] = r_now
+                            n_hit += 1
+                        else:
+                            self._upload_chunk([t[i:] for t in slot], e0 + i, e0 + i + 1, raw, up_first=True,
+                                               indices=w_indices)
+                if n_hit > 0:
+                    p0 = (1 << 62) | pack[0] | (pack[1] << 16) | (pack[2] << 32) | (pack[3] << 48)
+                    p1 = (1 << 62) | pack[4] | (pack[5] << 16) | (pack[6] << 32) | (pack[7] << 48)
+                    i_half_q = i_half_b >> 3
+                    w2_q = w2_b >> 3
+                    grid_q = tr.cdiv(max(2 * i_half_q, w2_q), 1024)
+                    with torch.cuda.stream(compute):
+                        _copy_pool_chunk8[(n, grid_q)](
+                            pool.arena[0].view(torch.int64), pool.arena[1].view(torch.int64),
+                            slot[0].view(torch.int64), slot[1].view(torch.int64),
+                            p0, p1, i_half_q, w2_q, 1024, num_warps=4)
+                    self.pool_reused = getattr(self, 'pool_reused', 0) + n_hit
+            else:
+                for i, r_prev in enumerate(rslice):
+                    if r_prev >= 0:
+                        r_now = cur_res[e0 + i] if (cur_res is not None and pool is not None) else -1
+                        if r_now >= 0:
+                            self._copy_from_pool(slot, i, pool, r_now, raw, weights_only=pre_swiz)
+                            self.pool_reused = getattr(self, 'pool_reused', 0) + 1
+                        else:
+                            self._upload_chunk([t[i:] for t in slot], e0 + i, e0 + i + 1, raw, up_first=True,
+                                               indices=w_indices)
+        if not pre_swiz:
+            from flashinfer import block_scale_interleave
+            n = e1 - e0
             for i in (2, 3):
                 scales = slot[i][:n]
                 scales.copy_(block_scale_interleave(scales).reshape_as(scales))
 
-    def _copy_from_pool(self, slot, i, pool, r, stream):
+    def _copy_from_pool(self, slot, i, pool, r, stream, weights_only=False):
         """Expert in pool slot r -> staging expert i, [gate; up] -> [up; gate] (bytes unchanged)."""
         I = self.inter
         a = pool.arena
         with torch.cuda.stream(torch.cuda.ExternalStream(stream)):
-            for t in (0, 2):
+            for t in ((0,) if weights_only else (0, 2)):
                 slot[t][i, :I].copy_(a[t][r, I:], non_blocking=True)
                 slot[t][i, I:].copy_(a[t][r, :I], non_blocking=True)
-            for t in (1, 3):
+            for t in ((1,) if weights_only else (1, 3)):
                 slot[t][i].copy_(a[t][r], non_blocking=True)
 
     def _share_plan(self, tokens, issued, skip):
@@ -845,27 +1091,42 @@ class Prefill:
             skip.add(j)
         return mine
 
-    def _share_start(self, mine, chunk_of, x_t, ids_t, w_t, k, n_chunks):
+    def _share_start(self, mine, touch, x_t, ids_t, w_t, k, n_chunks):
         """The CPU part of a call: the rows with a route into the chunks `mine`, staged in pinned host memory, and the
         engine on them in a thread (routes into other chunks get id -1). Returns (thread, rows, n, buffers, result)."""
-        global _share_worker
-        H = self.hidden
+        global _share_worker, _d2h_stream
+        H, CH = self.hidden, self.chunk
+        if _d2h_stream is None:
+            _d2h_stream = torch.cuda.Stream()
+        compute = torch.cuda.current_stream()
+        mine_idx = torch.tensor(mine, dtype=torch.long, device='cuda')
         mask = torch.zeros(n_chunks + 1, dtype=torch.bool, device='cuda')
-        mask[torch.tensor(mine, dtype=torch.long, device='cuda')] = True
-        routes = mask[chunk_of]
-        rows = routes.any(1).nonzero().squeeze(1)
+        mask[mine_idx] = True
+        routes = mask[torch.where(ids_t >= 0, torch.div(ids_t, CH, rounding_mode='floor'), n_chunks).long()]
+        rows = touch.index_select(0, mine_idx).any(0).nonzero().squeeze(1)
         # by expert: the engine reads an expert's weights once for up to 8 of a call's tokens, and a rarely used
         # expert's tokens lie far apart in the prompt (in prompt order: 13 us a route, three tokens a read)
         first = torch.where(routes, ids_t, self.experts).index_select(0, rows).min(1).values
         rows = rows[torch.argsort(first, stable=True)]
-        n = int(rows.numel())
+        n = int(rows.shape[0])
         buf = _share_buffers(H, k, n)
-        buf['x'][:n].copy_(x_t.index_select(0, rows), non_blocking=True)
-        buf['ids'][:n].copy_(torch.where(routes, ids_t, -1).index_select(0, rows), non_blocking=True)
-        buf['w'][:n].copy_(torch.where(routes, w_t, 0.0).index_select(0, rows), non_blocking=True)
-        staged = torch.cuda.Event()
-        staged.record()
-        result = dict(routes=int(routes.sum()))
+        gx = x_t.index_select(0, rows)
+        gi = torch.where(routes, ids_t, -1).index_select(0, rows)
+        gw = torch.where(routes, w_t, 0.0).index_select(0, rows)
+        gx_ev = torch.cuda.Event()
+        gx_ev.record(compute)
+        with torch.cuda.stream(_d2h_stream):
+            _d2h_stream.wait_event(gx_ev)
+            buf['x'][:n].copy_(gx, non_blocking=True)
+            buf['ids'][:n].copy_(gi, non_blocking=True)
+            buf['w'][:n].copy_(gw, non_blocking=True)
+            staged = torch.cuda.Event()
+            staged.record(_d2h_stream)
+        gx.record_stream(_d2h_stream)
+        gi.record_stream(_d2h_stream)
+        gw.record_stream(_d2h_stream)
+        del gx, gi, gw
+        result = {}
         forward, batch = self.native.forward, 2048   # the engine's largest call
 
         def work():
@@ -879,8 +1140,9 @@ class Prefill:
             except BaseException as e:   # re-raised by the caller after the join
                 result['error'] = e
 
-        worker = _share_worker = threading.Thread(target=work, name='xtier-prefill-cpu')
-        worker.start()
+        if _share_worker is None:
+            _share_worker = _PersistentWorker('xtier-prefill-cpu')
+        worker = _share_worker.launch(work)
         return worker, rows, n, buf, result
 
     def _share_learn(self, tokens, skip, mine, waits, gpu_s, result):
@@ -890,6 +1152,10 @@ class Prefill:
         if waits >= 4:   # the upload time of a chunk, within a factor of four of the link's
             up = min(max(gpu_s * 1e3 / waits, 0.25 * cost['up0']), 4 * cost['up0'])
             cost['up_ms'] = 0.8 * cost['up_ms'] + 0.2 * up
+        gpu_routes = sum(int(tokens[j]) for j in range(len(tokens)) if j not in skip)
+        if gpu_routes >= 4096 and gpu_s > 0:
+            g_per = gpu_s * 1e6 / gpu_routes
+            cost['gpu_us'] = 0.8 * cost['gpu_us'] + 0.2 * min(max(g_per, 0.15), 1.0)
         cpu_routes = sum(int(tokens[j]) for j in mine)
         if mine and cpu_routes >= 64 and 's' in result:
             per = result['s'] * 1e6 / cpu_routes
@@ -913,252 +1179,456 @@ class Prefill:
             s.update(calls=0, chunks=0, skipped=0, cpu_chunks=0, routes=0, cpu_routes=0, gpu_s=0.0, cpu_s=0.0)
 
     def _run_fp4(self, x, out, ids, routing, m, k, stream):
-        """XTIER_PREFILL_FP4=1 (MXFP4 layers): the experts on the SM120 FP4 tensor cores through
+        """XTIER_PREFILL_FP4=1 (SM100+/SM120, MXFP4, BF16 out, unit global scales): prefill through
         FlashInfer's CUTLASS fused MoE (MXFP4 weights x MXFP8 activations, block-32 UE8M0, the
         official reference's activation precision), as sglang's DSv4 path runs GPU-resident experts.
 
-        - no FP4->BF16 unpack and no BF16 weight buffers: the staging slots (same shapes as the packed
-          ones) hold the CUTLASS layout, uploaded as [up; gate] with the scales interleaved on the copy
-          stream; the freed memory buys more slots (XTIER_PREFILL_FP4_SLOTS, default 12);
-        - per expert chunk, one fused call over only the tokens routed into it (row lists from one
-          sorted unique over the routes and a single host sync of the counts), ep_size = chunks and
-          ep_rank = chunk so the other routes are skipped, BF16 output added into an FP32 accumulator
-          (rows are unique per chunk: deterministic);
-        - the slot ring and the cross-layer prefetch work as in _run_overlap (owner _Fp4Prefetch).
+        - pure-DMA staging on _copy_stream with pre-swizzled pinned UE8M0 scales (zero SM kernels on _copy_stream,
+          zero weight scale swizzle kernels on compute stream), and m-adaptive slot count (default 24 for m >= 16384,
+          12 for smaller m so CPU share still skips sparse chunks), allocated on `compute` stream to share PyTorch's
+          primary allocator pool;
+        - per expert chunk, one fused call (XTIER_PREFILL_FP4_ROWS default 8192) writing into a bounded BF16 band
+          buffer (XTIER_PREFILL_FP4_BAND_ROWS default 65536, <=0.63 GiB), reduced per band in exact ascending chunk
+          order via _reduce_band (bitwise identical to per-chunk FP32 _add_bf16_rows + _emit).
         """
-        global _slots, _pending, _copy_stream
+        global _slots, _slot_res, _slot_free_ev, _pending, _copy_stream
         from flashinfer import block_scale_interleave, mxfp8_quantize
         from flashinfer.fused_moe import cutlass_fused_moe, cutlass_fused_moe_workspace_size
         from flashinfer.fused_moe.core import ActivationType
         H, E, CH = self.hidden, self.experts, self.chunk
         n_chunks = E // CH
-        n_slots = min(n_chunks, max(2, int(os.environ.get('XTIER_PREFILL_FP4_SLOTS', '12'))))
+        env_slots = os.environ.get('XTIER_PREFILL_FP4_SLOTS')
+        if env_slots:
+            raw_slots = int(env_slots)
+        elif (_pending is not None and isinstance(_pending[0], _Fp4Prefetch)
+              and _pending[0].plan is self and _slots is not None):
+            raw_slots = len(_slots)
+        elif m < 2048:
+            raw_slots = 8
+        else:
+            slot_bytes = sum(math.prod(s) for s in self.slot_shapes)
+            held_bytes = (len(_slots) * slot_bytes) if (_slots is not None and _slots and _slots[0] is not None) else 0
+            avail_gib = (torch.cuda.mem_get_info()[0] + held_bytes) / (1 << 30)
+            raw_slots = 24 if avail_gib >= 9.0 else (20 if avail_gib >= 7.5 else 12)
+        n_slots = min(n_chunks, max(2, raw_slots))
         with _lock, torch.cuda.stream(torch.cuda.ExternalStream(stream)):
             compute = torch.cuda.current_stream()
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError('GPU prefill capture is not supported; use native CPU decode')
-            # The hot pool's rows are read once per call, after the host rendezvous below. A call that raised before
-            # its end left its rows behind, and the uploads this call starts before the rendezvous would copy by them:
-            # the elastic cache's out-of-memory retry runs the layer again after it unmapped the extra slots (2026-11-10
-            # audit R3: a fault, or wrong experts where the pool's contents changed).
-            self._fp4_residency = None
-            if _copy_stream is None:
-                _copy_stream = torch.cuda.Stream()
-            ready = {}  # chunk -> (slot, upload-done event)
-            if _pending is not None:
-                owner, chunks = _pending[0], _pending_chunks(_pending)
-                _pending = None
-                if (isinstance(owner, _Fp4Prefetch) and owner.plan is self and _slots is not None
-                        and len(_slots) == n_slots
-                        and all(c < n_chunks and _slots[s] is not None
-                                and [tuple(t.shape) for t in _slots[s]] == self.slot_shapes for c, _, s in chunks)):
-                    for c, done, s in chunks:
-                        ready[c] = (s, done)
-                else:
-                    for _, done, _ in chunks:
-                        done.synchronize()
-            if _slots is None or len(_slots) != n_slots:
-                _slots = [None] * n_slots
-            for j in range(n_slots):
-                if _slots[j] is None or [tuple(t.shape) for t in _slots[j]] != self.slot_shapes:
-                    _slots[j] = [torch.empty(s, dtype=torch.uint8, device='cuda') for s in self.slot_shapes]
-            target = self.next_prefill() if self.prefetch_enabled and self.next_prefill else None
-            if target is not None and (target.slot_shapes != self.slot_shapes or target.chunk != CH
-                                       or not target._fp4_ready(torch.bfloat16)):
-                target = None
-            if target is not None:
-                target._fp4_residency = None   # the same for the next layer's rows (set by this call's rendezvous)
-            n_cross = min(n_slots, target.experts // target.chunk) if target is not None else 0
-            cross = []  # [(next-layer chunk, upload-done event, slot), ...]
-            if ready:
-                self.prefetch_hits += 1
-            else:
-                self.prefetch_uploads += 1
-            freed = [None] * n_slots  # event on the compute stream: slot no longer read
-            state = dict(next=0, cross=0)
-            issued = set(ready)  # chunks of this layer already uploaded (computed ones leave `ready`)
-            skip = set()         # XTIER_PREFILL_CPU_SHARE: chunks this call does not upload (filled after the rendezvous)
-            if _share_worker is not None and _share_worker.is_alive():   # of a call that raised: its buffers, the engine
-                _share_worker.join()
-
-            def upload(j, slot):
-                if freed[slot] is None:
-                    _copy_stream.wait_stream(compute)
-                else:
-                    _copy_stream.wait_event(freed[slot])
-                self._upload_chunk_fp4(_slots[slot], j * CH, (j + 1) * CH, _copy_stream.cuda_stream)
-                done = torch.cuda.Event(); done.record(_copy_stream)
-                ready[j] = (slot, done); issued.add(j)
-                self.chunk_uploads += 1
-
-            def refill(slot):
-                while state['next'] < n_chunks and (state['next'] in issued or state['next'] in skip):
-                    state['next'] += 1
-                if state['next'] < n_chunks:
-                    upload(state['next'], slot); state['next'] += 1
-                elif state['cross'] < n_cross:
-                    c = state['cross']; state['cross'] += 1
-                    if freed[slot] is None:
-                        _copy_stream.wait_stream(compute)
+            try:
+                self._fp4_residency = None
+                if _copy_stream is None:
+                    _copy_stream = torch.cuda.Stream()
+                ready = {}  # chunk -> (slot, upload-done event)
+                if _pending is not None:
+                    owner, chunks = _pending[0], _pending_chunks(_pending)
+                    _pending = None
+                    if (isinstance(owner, _Fp4Prefetch) and owner.plan is self and _slots is not None
+                            and _slot_res is not None and len(_slots) == n_slots
+                            and all(c < n_chunks and _slots[s] is not None
+                                    and [tuple(t.shape) for t in _slots[s]] == self.slot_shapes for c, _, s in chunks)):
+                        for c, done, s in chunks:
+                            ready[c] = (s, done)
                     else:
+                        for _, done, _ in chunks:
+                            done.synchronize()
+                target = self.next_prefill() if self.prefetch_enabled and self.next_prefill else None
+                if target is None and self.prefetch_enabled and self.learned_ring:
+                    from xtier.cache import elastic
+                    if elastic.is_chunking() or _more_chunks[0]:
+                        first = _first_plan() if _first_plan is not None else None
+                        if first is not None and first is not self:
+                            target = first
+                if target is not None and (target.slot_shapes != self.slot_shapes or target.chunk != CH
+                                           or not target._fp4_ready(torch.bfloat16)):
+                    target = None
+                if target is not None:
+                    target._fp4_residency = None
+                # Ensure pre-swizzled pinned scales exist for self and target before issuing DMA uploads.
+                self._ensure_fp4_scales(compute)
+                if target is not None:
+                    target._ensure_fp4_scales(compute)
+                if _slots is None or len(_slots) != n_slots:
+                    if _slot_free_ev:
+                        for ev in _slot_free_ev:
+                            if ev is not None:
+                                compute.wait_event(ev)
+                    _slots = [None] * n_slots
+                    _slot_res = [None] * n_slots
+                    _slot_free_ev = [None] * n_slots
+                newly_allocated = False
+                for j in range(n_slots):
+                    if _slots[j] is None or [tuple(t.shape) for t in _slots[j]] != self.slot_shapes:
+                        if _slot_free_ev[j] is not None:
+                            compute.wait_event(_slot_free_ev[j])
+                            _slot_free_ev[j] = None
+                        _slots[j] = [torch.empty(s, dtype=torch.uint8, device='cuda') for s in self.slot_shapes]
+                        _slot_res[j] = None
+                        newly_allocated = True
+                if newly_allocated:
+                    alloc_ev = torch.cuda.Event()
+                    alloc_ev.record(compute)
+                else:
+                    alloc_ev = None
+                n_cross = min(n_slots, target.experts // target.chunk) if target is not None else 0
+                cross = []  # [(next-layer chunk, upload-done event, slot), ...]
+                deferred_cross_slots = []
+                defer_cross = [False]
+                if ready:
+                    self.prefetch_hits += 1
+                else:
+                    self.prefetch_uploads += 1
+                freed = list(_slot_free_ev)
+                state = dict(next=0, cross=0)
+                issued = set(ready)
+                skip = set()
+                if _share_worker is not None and _share_worker.is_alive():
+                    _share_worker.join()
+
+                def wait_slot_safe(slot):
+                    if freed[slot] is not None:
                         _copy_stream.wait_event(freed[slot])
-                    target._upload_chunk_fp4(_slots[slot], c * CH, (c + 1) * CH, _copy_stream.cuda_stream)
+                    elif alloc_ev is not None:
+                        _copy_stream.wait_event(alloc_ev)
+
+                def upload(j, slot):
+                    wait_slot_safe(slot)
+                    _slot_res[slot] = self._upload_chunk_fp4_dma(
+                        _slots[slot], j * CH, (j + 1) * CH, _copy_stream.cuda_stream)
+                    done = torch.cuda.Event(); done.record(_copy_stream)
+                    ready[j] = (slot, done); issued.add(j)
+                    self.chunk_uploads += 1
+
+                def issue_cross(slot):
+                    c = state['cross']; state['cross'] += 1
+                    wait_slot_safe(slot)
+                    _slot_res[slot] = target._upload_chunk_fp4_dma(
+                        _slots[slot], c * CH, (c + 1) * CH, _copy_stream.cuda_stream)
                     done = torch.cuda.Event(); done.record(_copy_stream)
                     cross.append((c, done, slot))
 
-            # Start the weight pipeline before the host rendezvous on the routes.
-            used = {s for s, _ in ready.values()}
-            for slot in range(n_slots):
-                if slot not in used:
-                    refill(slot)
+                def refill(slot):
+                    while state['next'] < n_chunks and (state['next'] in issued or state['next'] in skip):
+                        state['next'] += 1
+                    if state['next'] < n_chunks:
+                        upload(state['next'], slot); state['next'] += 1
+                    elif state['cross'] < n_cross:
+                        if defer_cross[0]:
+                            if len(deferred_cross_slots) < n_cross:
+                                deferred_cross_slots.append(slot)
+                        else:
+                            issue_cross(slot)
 
-            x_t = _device_tensor(x, (m, H), torch.bfloat16)
-            ids_t = _device_tensor(ids, (m, k), torch.int32)
-            w_t = _device_tensor(routing, (m, k), torch.float32)
-            ids64 = ids_t.long()
-            token = torch.arange(m, device='cuda')
-            chunk_of = torch.where(ids64 >= 0, ids64 // CH, n_chunks)
-            keys = torch.unique(chunk_of * m + token[:, None])  # sorted: chunk-major, then token
-            counts = torch.bincount(keys // m, minlength=n_chunks + 1)
-            pools = [getattr(p.native, 'pool', None) if p is not None else None for p in (self, target)]
-            tables = [p.table.long() for p in pools if p is not None]
-            host = torch.cat([counts[:n_chunks], ((ids64 < -1) | (ids64 >= E)).sum()[None],
-                              (ids64 == -1).sum()[None]] + tables).cpu().tolist()
-            if host[n_chunks]:
-                raise ValueError('Invalid expert id')
-            rows = host[n_chunks + 2:]
-            for p, pool in zip((self, target), pools):
-                if pool is not None:
-                    p._fp4_residency, rows = rows[:E], rows[E:]
-                    if p.cold is not None and p.cold.vexpert is not None:   # by this call's virtual experts
-                        p._fp4_residency = [p._fp4_residency[e] for e in p.cold.vexpert]
-            has_skipped = host[n_chunks + 1] > 0
-            rows_all = keys % m
-            offsets = [0]
-            for c in host[:n_chunks]:
-                offsets.append(offsets[-1] + int(c))
-            self.chunks_skipped += sum(1 for c in host[:n_chunks] if c == 0)
-            share = None
-            if cpu_share() and self.cold is None and self.native is not None and n_chunks > 1:
-                waits = n_chunks - len(issued)   # before the split: the chunks whose upload has not started
-                mine = self._share_plan(host[:n_chunks], issued, skip)
-                share = (self._share_start(mine, chunk_of, x_t, ids_t, w_t, k, n_chunks) if mine else None, mine,
-                         waits - len(skip), time.perf_counter())
-            acc = torch.zeros((m, H), dtype=torch.float32, device='cuda')
-            ones = torch.ones(CH, dtype=torch.float32, device='cuda')
-            limit = (torch.full((CH,), self.swiglu_limit, dtype=torch.float32, device='cuda')
-                     if self.swiglu_limit > 0 else None)
-            # At most `cap` tokens per call; size the CUTLASS workspace to the largest slice this layer actually runs.
-            cap = max(256, int(os.environ.get('XTIER_PREFILL_FP4_ROWS', '4096')))
-            calls = []
-            for j in range(n_chunks):
-                if j in skip:
-                    continue
-                for a in range(offsets[j], offsets[j + 1], cap):
-                    calls.append((j, a, min(a + cap, offsets[j + 1])))
-            self.fp4_calls = getattr(self, 'fp4_calls', 0) + len(calls)
-            by_chunk = {}
-            for j, a, b in calls:
-                by_chunk.setdefault(j, []).append((a, b))
-            max_nr = max((b - a for _, a, b in calls), default=0)
-            ws_cap = min(cap, max(256, ((max_nr + 255) // 256) * 256))
-            if max_nr > 0:
-                ws_key = (ws_cap, H, self.inter, E, k, n_chunks)
-                if getattr(self, '_fp4_ws_key', None) != ws_key:
-                    self._fp4_ws_bytes = cutlass_fused_moe_workspace_size(
-                        ws_cap, H, self.inter, E, k, x_dtype=torch.float8_e4m3fn, weight_dtype=torch.int64,
-                        use_mxfp8_act_scaling=True, ep_size=n_chunks, ep_rank=0)
-                    self._fp4_ws_key = ws_key
-                workspace = torch.empty(self._fp4_ws_bytes, dtype=torch.uint8, device='cuda')
-            else:
-                workspace = None
-            fast_glue = max_nr > 0 and H % 32 == 0 and os.environ.get('XTIER_PREFILL_FP4_FAST_GLUE', '1') != '0'
-            if fast_glue:
-                xq_all, xsf_all = mxfp8_quantize(x_t, is_sf_swizzled_layout=False, alignment=32)
-                if xq_all.shape == (m, H) and xsf_all.numel() == m * (H // 32):
-                    xsf_all = xsf_all.view(m, H // 32).view(torch.uint8)
-                    xq_buf = torch.empty((max_nr, H), dtype=torch.float8_e4m3fn, device='cuda')
-                    xsf_buf = torch.empty((max_nr, H // 32), dtype=torch.uint8, device='cuda')
-                    ids_buf = torch.empty((max_nr, k), dtype=torch.int32, device='cuda')
-                    w_buf = torch.empty((max_nr, k), dtype=torch.float32, device='cuda')
-                    part_buf = torch.empty((max_nr, H), dtype=torch.bfloat16, device='cuda')
-                    b_sf = tr.next_power_of_2(max(16, H // 32))
+                # Start pure-DMA weight uploads before the host rendezvous on the routes.
+                used = {s for s, _ in ready.values()}
+                for slot in range(n_slots):
+                    if slot not in used:
+                        refill(slot)
+
+                x_t = _device_tensor(x, (m, H), torch.bfloat16)
+                ids_t = _device_tensor(ids, (m, k), torch.int32)
+                w_t = _device_tensor(routing, (m, k), torch.float32)
+                if k <= 16:
+                    touch = torch.zeros((n_chunks + 1, m), dtype=torch.uint8, device='cuda')
+                    flags = torch.zeros(2, dtype=torch.int32, device='cuda')
+                    _mark_chunk_tokens[(tr.cdiv(m, 256),)](ids_t, touch, flags, m, E, CH, n_chunks, k, 256, num_warps=4)
+                    counts = touch[:n_chunks].sum(dim=1, dtype=torch.int64)
+                    pools = [getattr(p.native, 'pool', None) if p is not None else None for p in (self, target)]
+                    tables = [p.table.long() for p in pools if p is not None]
+                    host = torch.cat([counts, flags.long()] + tables).cpu().tolist()
+                    if host[n_chunks]:
+                        raise ValueError('Invalid expert id')
+                    rows = host[n_chunks + 2:]
+                    for p, pool in zip((self, target), pools):
+                        if pool is not None:
+                            p._fp4_residency, rows = rows[:E], rows[E:]
+                            if p.cold is not None and p.cold.vexpert is not None:
+                                p._fp4_residency = [p._fp4_residency[e] for e in p.cold.vexpert]
+                    has_skipped = host[n_chunks + 1] > 0
+                    self.chunks_skipped += sum(1 for c in host[:n_chunks] if c == 0)
+                    share = None
+                    if cpu_share() and self.cold is None and self.native is not None and n_chunks > 1:
+                        waits = n_chunks - len(issued)
+                        mine = self._share_plan(host[:n_chunks], issued, skip)
+                        share = (self._share_start(mine, touch, x_t, ids_t, w_t, k, n_chunks) if mine else None, mine,
+                                 waits - len(skip), time.perf_counter())
+                        defer_cross[0] = share[0] is not None
+                    offsets = [0]
+                    for j, c in enumerate(host[:n_chunks]):
+                        offsets.append(offsets[-1] + (0 if j in skip else int(c)))
+                    total_gpu = offsets[-1]
+                    rows_gpu = torch.empty(total_gpu, dtype=torch.int32, device='cuda')
+                    if total_gpu > 0:
+                        off_gpu = torch.tensor(offsets, dtype=torch.int32, device='cuda')
+                        _compact_chunk_rows[(n_chunks,)](touch, off_gpu, rows_gpu, m, 1024, num_warps=4)
+                    del touch, flags
                 else:
-                    fast_glue = False
-            for j in range(n_chunks):
-                if j in skip:
-                    continue
-                slot, done = ready.pop(j)
-                compute.wait_event(done)
-                for r0, r1 in by_chunk.get(j, []):
-                    nr = r1 - r0
-                    rows = rows_all[r0:r1]
-                    if fast_glue:
-                        xq = xq_buf[:nr]
-                        xsf_lin = xsf_buf[:nr]
-                        ids_j = ids_buf[:nr]
-                        w_j = w_buf[:nr]
-                        part = part_buf[:nr]
-                        _gather_fp8_and_ids[(nr, tr.cdiv(H, 512))](
-                            xq_all.view(torch.uint8), xsf_all, ids_t, w_t, rows,
-                            xq.view(torch.uint8), xsf_lin, ids_j, w_j,
-                            has_skipped, ((j + 1) % n_chunks) * CH, 512, b_sf, H, k, num_warps=4)
-                        xsf = block_scale_interleave(xsf_lin)
+                    ids64 = ids_t.long()
+                    token = torch.arange(m, device='cuda')
+                    chunk_of = torch.where(ids64 >= 0, ids64 // CH, n_chunks)
+                    keys = torch.unique(chunk_of * m + token[:, None])
+                    counts = torch.bincount(keys // m, minlength=n_chunks + 1)
+                    pools = [getattr(p.native, 'pool', None) if p is not None else None for p in (self, target)]
+                    tables = [p.table.long() for p in pools if p is not None]
+                    host = torch.cat([counts[:n_chunks], ((ids64 < -1) | (ids64 >= E)).sum()[None],
+                                      (ids64 == -1).sum()[None]] + tables).cpu().tolist()
+                    if host[n_chunks]:
+                        raise ValueError('Invalid expert id')
+                    rows = host[n_chunks + 2:]
+                    for p, pool in zip((self, target), pools):
+                        if pool is not None:
+                            p._fp4_residency, rows = rows[:E], rows[E:]
+                            if p.cold is not None and p.cold.vexpert is not None:
+                                p._fp4_residency = [p._fp4_residency[e] for e in p.cold.vexpert]
+                    has_skipped = host[n_chunks + 1] > 0
+                    rows_all = keys % m
+                    self.chunks_skipped += sum(1 for c in host[:n_chunks] if c == 0)
+                    share = None
+                    if skip:
+                        keep_c = torch.ones(n_chunks + 1, dtype=torch.bool, device='cuda')
+                        keep_c[list(skip)] = False
+                        keep_c[n_chunks] = False
+                        rows_gpu = rows_all[keep_c[keys // m]].to(torch.int32)
                     else:
-                        ids_j, w_j = ids_t.index_select(0, rows), w_t.index_select(0, rows)
-                        if has_skipped:  # route computed elsewhere: an id outside this chunk, weight 0
-                            skip_mask = ids_j < 0
-                            ids_j = torch.where(skip_mask, ((j + 1) % n_chunks) * CH, ids_j)
-                            w_j = torch.where(skip_mask, 0.0, w_j)
-                        xq, xsf = mxfp8_quantize(x_t.index_select(0, rows), is_sf_swizzled_layout=True, alignment=32)
-                        part = torch.empty((nr, H), dtype=torch.bfloat16, device='cuda')
-                    w = _slots[slot]
-                    cutlass_fused_moe(input=xq, token_selected_experts=ids_j, token_final_scales=w_j,
-                                      fc1_expert_weights=w[0].view(torch.int64), fc2_expert_weights=w[1].view(torch.int64),
-                                      output_dtype=torch.bfloat16,
-                                      quant_scales=[w[2].view(torch.int32), ones, w[3].view(torch.int32), ones],
-                                      input_sf=xsf, swiglu_limit=limit, use_w4_group_scaling=False,
-                                      use_mxfp8_act_scaling=True, activation_type=ActivationType.Swiglu,
-                                      ep_size=n_chunks, ep_rank=j, tune_max_num_tokens=ws_cap, output=part,
-                                      workspace_buffer=workspace)
-                    if fast_glue:
-                        _add_bf16_rows[(nr, tr.cdiv(H, 256))](acc, part, rows, 256, H, num_warps=8)
+                        rows_gpu = (rows_all[:int(sum(host[:n_chunks]))] if has_skipped else rows_all).to(torch.int32)
+                    offsets = [0]
+                    for j, c in enumerate(host[:n_chunks]):
+                        offsets.append(offsets[-1] + (0 if j in skip else int(c)))
+                    total_gpu = offsets[-1]
+
+                ones = torch.ones(CH, dtype=torch.float32, device='cuda')
+                limit = (torch.full((CH,), self.swiglu_limit, dtype=torch.float32, device='cuda')
+                         if self.swiglu_limit > 0 else None)
+                cap = max(256, int(os.environ.get('XTIER_PREFILL_FP4_ROWS', '8192')))
+                calls = []
+                for j in range(n_chunks):
+                    if j in skip:
+                        continue
+                    for a in range(offsets[j], offsets[j + 1], cap):
+                        calls.append((j, a, min(a + cap, offsets[j + 1])))
+                self.fp4_calls = getattr(self, 'fp4_calls', 0) + len(calls)
+                by_chunk = {}
+                for j, a, b in calls:
+                    by_chunk.setdefault(j, []).append((a, b))
+                max_nr = max((b - a for _, a, b in calls), default=0)
+                ws_cap = min(cap, max(256, ((max_nr + 255) // 256) * 256))
+                if max_nr > 0:
+                    ws_key = (ws_cap, H, self.inter, E, k, n_chunks)
+                    if getattr(self, '_fp4_ws_key', None) != ws_key:
+                        self._fp4_ws_bytes = cutlass_fused_moe_workspace_size(
+                            ws_cap, H, self.inter, E, k, x_dtype=torch.float8_e4m3fn, weight_dtype=torch.int64,
+                            use_mxfp8_act_scaling=True, ep_size=n_chunks, ep_rank=0)
+                        self._fp4_ws_key = ws_key
+                    workspace = torch.empty(self._fp4_ws_bytes, dtype=torch.uint8, device='cuda')
+                else:
+                    workspace = None
+                fast_glue = max_nr > 0 and H % 32 == 0 and os.environ.get('XTIER_PREFILL_FP4_FAST_GLUE', '1') != '0'
+                if fast_glue:
+                    xq_all, xsf_all = mxfp8_quantize(x_t, is_sf_swizzled_layout=False, alignment=32)
+                    if xq_all.shape == (m, H) and xsf_all.numel() == m * (H // 32):
+                        xsf_all = xsf_all.view(m, H // 32).view(torch.uint8)
+                        xq_buf = torch.empty((max_nr, H), dtype=torch.float8_e4m3fn, device='cuda')
+                        xsf_buf = torch.empty((max_nr, H // 32), dtype=torch.uint8, device='cuda')
+                        ids_buf = torch.empty((max_nr, k), dtype=torch.int32, device='cuda')
+                        w_buf = torch.empty((max_nr, k), dtype=torch.float32, device='cuda')
+                        b_sf = tr.next_power_of_2(max(16, H // 32))
                     else:
-                        acc.index_add_(0, rows, part.float())
-                ev = torch.cuda.Event(); ev.record(compute); freed[slot] = ev
-                refill(slot)
-            if share is not None:
-                started, mine, waits, t0 = share
-                compute.synchronize()
-                gpu_s = time.perf_counter() - t0
-                result = {}
-                if started is not None:   # the CPU part: its rows' FP32 outputs add to the GPU's
-                    worker, rows_c, n_c, buf, result = started
-                    worker.join()
-                    if 'error' in result:
-                        raise result['error']
-                    acc.index_add_(0, rows_c, buf['out'][:n_c].to('cuda', non_blocking=True))
-                self._share_learn(host[:n_chunks], skip, mine, waits, gpu_s, result)
-            _emit[(m, tr.cdiv(H, 256))](acc, Pointer(out, torch.bfloat16), 256, H)
-            if cross:
-                cross.sort(key=lambda t: t[0])
-                _pending = (_Fp4Prefetch(target), cross[0][1], cross[0][2], cross[1:])
-                self.prefetch_submissions += 1
-            torch.cuda.current_stream().synchronize()
-            for p in (self, target):  # copies already enqueued keep their decisions
-                if p is not None:
-                    p._fp4_residency = None
-            self.last_profile = []
-            if self.release_workspace:
-                keep = {s for _, _, s in _pending_chunks(_pending)} if _pending is not None else set()
-                retired = []
-                for j in range(len(_slots)):
-                    if j not in keep and _slots[j] is not None:
-                        retired += [weakref.ref(t) for t in _slots[j]]
-                        _slots[j] = None
-                if not keep:
-                    _slots = None
-                return tuple(retired)
+                        fast_glue = False
+
+                single_reduce = fast_glue or total_gpu == 0
+                if single_reduce:
+                    band_cap = max(max_nr, int(os.environ.get('XTIER_PREFILL_FP4_BAND_ROWS', '65536')))
+                    bands = []  # [(r_start, r_end, last_chunk_j), ...]
+                    if total_gpu > 0:
+                        b_start = 0
+                        last_j = -1
+                        for j in range(n_chunks):
+                            if j in skip or offsets[j + 1] == offsets[j]:
+                                continue
+                            c_end = offsets[j + 1]
+                            if c_end - b_start > band_cap and offsets[j] > b_start:
+                                bands.append((b_start, offsets[j], last_j))
+                                b_start = offsets[j]
+                            last_j = j
+                        if total_gpu > b_start:
+                            bands.append((b_start, total_gpu, last_j))
+                    max_band = max((b1 - b0 for b0, b1, _ in bands), default=1)
+                    parts_buf = torch.empty((max_band, H), dtype=torch.bfloat16, device='cuda')
+                    acc = torch.empty((m, H), dtype=torch.float32, device='cuda') if len(bands) > 1 else None
+                    roff = torch.zeros(m + 1, dtype=torch.int32, device='cuda')
+                    rc = torch.empty(m, dtype=torch.int32, device='cuda')
+                    band_by_last_j = {lj: (idx, b0, b1) for idx, (b0, b1, lj) in enumerate(bands)}
+                    cur_band_b0 = bands[0][0] if bands else 0
+                    next_band_idx = 0
+                else:
+                    acc = torch.zeros((m, H), dtype=torch.float32, device='cuda')
+
+                cpu_dev, cpu_idx, cpu_alloc_ev, gpu_start_ev, gpu_end_ev = None, None, None, None, None
+                if share is not None:
+                    gpu_start_ev = torch.cuda.Event(enable_timing=True)
+                    gpu_start_ev.record(compute)
+                    if share[0] is not None:
+                        _, rows_c_pre, n_c_pre, _, _ = share[0]
+                        cpu_dev = torch.empty((n_c_pre, H), dtype=torch.float32, device='cuda')
+                        if single_reduce:
+                            cpu_idx = torch.full((m,), -1, dtype=torch.int32, device='cuda')
+                            cpu_idx[rows_c_pre] = torch.arange(n_c_pre, dtype=torch.int32, device='cuda')
+                        cpu_alloc_ev = torch.cuda.Event()
+                        cpu_alloc_ev.record(compute)
+
+                for j in range(n_chunks):
+                    if j in skip:
+                        continue
+                    slot, done = ready.pop(j)
+                    slices_j = by_chunk.get(j)
+                    if slices_j:
+                        compute.wait_event(done)
+                        self._prepare_chunk_fp4(_slots[slot], j * CH, (j + 1) * CH, _slot_res[slot], compute)
+                        w = _slots[slot]
+                        for r0, r1 in slices_j:
+                            nr = r1 - r0
+                            rows = rows_gpu[r0:r1]
+                            if fast_glue:
+                                xq = xq_buf[:nr]
+                                xsf_lin = xsf_buf[:nr]
+                                ids_j = ids_buf[:nr]
+                                w_j = w_buf[:nr]
+                                part = parts_buf[r0 - cur_band_b0 : r1 - cur_band_b0]
+                                _gather_fp8_and_ids[(nr, tr.cdiv(H, 512))](
+                                    xq_all.view(torch.uint8), xsf_all, ids_t, w_t, rows,
+                                    xq.view(torch.uint8), xsf_lin, ids_j, w_j,
+                                    has_skipped, ((j + 1) % n_chunks) * CH, 512, b_sf, H, k, num_warps=4)
+                                xsf = block_scale_interleave(xsf_lin)
+                            else:
+                                rows64 = rows.long()
+                                ids_j, w_j = ids_t.index_select(0, rows64), w_t.index_select(0, rows64)
+                                if has_skipped:
+                                    skip_mask = ids_j < 0
+                                    ids_j = torch.where(skip_mask, ((j + 1) % n_chunks) * CH, ids_j)
+                                    w_j = torch.where(skip_mask, 0.0, w_j)
+                                xq, xsf = mxfp8_quantize(x_t.index_select(0, rows64), is_sf_swizzled_layout=True, alignment=32)
+                                part = torch.empty((nr, H), dtype=torch.bfloat16, device='cuda')
+                            cutlass_fused_moe(input=xq, token_selected_experts=ids_j, token_final_scales=w_j,
+                                              fc1_expert_weights=w[0].view(torch.int64), fc2_expert_weights=w[1].view(torch.int64),
+                                              output_dtype=torch.bfloat16,
+                                              quant_scales=[w[2].view(torch.int32), ones, w[3].view(torch.int32), ones],
+                                              input_sf=xsf, swiglu_limit=limit, use_w4_group_scaling=False,
+                                              use_mxfp8_act_scaling=True, activation_type=ActivationType.Swiglu,
+                                              ep_size=n_chunks, ep_rank=j, tune_max_num_tokens=ws_cap, output=part,
+                                              workspace_buffer=workspace)
+                            if not single_reduce:
+                                acc.index_add_(0, rows.long(), part.float())
+                        w = None
+                        ev = torch.cuda.Event(); ev.record(compute); freed[slot] = ev
+                    else:
+                        freed[slot] = done
+                    refill(slot)
+                    if single_reduce and j in band_by_last_j:
+                        b_idx, b0, b1 = band_by_last_j[j]
+                        is_last_band = (b_idx == len(bands) - 1)
+                        if not is_last_band:
+                            b_rows = rows_gpu[b0:b1]
+                            nb = b1 - b0
+                            perm = torch.argsort(b_rows, stable=True).to(torch.int32)
+                            rc.zero_()
+                            if nb > 0:
+                                _hist_rows[(tr.cdiv(nb, 512),)](b_rows, rc, nb, 512, num_warps=4)
+                            torch.cumsum(rc, 0, dtype=torch.int32, out=roff[1:])
+                            _reduce_band[(m, tr.cdiv(H, 256))](
+                                parts_buf, perm, roff, acc, parts_buf, roff, Pointer(out, torch.bfloat16),
+                                b_idx == 0, False, False, 256, H, num_warps=8)
+                            next_band_idx = b_idx + 1
+                            cur_band_b0 = bands[next_band_idx][0]
+
+                share_result = {}
+                if share is not None:
+                    started, mine, waits, _ = share
+                    gpu_end_ev = torch.cuda.Event(enable_timing=True)
+                    gpu_end_ev.record(compute)
+                    if started is not None:
+                        worker, rows_c, n_c, buf, share_result = started
+                        worker.join()
+                        if 'error' in share_result:
+                            raise share_result['error']
+                        with torch.cuda.stream(_copy_stream):
+                            _copy_stream.wait_event(cpu_alloc_ev)
+                            cpu_dev.copy_(buf['out'][:n_c], non_blocking=True)
+                            cpu_ready_ev = torch.cuda.Event()
+                            cpu_ready_ev.record(_copy_stream)
+                        cpu_dev.record_stream(_copy_stream)
+                        if deferred_cross_slots:
+                            for s_idx in deferred_cross_slots:
+                                if state['cross'] < n_cross:
+                                    issue_cross(s_idx)
+                        compute.wait_event(cpu_ready_ev)
+                        if not single_reduce:
+                            acc.index_add_(0, rows_c, cpu_dev)
+
+                if single_reduce:
+                    has_cpu = cpu_dev is not None
+                    if bands:
+                        b_idx = len(bands) - 1
+                        b0, b1, _ = bands[b_idx]
+                        b_rows = rows_gpu[b0:b1]
+                        nb = b1 - b0
+                        perm = torch.argsort(b_rows, stable=True).to(torch.int32)
+                        rc.zero_()
+                        if nb > 0:
+                            _hist_rows[(tr.cdiv(nb, 512),)](b_rows, rc, nb, 512, num_warps=4)
+                        torch.cumsum(rc, 0, dtype=torch.int32, out=roff[1:])
+                        _reduce_band[(m, tr.cdiv(H, 256))](
+                            parts_buf, perm, roff, acc if acc is not None else parts_buf,
+                            cpu_dev if has_cpu else parts_buf, cpu_idx if has_cpu else roff,
+                            Pointer(out, torch.bfloat16),
+                            b_idx == 0, True, has_cpu, 256, H, num_warps=8)
+                    else:
+                        _reduce_band[(m, tr.cdiv(H, 256))](
+                            parts_buf, roff, roff, parts_buf,
+                            cpu_dev if has_cpu else parts_buf, cpu_idx if has_cpu else roff,
+                            Pointer(out, torch.bfloat16),
+                            True, True, has_cpu, 256, H, num_warps=8)
+                else:
+                    _emit[(m, tr.cdiv(H, 256))](acc, Pointer(out, torch.bfloat16), 256, H)
+
+                if cross:
+                    cross.sort(key=lambda t: t[0])
+                    _pending = (_Fp4Prefetch(target), cross[0][1], cross[0][2], cross[1:])
+                    self.prefetch_submissions += 1
+                torch.cuda.current_stream().synchronize()
+                if share is not None:
+                    gpu_s = gpu_start_ev.elapsed_time(gpu_end_ev) * 1e-3
+                    self._share_learn(host[:n_chunks], skip, mine, share[2], gpu_s, share_result)
+                for p in (self, target):
+                    if p is not None:
+                        p._fp4_residency = None
+                self.last_profile = []
+                if self.release_workspace:
+                    keep = {s for _, _, s in _pending_chunks(_pending)} if _pending is not None else set()
+                    retired = []
+                    for j in range(len(_slots)):
+                        if j not in keep and _slots[j] is not None:
+                            retired += [weakref.ref(t) for t in _slots[j]]
+                            _slots[j] = None
+                            _slot_res[j] = None
+                            _slot_free_ev[j] = None
+                        else:
+                            _slot_free_ev[j] = freed[j]
+                    if not keep:
+                        _slots = None
+                        _slot_res = None
+                        _slot_free_ev = None
+                    return tuple(retired)
+                _slot_free_ev = list(freed)
+            except BaseException:
+                torch.cuda.synchronize()
+                _pending = None
+                _slots = None
+                _slot_res = None
+                _slot_free_ev = None
+                for p in (self, locals().get('target')):
+                    if p is not None:
+                        p._fp4_residency = None
+                raise
 
     def _run_overlap(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16):
         """XTIER_PREFILL_OVERLAP=1 (unpacked weights, several expert chunks, route accumulation).

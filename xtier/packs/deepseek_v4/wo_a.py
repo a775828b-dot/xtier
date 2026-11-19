@@ -40,7 +40,7 @@ SCALE_NAME = re.compile(r'(?:^|\.)layers\.(\d+)\.attn\.wo_a\.scale$')
 LAYER_NAME = re.compile(r'(?:^|\.)layers\.(\d+)\.')
 BLOCK = 32                        # the checkpoint's FP8 block (rows and columns)
 FAST_SHAPE = (2, 1024, 4096)      # (groups, rank, dim) of SGLang's own BF16 fast paths (TP4): left to them
-MAX_T = int(os.environ.get('XTIER_DS_WO_A_MAX_T', '64'))
+MAX_T = int(os.environ.get('XTIER_DS_WO_A_MAX_T', '96'))
 BLOCK_T, BLOCK_R, BLOCK_H = 16, 32, 128   # 256 CTAs for (8, 1024, 4096): FP8 30 us (BLOCK_R 128 as in lkqmoe: 32.5)
 _scales = {}        # FP8 weight data_ptr -> FP32 block scales [rows / 32, cols / 32]
 _scratch = {}       # (device, numel) -> BF16 buffer for dequantized larger calls
@@ -114,6 +114,47 @@ def dequantize(w, scale, out):
     return out
 
 
+@triton.jit
+def _prefill_bf16_kernel(o_ptr, w_ptr, out_ptr, T, o_st, o_sg, w_sg, w_sr, out_st, out_sg,
+                         R: tl.constexpr, D: tl.constexpr,
+                         BT: tl.constexpr, BR: tl.constexpr, BH: tl.constexpr, GROUP_M: tl.constexpr):
+    """Token-major grouped BF16 GEMM out[t, g, r] = sum_h o[t, g, h] * w[g, r, h] with L2-grouped CTA swizzling."""
+    pid = tl.program_id(0)
+    g = tl.program_id(1)
+    num_t = tl.cdiv(T, BT)
+    num_r = R // BR
+    group_size = GROUP_M * num_r
+    first_t = (pid // group_size) * GROUP_M
+    gm = tl.minimum(num_t - first_t, GROUP_M)
+    tid = first_t + (pid % gm)
+    rid = (pid % group_size) // gm
+    t = tid * BT + tl.arange(0, BT)
+    r = rid * BR + tl.arange(0, BR)
+    tm = t < T
+    acc = tl.zeros((BT, BR), dtype=tl.float32)
+    o_base = o_ptr + t[:, None] * o_st + g * o_sg
+    w_base = w_ptr + g * w_sg + r[:, None] * w_sr
+    for h0 in range(0, D, BH):
+        h = h0 + tl.arange(0, BH)
+        a = tl.load(o_base + h[None, :], mask=tm[:, None], other=0.0)
+        wb = tl.load(w_base + h[None, :])
+        acc = tl.dot(a, tl.trans(wb), acc=acc)
+    tl.store(out_ptr + t[:, None] * out_st + g * out_sg + r[None, :], acc.to(out_ptr.dtype.element_ty),
+             mask=tm[:, None])
+
+
+def einsum_prefill_bf16(o, w):
+    """Large-T token-major grouped GEMM without [G, T, D] / [G, T, R] transpose copies (torch.equal to torch.einsum)."""
+    T, G, D = o.shape
+    R = w.shape[1]
+    br = 256 if R % 256 == 0 else 128
+    out = torch.empty((T, G, R), dtype=o.dtype, device=o.device)
+    _prefill_bf16_kernel[(triton.cdiv(T, 128) * (R // br), G)](
+        o, w, out, T, o.stride(0), o.stride(1), w.stride(0), w.stride(1), out.stride(0), out.stride(1),
+        R=R, D=D, BT=128, BR=br, BH=64, GROUP_M=4 if br == 256 else 8, num_warps=8, num_stages=3)
+    return out
+
+
 def _apply(original, o, wo_a, *args, **kwargs):
     """Around SGLang's ``_apply_wo_a_bf16_matmul(o [T, G, D], wo_a [G, R, D], ...)``."""
     scale = _scales.get(wo_a.data_ptr()) if wo_a.dtype == torch.float8_e4m3fn else None
@@ -126,6 +167,14 @@ def _apply(original, o, wo_a, *args, **kwargs):
             _scratch[key] = torch.empty(wo_a.shape, dtype=torch.bfloat16, device=wo_a.device)
         flat = wo_a.reshape(-1, wo_a.shape[-1])
         wo_a = dequantize(flat, scale, _scratch[key].view(flat.shape)).view(wo_a.shape)
+    if (os.environ.get('XTIER_DS_WO_A_PREFILL', '1') != '0'
+            and o.dim() == 3 and o.shape[0] > MAX_T
+            and o.dtype == wo_a.dtype == torch.bfloat16 and o.is_cuda
+            and tuple(wo_a.shape) != FAST_SHAPE
+            and o.stride(2) == 1 and wo_a.is_contiguous()
+            and wo_a.shape[1] % 128 == 0 and wo_a.shape[2] % 64 == 0
+            and torch.cuda.get_device_capability(o.device)[0] >= 8):
+        return einsum_prefill_bf16(o, wo_a)
     return original(o, wo_a, *args, **kwargs)
 
 
