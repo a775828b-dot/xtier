@@ -43,6 +43,13 @@
   (``.staging-<uuid>/cuda.cu``), no published build ever matches again, and every start compiles every JIT kernel
   anew: on an RTX 3090 the Marlin W8A16 GEMM takes about 5 minutes, once per TP rank (the second rank finds no usable
   build either). XTier resolves ``build_dir`` first.
+- CPU multimodal image/video decoding & bounded worker pool (``install_serving``, ``XTIER_CPU_IMAGE=1`` default,
+  ``XTIER_MM_CPU_WORKERS``): SGLang's multimodal processors default to ``gpu_image_decode=True`` (nvJPEG on CUDA),
+  GPU fast image preprocessing (``retry_on_cpu_after_gpu_oom=False``), and ``SGLANG_CPU_WORKERS=os.cpu_count()``
+  (128 forked workers on a dual-EPYC host). On a tight-VRAM XTier host this opens an extra CUDA context (~0.5-1 GiB)
+  in the tokenizer process, risks OOM on multi-image requests, and oversubscribes the non-MoE CPUs. XTier keeps
+  image/video decoding and preprocessing on the CPU and bounds multimodal CPU workers inside the reserved non-MoE
+  CPU headroom (4-8 workers on large hosts).
 """
 
 import ctypes
@@ -59,6 +66,18 @@ MXFP8_TUNER = 'flashinfer.autotuner.autotuner.AutoTuner.choose_one'
 FREEZE_GC = 'sglang.srt.entrypoints.http_server._freeze_gc_after_server_warmup'
 PARALLEL_TOKENIZE = 'sglang.srt.managers.tokenizer_manager.TokenizerManager._tokenize_texts'
 INIT_TOKENIZER = 'sglang.srt.managers.tokenizer_manager.TokenizerManager.init_tokenizer_and_processor'
+MM_LOAD_IMAGE = 'sglang.srt.multimodal.media_io.load_image'
+MM_LOAD_VIDEO = 'sglang.srt.multimodal.media_io.load_video'
+MM_PROC_INIT = 'sglang.srt.multimodal.processors.base_processor.BaseMultimodalProcessor.__init__'
+MM_PROC_DEVICE = 'sglang.srt.multimodal.processors.base_processor.BaseMultimodalProcessor._fast_image_processor_device'
+MM_PROC_COMPETES = (
+    'sglang.srt.multimodal.processors.base_processor.BaseMultimodalProcessor'
+    '._preprocessing_competes_with_the_scheduler'
+)
+MM_PROC_WORKERS = (
+    'sglang.srt.multimodal.processors.base_processor.BaseMultimodalProcessor'
+    '._resolve_auto_mm_processor_worker_num'
+)
 ACT_QUANT = 'sglang.kernels.ops.quantization.act_quant_triton.act_quant'
 JIT_DEPS = 'sglang.kernels.jit.utils.compile.cache._to_entries'
 MXFP8_LARGE_TILE, MXFP8_LARGE_ROWS = 4, 256   # SM120 CUTLASS MXFP8: tactic 4 = 128 x 128 x 128, no A/B swap
@@ -368,14 +387,110 @@ def _wrap_tokenizer_encode(original, self, *args, **kwargs):
     return ret
 
 
+def _mm_cpu_budget() -> int:
+    """Safe CPU worker count for multimodal decoding/preprocessing inside XTier's reserved non-MoE cores.
+
+    Honors an explicit ``XTIER_MM_CPU_WORKERS``; otherwise derives from the process CPU affinity (narrowed by
+    ``xtier.engine.placement``) or ``total_cpus - XTIER_THREADS``, using at most half the reserved headroom and
+    capped at 8 so bursts of high-res images/video never starve the HTTP loop or contend with MoE workers.
+    """
+    raw = os.environ.get('XTIER_MM_CPU_WORKERS', '').strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning('xtier: invalid XTIER_MM_CPU_WORKERS=%r; using auto budget', raw)
+    total = os.cpu_count() or 4
+    try:
+        avail = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        avail = total
+    if avail >= total:
+        try:
+            from xtier import config
+            moe_threads = config.threads()
+        except Exception:
+            moe_threads = 0
+        if 0 < moe_threads < total:
+            avail = total - moe_threads
+    if avail < 2:
+        return 1
+    return max(2, min(8, avail // 2))
+
+
+def _mm_load_image_cpu(original, image_file, *args, **kwargs):
+    if args:
+        args = (False, *args[1:])
+    else:
+        kwargs['gpu_image_decode'] = False
+    return original(image_file, *args, **kwargs)
+
+
+def _mm_load_video_cpu(original, video_file, *args, **kwargs):
+    if args:
+        args = (False, *args[1:])
+    else:
+        kwargs['use_gpu'] = False
+    return original(video_file, *args, **kwargs)
+
+
+def _mm_fast_device_cpu(original, self, processor, *args, **kwargs):
+    return 'cpu'
+
+
+def _mm_not_competing(original, self, *args, **kwargs):
+    return False
+
+
+def _mm_processor_init(original, self, *args, **kwargs):
+    cpu_image = os.environ.get('XTIER_CPU_IMAGE', '1') != '0'
+    if cpu_image:
+        cls = type(self)
+        if getattr(cls, 'gpu_image_decode', False) is not False:
+            cls.gpu_image_decode = False
+        self.gpu_image_decode = False
+        if getattr(cls, 'video_preprocessing_device', None) != 'cpu':
+            cls.video_preprocessing_device = 'cpu'
+        self.video_preprocessing_device = 'cpu'
+    budget = _mm_cpu_budget()
+    os.environ.setdefault('SGLANG_CPU_WORKERS', str(budget))
+    if budget < 4:
+        os.environ.setdefault('SGLANG_IO_WORKERS', str(budget))
+    return original(self, *args, **kwargs)
+
+
+def _mm_auto_workers(original, self, *args, **kwargs):
+    budget = _mm_cpu_budget()
+    if os.environ.get('XTIER_MM_CPU_WORKERS', '').strip():
+        return budget
+    n = max(1, int(original(self, *args, **kwargs)))
+    if os.environ.get('XTIER_CPU_IMAGE', '1') != '0':
+        target = min(4, budget)
+        if n < target:
+            n = target
+    return min(n, budget)
+
+
 def install_serving(registry, hook_type) -> list[str]:
     """Fixes of the process that serves the API."""
+    import importlib.util
     fixes = ['freeze-gc-after-listen']
     registry.register(FREEZE_GC, _freeze_gc_when_listening, hook_type.AROUND)
     if os.environ.get('XTIER_PARALLEL_TOKENIZE', '1') != '0':
         registry.register(PARALLEL_TOKENIZE, _parallel_tokenize_texts, hook_type.AROUND)
         registry.register(INIT_TOKENIZER, _wrap_tokenizer_encode, hook_type.AROUND)
         fixes.append('parallel-bpe-tokenize')
+    has_mm = importlib.util.find_spec('sglang.srt.multimodal.processors.base_processor') is not None
+    if has_mm:
+        if os.environ.get('XTIER_CPU_IMAGE', '1') != '0':
+            registry.register(MM_LOAD_IMAGE, _mm_load_image_cpu, hook_type.AROUND)
+            registry.register(MM_LOAD_VIDEO, _mm_load_video_cpu, hook_type.AROUND)
+            registry.register(MM_PROC_DEVICE, _mm_fast_device_cpu, hook_type.AROUND)
+            registry.register(MM_PROC_COMPETES, _mm_not_competing, hook_type.AROUND)
+            fixes.append('cpu-image-decode')
+        registry.register(MM_PROC_INIT, _mm_processor_init, hook_type.AROUND)
+        registry.register(MM_PROC_WORKERS, _mm_auto_workers, hook_type.AROUND)
+        fixes.append('mm-cpu-worker-budget')
     return fixes
 
 
