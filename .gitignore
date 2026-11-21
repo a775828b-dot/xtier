@@ -3,3 +3,37 @@ __pycache__/
 build/
 dist/
 *.so
+__pycache__/
+*.egg-info/
+build/
+dist/
+*.so
+# ---- 运行时产物（2026-11-21 落盘时加入） ----
+# 路由追踪、profile、学习型成本表与滚动记录：几十~上百 MB，且只对本机有意义
+*.bin
+ds41-profile-l20.json
+sps-table-*.json
+sps-table-*.records.jsonl
+sps-table-*.rounds.jsonl
+# 一次性依赖快照（环境已在 manifest 里记录）
+pip-freeze*.txt
+# 调试期的脚本备份：正式副本在 snapshots/prod/ 里
+*.bak-*
+*.ok-*
+# 本机代理前缀（推远端时不要再套一层）
+.ssh-ws/
+# ---- runtime artifacts (persist 2026-11-21) ----
+# route traces, profiles, learned cost tables and their rolling records: 10s-100s of MB,
+# and only meaningful on this box
+*.bin
+ds41-profile-l20.json
+sps-table-*.json
+sps-table-*.records.jsonl
+sps-table-*.rounds.jsonl
+# one-off dependency snapshots (the environment is recorded in the prod manifest)
+pip-freeze*.txt
+# debugging backups of the launch script; the real copies live in snapshots/prod/
+*.bak-*
+*.ok-*
+# local proxy prefix
+.ssh-ws/
