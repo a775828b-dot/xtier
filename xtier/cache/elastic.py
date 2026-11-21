@@ -265,11 +265,16 @@ class Governor:
                     _check(lib, lib.xtier_mailbox_pool_shrink(k))
                     self._settle()           # the evictions leave the residency table before the granules go
                 freed = self.bytes(target, self.extra)
+                # L20 TP2 SIGBUS/SIGSEGV fix (2026-11-19): cuMemUnmap invalidates GPU VAs that an
+                # in-flight forward / TP all-reduce may still reference. Drain the device before and
+                # after the unmap so no kernel or cross-rank transfer observes a torn-down VA.
+                torch.cuda.synchronize()
                 for p in self.pools:
                     keep = self._slots(p, target)
                     for a in p.arena:
                         _check(lib, lib.xtier_mailbox_vmm_unmap(C.c_void_p(a.data_ptr()), keep * a[0].numel()))
                     p.active = keep
+                torch.cuda.synchronize()
                 n, self.extra = self.extra - target, target
             finally:
                 lib.xtier_mailbox_pool_resume()
@@ -302,9 +307,19 @@ class Governor:
                             st = a[0].numel()
                             _check(lib, lib.xtier_mailbox_vmm_map(C.c_void_p(a.data_ptr()), a0 * st, (a1 - a0) * st))
                 except RuntimeError as e:   # out of memory on the way: back to where it was, no growth for a while
-                    for p in self.pools:
-                        for a in p.arena:
-                            lib.xtier_mailbox_vmm_unmap(C.c_void_p(a.data_ptr()), self._slots(p, old) * a[0].numel())
+                    # Same SIGBUS fix as release(): this rollback unmap runs on the background grow thread
+                    # concurrently with forwards, so quiesce the pool and drain the device around it.
+                    _check(lib, lib.xtier_mailbox_pool_pause(1))
+                    try:
+                        self._settle()
+                        torch.cuda.synchronize()
+                        for p in self.pools:
+                            for a in p.arena:
+                                lib.xtier_mailbox_vmm_unmap(C.c_void_p(a.data_ptr()), self._slots(p, old) * a[0].numel())
+                            p.active = self._slots(p, old)
+                        torch.cuda.synchronize()
+                    finally:
+                        lib.xtier_mailbox_pool_resume()
                     self.calm_until = time.monotonic() + self.cooldown
                     self._log(f'growth stopped at +{old} slots: {e}')
                     return
