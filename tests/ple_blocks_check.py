@@ -70,7 +70,8 @@ def run(fn, hidden, embeddings, track_offset):
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    out = fn(layer, hidden, None, batch)
+    fb = SimpleNamespace(_original_forward_mode=None, forward_mode=mode)
+    out = fn(layer, hidden, fb, batch)
     torch.cuda.synchronize()
     return out, pool.cache.clone(), (torch.cuda.max_memory_allocated() - base) / 2**20
 

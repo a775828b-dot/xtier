@@ -3,4 +3,4 @@
 __version__ = "0.1.7"
 
 # The SGLang main commit this XTier is tested with (2026-11-13): README, tools/check_sglang.py, a warning at load
-SGLANG_COMMIT = "084a5e9aae"
+SGLANG_COMMIT = "4ce41378f9"

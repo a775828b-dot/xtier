@@ -81,8 +81,6 @@ FORWARD_BATCH_INIT = 'sglang.srt.model_executor.forward_batch_info.ForwardBatch.
 TAIL_LAYOUT = 'sglang.srt.layers.attention.deepseek_v4_backend.late_layer_tail_layout'
 DSPARK_DRAFT = 'sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark'
 DRAFT_PROJECT = 'sglang.srt.models.dspark.project_through_lm_head'
-INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
-INDEXER_ARCH = 'sglang.srt.layers.attention.dsv4.v41_indexer.is_sm100'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
 REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
 MXFP8_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_blockscaled_linear'
@@ -384,30 +382,6 @@ def _draft_project(original, hidden, lm_head):
     return out.view(*hidden.shape[:-1], qweight.shape[0])
 
 
-def _indexer_arch(original, *args, **kwargs):
-    """Around SGLang's v41_indexer.is_sm100, which picks the DSv4.1 indexer's DeepGEMM fp8_fp4 MQA-logits kernels for
-    prefill and decode: SGLang 27bc1a0 narrowed it from SM100 and newer to the SM100 family, so SM12x took the torch /
-    Triton indexer and a 520K prefill ran 1.8x slower (each 22K chunk 5 s -> 12 s as the context grew). SM12x keeps
-    DeepGEMM, as up to 6162b07."""
-    return original(*args, **kwargs) or torch.cuda.get_device_capability()[0] == 12
-
-
-def _make_candidate_indexer(original, *args, **kwargs):
-    from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_PAGED_SPARSE_MQA_LOGITS
-
-    if (DEEPGEMM_PAGED_SPARSE_MQA_LOGITS or torch.cuda.get_device_capability()[0] != 12
-            or kwargs.get('candidate_topk_blocks', 1) <= 0):
-        return original(*args, **kwargs)
-    from sglang.srt.layers.attention.dsv4 import v41_indexer
-    from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import DenseBlocksBackend
-
-    dense = DenseBlocksBackend(token_to_kv_pool=kwargs['token_to_kv_pool'], req_to_token=kwargs['req_to_token'],
-                               candidate_topk_blocks=kwargs['candidate_topk_blocks'],
-                               candidate_block_size=kwargs['candidate_block_size'],
-                               use_deep_gemm_prefill=v41_indexer._use_deep_gemm_prefill())
-    return dense, dense
-
-
 @functools.lru_cache
 def _tuned(N, K, block_n, block_k):
     device = torch.cuda.get_device_name().replace(' ', '_')
@@ -475,16 +449,13 @@ def _markov_step_bias(original, self, prev_tokens, *, hidden_states=None, state=
 
 
 def install(registry, hook_type):
-    from xtier.packs.deepseek_v4 import mhc_sm120, paged_indexer, ragged_verify, recall, wo_a
+    from xtier.packs.deepseek_v4 import mhc_sm120, ragged_verify, recall, wo_a
 
     registry.register('sglang.srt.speculative.dspark_components.dspark_planner.DSparkVerifyPlanner.set_forced_budget_frac',
                       ragged_verify.forced_budget, hook_type.AFTER)
-    registry.register(INDEXER_ARCH, _indexer_arch, hook_type.AROUND)
-    registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
     wo_a.install(registry, hook_type)
     mhc_sm120.install(registry, hook_type)
-    paged_indexer.install(registry, hook_type)
     if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)

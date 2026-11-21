@@ -37,7 +37,7 @@ def _blocked(self, batch, tokens):
 
 def ple_forward(original, self, hidden_states, forward_batch, batch):
     tokens = batch.processed_tokens
-    if not _blocked(self, batch, tokens):
+    if not _blocked(self, batch, tokens) or hidden_states.shape[0] < tokens:
         return original(self, hidden_states, forward_batch, batch)
     from sglang.srt.models import qwen4_exp
 
