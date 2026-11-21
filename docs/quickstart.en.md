@@ -39,9 +39,9 @@ ln -s lib $CU/lib64
 ## 2. XTier and the tested SGLang
 
 ```bash
-git clone -b v0.1.7 https://github.com/a775828b-dot/xtier $DATA/src/xtier
+git clone -b v0.1.8 https://github.com/a775828b-dot/xtier $DATA/src/xtier
 git clone https://github.com/sgl-project/sglang $DATA/src/sglang
-git -C $DATA/src/sglang checkout 084a5e9aae
+git -C $DATA/src/sglang checkout 4ce41378f9
 
 SGLANG_BUILD_RUST_EXTS=none $P -m pip install --no-build-isolation \
   -c $DATA/src/xtier/constraints.txt -e $DATA/src/sglang/python

@@ -39,7 +39,7 @@ bench/         验收脚本（PPL、照抄、验证步、并发、prefill 延迟
 从空机器到第一次请求的完整路线（环境、模型准备、启动命令、测试请求）见[快速开始](docs/quickstart.md)。已经有 SGLang 环境时：
 
 ```bash
-git -C /path/to/sglang checkout 084a5e9aae      # 测试过的官方 SGLang main（2026-11-13）
+git -C /path/to/sglang checkout 4ce41378f9      # 测试过的官方 SGLang main（2026-11-21）
 SGLANG_BUILD_RUST_EXTS=none pip install -e /path/to/sglang/python   # 没装 Rust 时跳过 SGLang 可选的 Rust 扩展
 tools/build_engine.sh /path/to/site-packages/nvidia/cu13   # CPU 引擎与信箱库 -> xtier/engine/lib
 pip install --no-deps -e .                      # 注册插件入口 sglang.srt.plugins: xtier
@@ -245,11 +245,11 @@ SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速
 
 ## 版本更新
 
+- 2026-11-22（v0.1.8）：跟进官方 SGLang main `4ce41378f9`（`084a5e9aae` 之后 672 个提交），并打包合入 11-19 的 **9,000+ 无损 prefill / 工具回传 1.1 s** 优化与 **通用层默认 CPU 多模态解码 + 核数限流**（`XTIER_CPU_IMAGE=1`、`XTIER_MM_CPU_WORKERS`，Tokenizer/API 进程 0 显存占用、避免默认 128 进程 fork 争抢 MoE 核）。依赖更新：`sglang-kernel 0.4.11`、`sgl-deep-gemm 0.2.9`、`sgl-fa3 0.1.0`、`tml-renderers 0.4.2`（torch 2.14.1+cu130 与 FlashInfer 0.7.4 不变）。移除上游已原生合入的 DS SM120 索引器与 EAGLE 热词表拒绝采样钩子（解锁上游 `use_fused_draft_sample`，GLM-5.3 每步 decode 快约 1–1.5 ms）。三个模型全量回归（含 DeepSeek 4 路高分多图 CPU 解码、固定验证、序号回绕与模拟 SM86）全部通过。[报告](docs/reports/2026-11-22-sglang-4ce4137.md)
 - 2026-11-19：全链路 100% 无损预填突破 9,000 tok/s 与工具回传提速（不改 48K 默认分块）。通用层：`_run_fp4` 锁页预重排 `UE8M0` 缩放 + 24 槽纯 DMA 管线 + 零同步位图/直方图 + 保序单遍 `_reduce_band` + 全双工 `CPU_SHARE`；`engine.cpp` 对 `m > 16` 放开动态工作窃取与私有 L2 缓冲；`hybrid_prefill` 持久化锁页缓冲；HTTP 入口并行 BPE 分词（7.5 倍）；`elastic.py` 补齐 2,048 暂存档位边界。DeepSeek 加速包：SM120 PTX 精确 `mhc.post`（消除 +22.5 GiB 显存尖峰）、24-bit `bf16x3` mHC 投影、`>=512` 行 CUTLASS MXFP8 自调优、L2 分组 BF16 `wo_a` 预填核、非末尾分块跳过冗余 SWA 重放及 640 token 混合预填阈值。DeepSeek V4.1 的 `agent_bench` 冷 prefill 64K 升至 5,719 / 7,713、500K 升至 8,950 / 8,930 tok/s（384K–500K 达 8,894–9,085 tok/s，458K 单次冷提示 9,180 tok/s），长回复 159.0 tok/s，743 token 工具回传首字 2.07 → 1.12 s；58 项单测、TSan/ASan、PPL、序号回绕与多模型回归全数通过，细节见[报告](docs/reports/2026-11-19-lossless-9k-prefill.md)。
 - 2026-11-18（v0.1.7）：无损 prefill 融合、Engram 跨块预热与 DSpark 上下文草稿检索（Recall，启动台默认开、主模型验证无损）。DeepSeek V4.1 冷 prefill 64K 升至 5,568 / 7,158、500K 升至 7,677 / 7,590 tok/s；agent_bench 长回复 153.5–154.0 tok/s、每步 28.8 ms（含工具调用的全部请求 180.4 tok/s、每步 26.5 ms）；4 个请求同时新写 258 tok/s（基于原文件改写 / 编辑时 332–382 tok/s）。通用层同步优化 1K–6K FP4 预填、NVMe 行表去重预热与弹性热专家槽保护；三个模型的整模型回归、PPL 和各 15 分钟 dsh 真实任务均 0 错通过，细节见[报告](docs/reports/2026-11-18-lossless-prefill-recall.md)。
 - 2026-11-14（v0.1.6）：跟进官方 SGLang main 084a5e9（27bc1a0 之后 592 个提交），XTier 运行时的代码不用改。依赖：FlashInfer 0.7.4、nvidia-cudnn-frontend 1.32.3、sgl-deep-gemm 0.2.8、sgl-flash-mla 1.0.5。17 个改了源码的被钩函数逐个对过，钩子指纹已更新。三个模型回归通过，decode 持平；DeepSeek 冷 prefill 快约 10%（64K 6,144–6,691、520K 6,761 tok/s，上游改了 DSv4 prefill 的分块），GLM、Qwen 持平。`tools/arch_check.py` 的模拟模式跟着 SGLang JIT 工具链的接口改了一处。换 FlashInfer 后第一次启动要编译内核，会慢几分钟。[报告](docs/reports/2026-11-14-sglang-084a5e9.md)
 - 2026-11-12（v0.1.5）：DeepSeek V4.1 可以同时跑 4 个请求（原来 2 个）：4 个同时合计 254 tok/s（原来 2 个同时约 175 tok/s），2 个同时 191 tok/s，只有一个请求时基本不变。KV 池加到 1M token（单个请求的上下文仍是 512K），agent 派子 agent 时主会话的缓存不会被挤掉。一次专家调用从最多 8 个 token 改成 16 个（三个模型都一样），几个请求的验证行合在一起算；启动台的 DSpark 验证默认改成变长，成本表测到 4 个请求。多占约 1.2 GiB 显存。三个模型的回归通过。[报告](docs/reports/2026-11-12-ds-four-requests.md)
-- 2026-11-11：DeepSeek V4.1 的 decode 每步少 0.6–0.8 ms，两个请求同时每步 52.3 → 44.0 ms（−16%）。FP8 投影的小批量快内核原来只对 1、4、6 行开，DSpark 草稿模型的 5 行和两个请求同时的 10、12 行走的是慢 3–4 倍的内核；加速包的默认行数改成 1、4、5、6、10、12（`XTIER_MXFP8_B12X_ROWS`），只换内核，照抄 0 错。变长验证的成本表（`sps-table.json`）按新的耗时重测。[报告](docs/reports/2026-11-11-decode-step.md)
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 
 ## 许可
