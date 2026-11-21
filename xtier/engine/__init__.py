@@ -15,7 +15,7 @@ from pathlib import Path
 _P, _I = C.c_void_p, C.c_int
 _engine = None
 _mailbox = None
-SCALE_FORMATS = {'nvfp4': 0, 'mxfp4': 1}
+SCALE_FORMATS = {'nvfp4': 0, 'mxfp4': 1, 'bf16': 2}   # 2: BF16 experts (no block scales)
 
 
 def lib_dir() -> Path:
@@ -46,6 +46,10 @@ def engine() -> C.CDLL:
         lib.xtier_worker_cpus.restype = _I
         lib.xtier_create4.argtypes = [_I, _I, _I, _I, _I, C.c_float, _I] + [_P] * 7
         lib.xtier_create4.restype = _P
+        # The bench probe: streams the routed experts' weight bytes without the arithmetic, i.e. the memory
+        # ceiling of the compute kernels on this machine (csrc/engine/engine.cpp: read_rows).
+        lib.xtier_read_probe.argtypes = [_P, _I, _I] + [_P] * 4
+        lib.xtier_read_probe.restype = _I
         for name, args, res in (('place', [_P, _I, _I], _I), ('slot_table', [_P, _P], _I),
                                 ('slot_pieces', [_P, _I, _I, _P, _P], _I),
                                 ('cold_attach', [_P, _P, _P, _P, _P, C.c_float], _I),
@@ -83,7 +87,7 @@ class CpuPlan:
     and left to the caller to fill (shards / slot_pieces) before the first forward."""
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
-                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None):
+                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, global_scales=None):
         if scale_format not in SCALE_FORMATS:
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
@@ -91,14 +95,25 @@ class CpuPlan:
         self.swiglu_limit, self.scale_format = float(swiglu_limit), scale_format
         self.slots = self.experts if resident is None else len(resident)   # resident: the experts of slots 0..
         self.dynamic = None   # cold experts: the RAM slots experts can leave (cold.attach)
+        # The engine's create3/create4 also take the per-expert global scales (g13 [E, 2], g2 [E]); MXFP4 has
+        # none, so they are ones unless the caller has real ones (NVFP4).
+        import numpy as np
+        if global_scales is None:
+            g13 = np.ones((self.experts, 2), dtype=np.float32)
+            g2 = np.ones((self.experts,), dtype=np.float32)
+        else:
+            g13, g2 = global_scales
+            g13 = np.ascontiguousarray(g13, dtype=np.float32)
+            g2 = np.ascontiguousarray(g2, dtype=np.float32)
         if resident is None:
             self.plan = self.lib.xtier_create3(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
-                                               SCALE_FORMATS[scale_format], *weight_pointers)
+                                               SCALE_FORMATS[scale_format], *weight_pointers,
+                                               g13.ctypes.data, g2.ctypes.data)
         else:
             res = (C.c_int32 * self.slots)(*[int(e) for e in resident])
             self.plan = self.lib.xtier_create4(self.hidden, self.inter, self.experts, self.slots, int(threads),
                                                self.swiglu_limit, SCALE_FORMATS[scale_format], *weight_pointers,
-                                               C.cast(res, _P))
+                                               g13.ctypes.data, g2.ctypes.data, C.cast(res, _P))
         if not self.plan:
             raise RuntimeError(self.lib.xtier_last_error().decode())
         # GPT-OSS SwiGLU (MiniMax M3): gate * sigmoid(alpha * gate) * (up + beta); 1 / 0 keep the plain SiLU path

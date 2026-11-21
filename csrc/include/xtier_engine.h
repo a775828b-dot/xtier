@@ -25,7 +25,8 @@ extern "C" {
 // 0 disables the clamp. create owns an explicitly NUMA-bound, sharded copy (overrides
 // inherited interleave policy for its own mappings only). The input buffers can be
 // released after create returns. experts=10..512; threads<=128, divisible by the node count.
-// scale_format: 0=NVFP4 (E4M3/16), 1=MXFP4 (UE8M0/32).
+// scale_format: 0=NVFP4 (E4M3/16), 1=MXFP4 (UE8M0/32), 2=BF16 experts (no block scales;
+// w13: [experts,2*I,H] BF16, w2: [experts,H,I] BF16; the weights are used as they are).
 // MXFP4 globals must be arrays of 1. Shard scales retain compact 32-wide UE8M0
 // blocks; packed weights are unchanged. NVFP4 retains its original layout.
 void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int scale_format,

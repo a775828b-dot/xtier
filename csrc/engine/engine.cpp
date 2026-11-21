@@ -594,13 +594,41 @@ struct PlanBase {
     virtual void cold_stats(double *out)=0;
     virtual void tail_stats(double *out)=0;
 };
-template<bool MX> class Plan: public PlanBase {
-    static constexpr int scale_format=MX?1:0,scale_shift=MX?5:4;
+// FMT: 0=NVFP4 (E4M3 scales per 16), 1=MXFP4 (UE8M0 per 32), 2=BF16 experts (no scales)
+template<int FMT> class Plan: public PlanBase {
+    static constexpr bool MX=(FMT==1),BF16W=(FMT==2);
+    static constexpr int scale_format=FMT,scale_shift=MX?5:4;
     const std::array<uint16_t,16>* bf_table=lut.data();
 #if XTIER_AVX512
     const std::array<float,16>* fp_table=flut.data();
-    __m512bh unpack(const uint8_t* p,const uint8_t* s) const {if constexpr(MX)return ::unpack(p,s,bf_table,true);else return ::unpack(p,s);}
-    void unpack_f32(const uint8_t* p,const uint8_t* s,__m512& a,__m512& b) const {if constexpr(MX)::unpack_f32(p,s,a,b,fp_table,true);else ::unpack_f32(p,s,a,b);}
+    __m512bh unpack(const uint8_t* p,const uint8_t* s) const {
+        // BF16 experts: the weights are already BF16 (32 values, 64 bytes): no dequantization
+        if constexpr(BF16W)return (__m512bh)_mm512_loadu_si512((const void*)p);
+        else if constexpr(MX)return ::unpack(p,s,bf_table,true);
+        else return ::unpack(p,s);
+    }
+    void unpack_f32(const uint8_t* p,const uint8_t* s,__m512& a,__m512& b) const {
+        if constexpr(BF16W){   // BF16 -> FP32 lanes in the same order as asfloat(unpack())
+            __m512i v=_mm512_loadu_si512((const void*)p);
+            __m256i lo=_mm512_castsi512_si256(v),hi=_mm512_extracti64x4_epi64(v,1);
+            __m512i a32=_mm512_cvtepu16_epi32(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(lo)));
+            __m512i b32=_mm512_cvtepu16_epi32(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(hi)));
+            a=_mm512_castsi512_ps(_mm512_slli_epi32(a32,16));
+            b=_mm512_castsi512_ps(_mm512_slli_epi32(b32,16));
+        }
+        else if constexpr(MX)::unpack_f32(p,s,a,b,fp_table,true);
+        else ::unpack_f32(p,s,a,b);
+    }
+    // The weight pointer of row `base` at element offset `c` (c steps by 32 weights).
+    const uint8_t* wptr(const uint8_t* p,size_t base,int H,int c) const {
+        if constexpr(BF16W)return p+(base*(size_t)H+(size_t)c)*2;   // BF16 elements
+        else return p+base*(H/2)+c/2;
+    }
+    // The block scale of row `base` at element offset `c` (BF16 experts have none).
+    const uint8_t* sptr(const uint8_t* p,size_t base,int H,int c) const {
+        if constexpr(BF16W)return nullptr;
+        else return p+base*(H>>scale_shift)+(c>>scale_shift);
+    }
 #else
     const std::array<uint8_t,32>* byte_table=blut.data();
     void unpack32(const uint8_t* p,const uint8_t* s,__m256 w[4]) const {if constexpr(MX)::unpack32(p,s,w,byte_table,true);else ::unpack32(p,s,w);}
@@ -695,12 +723,18 @@ template<bool MX> class Plan: public PlanBase {
             const size_t e=size_t(expert_of[slot]),gi=slot*IN,di=slot*HN;
             size_t srcg=e*2*I+node*IN,srcu=srcg+I;
             size_t srcd=e*H+node*HN;
-            std::memcpy(s.gate.get()+gi*(H/2),source13+srcg*(H/2),IN*(H/2));
-            std::memcpy(s.up.get()+gi*(H/2),source13+srcu*(H/2),IN*(H/2));
-            copy_scales(s.sg.get()+gi*(H>>scale_shift),scale13+srcg*(H>>scale_shift),IN*(H>>scale_shift));
-            copy_scales(s.su.get()+gi*(H>>scale_shift),scale13+srcu*(H>>scale_shift),IN*(H>>scale_shift));
-            std::memcpy(s.down.get()+di*(I/2),source2+srcd*(I/2),HN*(I/2));
-            copy_scales(s.sd.get()+di*(I>>scale_shift),scale2+srcd*(I>>scale_shift),HN*(I>>scale_shift));
+            if constexpr(BF16W) {   // BF16 experts: the sources are BF16 rows, no scales
+                std::memcpy(s.gate.get()+gi*(size_t)H*2,source13+srcg*(size_t)H*2,IN*(size_t)H*2);
+                std::memcpy(s.up.get()+gi*(size_t)H*2,source13+srcu*(size_t)H*2,IN*(size_t)H*2);
+                std::memcpy(s.down.get()+di*(size_t)I*2,source2+srcd*(size_t)I*2,HN*(size_t)I*2);
+            } else {
+                std::memcpy(s.gate.get()+gi*(H/2),source13+srcg*(H/2),IN*(H/2));
+                std::memcpy(s.up.get()+gi*(H/2),source13+srcu*(H/2),IN*(H/2));
+                copy_scales(s.sg.get()+gi*(H>>scale_shift),scale13+srcg*(H>>scale_shift),IN*(H>>scale_shift));
+                copy_scales(s.su.get()+gi*(H>>scale_shift),scale13+srcu*(H>>scale_shift),IN*(H>>scale_shift));
+                std::memcpy(s.down.get()+di*(I/2),source2+srcd*(I/2),HN*(I/2));
+                copy_scales(s.sd.get()+di*(I>>scale_shift),scale2+srcd*(I>>scale_shift),HN*(I>>scale_shift));
+            }
         }
     }
 
@@ -725,8 +759,8 @@ template<bool MX> class Plan: public PlanBase {
                 __m512bh x[M];for(int t=0;t<M;t++)x[t]=(__m512bh)_mm512_loadu_si512(xs[t]+c);
                 for(int j=0;j<R;j++) {
                     size_t base=slot*IN+r+j;
-                    __m512bh a=unpack(s.gate.get()+base*(H/2)+c/2,s.sg.get()+base*(H>>scale_shift)+(c>>scale_shift));
-                    __m512bh b=unpack(s.up.get()+base*(H/2)+c/2,s.su.get()+base*(H>>scale_shift)+(c>>scale_shift));
+                    __m512bh a=unpack(wptr(s.gate.get(),base,H,c),sptr(s.sg.get(),base,H,c));
+                    __m512bh b=unpack(wptr(s.up.get(),base,H,c),sptr(s.su.get(),base,H,c));
                     for(int t=0;t<M;t++) {
                         ag[j][t]=_mm512_dpbf16_ps(ag[j][t],a,x[t]);au[j][t]=_mm512_dpbf16_ps(au[j][t],b,x[t]);
                     }
@@ -762,7 +796,7 @@ template<bool MX> class Plan: public PlanBase {
                 for(int t=0;t<M;t++)x[t]=(__m512bh)_mm512_loadu_si512(in_mid+(size_t(group.row)+t)*I+c);
                 for(int j=0;j<R;j++) {
                     size_t base=slot*HN+r+j;
-                    __m512bh w=unpack(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift));
+                    __m512bh w=unpack(wptr(s.down.get(),base,I,c),sptr(s.sd.get(),base,I,c));
                     for(int t=0;t<M;t++)acc[j][t]=_mm512_dpbf16_ps(acc[j][t],w,x[t]);
                 }
             }
@@ -774,7 +808,8 @@ template<bool MX> class Plan: public PlanBase {
     }
 
     template<int M,int HC,int IC> void down_rows(int node,int g,int begin,int end,float *destination=nullptr) {
-        if(down_bf16){down_rows_bf16<M,HC,IC>(node,g,begin,end,destination);return;}
+        // BF16 experts: the weights are BF16, so the BF16 dot path is the only one that reads them
+        if(down_bf16||BF16W){down_rows_bf16<M,HC,IC>(node,g,begin,end,destination);return;}
         const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
         const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;const size_t slot=size_t(group.slot);
         const float *__restrict const in_mid=mid;const float scale=globals2[e];
@@ -792,9 +827,9 @@ template<bool MX> class Plan: public PlanBase {
                     size_t base=slot*HN+r+j;
                     __m512 lo,hi;
 #if XTIER_DOWN_F32_LUT
-                    unpack_f32(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift),lo,hi);
+                    unpack_f32(wptr(s.down.get(),base,I,c),sptr(s.sd.get(),base,I,c),lo,hi);
 #else
-                    asfloat(unpack(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift)),lo,hi);
+                    asfloat(unpack(wptr(s.down.get(),base,I,c),sptr(s.sd.get(),base,I,c)),lo,hi);
 #endif
                     for(int t=0;t<M;t++) {
                         acc[j][t]=_mm512_fmadd_ps(lo,xl[t],acc[j][t]);
@@ -1145,16 +1180,22 @@ public:
         for(float g:globals13)if(!std::isfinite(g)||g<=0)throw std::runtime_error("Invalid global scale");
         for(float g:globals2)if(!std::isfinite(g)||g<=0)throw std::runtime_error("Invalid global scale");
         const size_t E=e,H=h,I=i;
-        if(s13) {   // without sources the caller writes the shards and checks their scales (xtier/backend/direct.py)
+        if(s13&&!BF16W) {   // without sources the caller writes the shards and checks their scales (xtier/backend/direct.py)
             for(size_t j=0;j<E*2*I*H/(format?32:16);j++)if(s13[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
             for(size_t j=0;j<E*H*I/(format?32:16);j++)if(s2[j]>(format?254:126))throw std::runtime_error("Unsupported block scale");
         }
         const size_t IN=I/nodes,HN=H/nodes,S=slots;
         for(int node=0;node<nodes;node++) {
             auto &s=shards[node];const int mem=topology().memory[node];
-            s.gate=alloc(S*IN*(H/2),mem);s.up=alloc(S*IN*(H/2),mem);
-            s.sg=alloc(S*IN*(H>>scale_shift),mem);s.su=alloc(S*IN*(H>>scale_shift),mem);
-            s.down=alloc(S*HN*(I/2),mem);s.sd=alloc(S*HN*(I>>scale_shift),mem);
+            if constexpr(BF16W) {   // BF16 experts: two bytes per weight, no block scales
+                s.gate=alloc(S*IN*(size_t)H*2,mem);s.up=alloc(S*IN*(size_t)H*2,mem);
+                s.down=alloc(S*HN*(size_t)I*2,mem);
+                s.sg=alloc(1,mem);s.su=alloc(1,mem);s.sd=alloc(1,mem);
+            } else {
+                s.gate=alloc(S*IN*(H/2),mem);s.up=alloc(S*IN*(H/2),mem);
+                s.sg=alloc(S*IN*(H>>scale_shift),mem);s.su=alloc(S*IN*(H>>scale_shift),mem);
+                s.down=alloc(S*HN*(I/2),mem);s.sd=alloc(S*HN*(I>>scale_shift),mem);
+            }
         }
         if(const char *v=std::getenv("XTIER_DOWN_BF16"))down_bf16=std::string(v)=="1";
         if(const char *v=std::getenv("XTIER_DYNAMIC"))dynamic=std::stoi(v);
@@ -1528,9 +1569,10 @@ void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,floa
         const bool empty=!w13&&!w2&&!s13&&!s2;   // all four null: shards allocated, not filled
         if(experts<10||experts>MAX_EXPERTS||threads<1||threads>128||(!empty&&(!w13||!w2||!s13||!s2))||!g13||!g2)
             throw std::runtime_error("Invalid create arguments");
-        if(scale_format==1)return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1)};
+        if(scale_format==1)return new Handle{std::make_shared<Plan<1>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1)};
+        if(scale_format==2)return new Handle{std::make_shared<Plan<2>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,2)};
         if(scale_format!=0)throw std::runtime_error("Unknown scale format");
-        return new Handle{std::make_shared<Plan<false>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0)};
+        return new Handle{std::make_shared<Plan<0>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0)};
     }catch(const std::exception &e){last_error=e.what();return nullptr;}
 }
 void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int threads,float swiglu_limit,int scale_format,
@@ -1549,10 +1591,13 @@ void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int th
            ||(!empty&&(!w13||!w2||!s13||!s2))||!g13||!g2||!resident)
             throw std::runtime_error("Invalid create arguments");
         if(scale_format==1)
-            return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1,
+            return new Handle{std::make_shared<Plan<1>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1,
+                                                           slots,resident)};
+        if(scale_format==2)
+            return new Handle{std::make_shared<Plan<2>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,2,
                                                            slots,resident)};
         if(scale_format!=0)throw std::runtime_error("Unknown scale format");
-        return new Handle{std::make_shared<Plan<false>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0,
+        return new Handle{std::make_shared<Plan<0>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0,
                                                         slots,resident)};
     }catch(const std::exception &e){last_error=e.what();return nullptr;}
 }
