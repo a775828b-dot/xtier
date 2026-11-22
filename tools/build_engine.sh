@@ -10,5 +10,13 @@ cuda=${1:-}
 cmake -S "$root/csrc" -B "$build" -DCMAKE_BUILD_TYPE=Release ${cuda:+-DXTIER_CUDA_ROOT="$cuda"} ${XTIER_CMAKE_ARGS:-}
 cmake --build "$build" -j "${XTIER_BUILD_JOBS:-8}"
 mkdir -p "$root/xtier/engine/lib"
-cp "$build"/libxtier_*.so "$root/xtier/engine/lib/"
+# Atomic replace (copy to temp on same filesystem, then rename) so rebuilding while a server is running never truncates an active .so.
+trap 'rm -f "$root/xtier/engine/lib"/.*.so.tmp.$$' EXIT
+for so in "$build"/libxtier_*.so; do
+  [ -f "$so" ] || continue
+  base=$(basename "$so")
+  tmp="$root/xtier/engine/lib/.${base}.tmp.$$"
+  cp "$so" "$tmp"
+  mv -f "$tmp" "$root/xtier/engine/lib/$base"
+done
 ls -la "$root/xtier/engine/lib"
