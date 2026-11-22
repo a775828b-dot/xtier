@@ -46,12 +46,11 @@ def e4m3_f32(b):
         return b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
     else:
         v = b.to(tl.int32)
-        e = (v >> 3) & 15
-        m = v & 7
-        mag = tl.where(e == 0, m.to(tl.float32) * 0.001953125,
-                       (((e + 120) << 23) | (m << 20)).to(tl.float32, bitcast=True))
-        mag = tl.where((v & 0x7F) == 0x7F, float('nan'), mag)
-        return tl.where((v & 0x80) != 0, -mag, mag)
+        bits = (((v & 0x7F) + 0x3C0) << 20) | ((v & 0x80) << 24)
+        sub = (v & 7).to(tl.float32) * 0.001953125
+        sub = tl.where((v & 0x80) != 0, -sub, sub)
+        mag = tl.where((v & 0x78) == 0, sub, bits.to(tl.float32, bitcast=True))
+        return tl.where((v & 0x7F) == 0x7F, float('nan'), mag)
 
 
 @triton.jit
