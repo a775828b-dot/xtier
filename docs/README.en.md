@@ -81,9 +81,10 @@ What has really been run, per model, GPU and multi-GPU mode (whole model, first 
 
 | GPU | Status |
 |---|---|
-| Blackwell (SM120) | Development and benchmark platform (RTX PRO 5000) |
-| RTX 40 series (SM89) | Supported. On an RTX 4090: Qwen3.8 whole model on 24 GB + 120 GB of host memory, copy test without errors, 120K context ([configuration](../configs/qwen38-rtx4090-3090/README.md)). GLM-5.3's first 8 layers and a DeepSeek V4.1 layer pass; their whole models were only emulated here. GLM needs speculative decoding off |
-| RTX 30 series (SM86) | Supported. On an RTX 3090: Qwen3.8 whole model on 24 GB, copy test without errors, 120K context, about 42 tok/s decode (a cloud host with 28 CPU threads). GLM-5.3's first 8 layers and a DeepSeek V4.1 layer pass; their whole models were only emulated here. FP8 is decoded in software (bit for bit as the hardware); GLM uses a BF16 KV and needs speculative decoding off |
+| Blackwell (SM120) | Development and benchmark platform (RTX PRO 5000 72 GB); also verified on an RTX PRO 6000 Blackwell 96 GB (Colab G4: Qwen3.8 whole model with MTP, 0/8 copy test, full model-free test suite) |
+| Ada / RTX 40 series & L4 (SM89) | Supported. On an RTX 4090: Qwen3.8 whole model on 24 GB + 120 GB of host memory, copy test without errors, 120K context ([configuration](../configs/qwen38-rtx4090-3090/README.md)). GLM-5.3's first 8 layers and a DeepSeek V4.1 layer pass; their whole models were only emulated here. GLM needs speculative decoding off. Also verified on an NVIDIA L4 24 GB (Qwen3.8 whole model with 50% SSD cold offload + full model-free test suite) |
+| Ampere / RTX 30 series (SM86) | Supported. On an RTX 3090: Qwen3.8 whole model on 24 GB, copy test without errors, 120K context, about 42 tok/s decode (a cloud host with 28 CPU threads). GLM-5.3's first 8 layers and a DeepSeek V4.1 layer pass; their whole models were only emulated here. FP8 is decoded in software (bit for bit as the hardware); GLM uses a BF16 KV and needs speculative decoding off |
+| Ampere / A100 (SM80) | Supported. On an NVIDIA A100 40 GB: Qwen3.8 whole model (MTP=0 and MTP=1, 110 slots + NVMe PLE) passes copy test 0/8, plus the full model-free test suite. FP8 weights and KV are decoded in software (bit for bit as the hardware); first-start Marlin FP8 PTX JIT takes ~6–7 min and is cached afterwards |
 
 ## Two GPUs (tensor parallel)
 

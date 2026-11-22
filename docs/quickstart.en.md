@@ -8,7 +8,7 @@ From an empty machine to the first request. This route uses Qwen3.8 Flash Next: 
 
 | Item | Requirement |
 |---|---|
-| GPU | 24 GB or more; run on RTX 4090, RTX 3090 and RTX PRO 5000 |
+| GPU | 24 GB or more (SM80+); verified on RTX PRO 5000 / 6000 (SM120), RTX 4090 / L4 (SM89), RTX 3090 (SM86), and A100 (SM80) |
 | Driver | 580 or newer (CUDA 13.0), see `nvidia-smi` |
 | Host memory | about 120 GB (about 71 GiB at the peak of serving, more while loading) |
 | Disk | 200 GiB or more on an SSD (the model 121 GiB, the environment about 15 GiB) |
