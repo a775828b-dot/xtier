@@ -50,6 +50,11 @@
   in the tokenizer process, risks OOM on multi-image requests, and oversubscribes the non-MoE CPUs. XTier keeps
   image/video decoding and preprocessing on the CPU and bounds multimodal CPU workers inside the reserved non-MoE
   CPU headroom (4-8 workers on large hosts).
+- Block-FP8 W8A8 Triton SWAP_AB / SPLIT_K on SM89 (Ada: L4 / L20 / L40S / RTX 4090): SGLang gates
+  ``_w8a8_block_fp8_matmul_hopper`` (plain Triton, no TMA/wgmma) on ``get_platform().is_sm90``, so SM89 tuned
+  configs carrying ``SWAP_AB`` or ``SPLIT_K > 1`` fall through to ``_w8a8_block_fp8_matmul`` and raise KeyError.
+  Until upstream widens the gate to exact capability (8, 9), XTier dispatches those SM89 configs (non-deterministic
+  mode) to ``_w8a8_block_fp8_matmul_hopper`` + ``_reduce_block_fp8_split_k`` without patching SGLang source.
 """
 
 import ctypes
@@ -80,6 +85,7 @@ MM_PROC_WORKERS = (
 )
 ACT_QUANT = 'sglang.kernels.ops.quantization.act_quant_triton.act_quant'
 JIT_DEPS = 'sglang.kernels.jit.utils.compile.cache._to_entries'
+BLOCK_FP8_TRITON = 'sglang.kernels.ops.gemm.fp8_kernel.w8a8_block_fp8_matmul_triton'
 MXFP8_LARGE_TILE, MXFP8_LARGE_ROWS = 4, 256   # SM120 CUTLASS MXFP8: tactic 4 = 128 x 128 x 128, no A/B swap
 _MADV_PAGEOUT = 21
 READ_AHEAD_FILES, READ_AHEAD_MAX = 2, 16 << 30
@@ -239,6 +245,53 @@ def _jit_deps_resolved(original, *args, **kwargs):
     if 'build_dir' in kwargs:
         kwargs['build_dir'] = kwargs['build_dir'].resolve()
     return original(*args, **kwargs)
+
+
+@functools.lru_cache(maxsize=8)
+def _is_sm89(device_index: int) -> bool:
+    import torch
+    return torch.cuda.get_device_capability(device_index) == (8, 9)
+
+
+def _w8a8_block_fp8_sm89(original, A, B, As, Bs, block_size, output_dtype=None):
+    import torch
+    if output_dtype is None:
+        output_dtype = torch.float16
+    if (not A.is_cuda or A.ndim < 2 or A.shape[-1] == 0 or not _is_sm89(A.device.index)
+            or B.ndim != 2 or len(block_size) != 2):
+        return original(A, B, As, Bs, block_size, output_dtype)
+    import triton
+    from sglang.kernels.ops.gemm import fp8_kernel as fk
+    N, K = B.shape
+    configs = fk.get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+    if not configs:
+        return original(A, B, As, Bs, block_size, output_dtype)
+    M = A.numel() // A.shape[-1]
+    config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    if not (config.get('SWAP_AB', False) or config.get('SPLIT_K', 1) > 1):
+        return original(A, B, As, Bs, block_size, output_dtype)
+    ctx = fk.get_context()
+    if ctx.is_config_namespace_published('exec') and fk.get_exec().deterministic.enable_deterministic_inference:
+        return original(A, B, As, Bs, block_size, output_dtype)
+    M, N, K, C = fk.prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    block_n, block_k = block_size
+    split_k = config.get('SPLIT_K', 1)
+    assert split_k & (split_k - 1) == 0
+    partials = torch.empty((split_k, M, N), device=A.device, dtype=torch.float32) if split_k > 1 else C
+    needs_masking = bool(K % config['BLOCK_SIZE_K'] != 0)
+
+    def grid(META):
+        return (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), split_k)
+
+    fk._w8a8_block_fp8_matmul_hopper[grid](
+        A, B, partials, As, Bs, M, N, K, block_n, block_k,
+        A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2), C.stride(-1),
+        As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0),
+        **config, needs_masking=needs_masking, USE_INT64_OFFSETS=max(A.numel(), partials.numel()) >= 2**31,
+    )
+    if split_k > 1:
+        fk._reduce_block_fp8_split_k[(triton.cdiv(M * N, 256),)](partials, C, M * N, split_k, 256)
+    return C
 
 
 _BPE_SPLIT_PATTERN = None
@@ -515,4 +568,7 @@ def install(registry, hook_type) -> list[str]:
     if importlib.util.find_spec('sglang.kernels.jit.utils.compile') is not None:
         registry.register(JIT_DEPS, _jit_deps_resolved, hook_type.AROUND)
         fixes.append('jit-cache-symlinked-dir')
+    if importlib.util.find_spec('sglang.kernels.ops.gemm.fp8_kernel') is not None:
+        registry.register(BLOCK_FP8_TRITON, _w8a8_block_fp8_sm89, hook_type.AROUND)
+        fixes.append('sm89-block-fp8-split-k')
     return fixes

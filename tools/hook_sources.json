@@ -12,6 +12,7 @@
   "sglang.kernels.ops.attention.flash_mla_sm120._validate_flashinfer_sparse_mla_backend": "a64a724ddf9cbb2a",
   "sglang.kernels.ops.embeddings.engram_gather.engram_gather": "1c32b76876b7d743",
   "sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs": "a27ab7e952c6d587",
+  "sglang.kernels.ops.gemm.fp8_kernel.w8a8_block_fp8_matmul_triton": "d101d5c6a46f96e7",
   "sglang.kernels.ops.gemm.hc_mix.fused_hc_mix": "4bec0c2d763c135d",
   "sglang.kernels.ops.layernorm.mhc.mhc_pre": "05d3fcb0b136e1d3",
   "sglang.kernels.ops.quantization.act_quant_triton.act_quant": "1228937f35d50ea0",
