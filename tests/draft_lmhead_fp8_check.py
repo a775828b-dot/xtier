@@ -13,6 +13,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch  # noqa: E402
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+    print('SKIP: needs an SM89 or newer GPU (torch._scaled_mm FP8; the pack keeps the draft LM head in BF16 below SM89)')
+    sys.exit(0)
+
 from xtier.packs.deepseek_v4 import _draft_project, _quantize_lm_head  # noqa: E402
 
 P = argparse.ArgumentParser()

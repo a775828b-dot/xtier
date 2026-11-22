@@ -17,6 +17,13 @@ from xtier import arch  # noqa: E402
 
 
 @triton.jit
+def encode_soft(X, SOFT, N, B: tl.constexpr):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    x = tl.load(X + i, mask=i < N)
+    tl.store(SOFT + i, arch.e4m3_bits(x), mask=i < N)
+
+
+@triton.jit
 def encode(X, SOFT, HARD, N, B: tl.constexpr):
     i = tl.program_id(0) * B + tl.arange(0, B)
     x = tl.load(X + i, mask=i < N)
@@ -37,8 +44,12 @@ if __name__ == '__main__':
     x = torch.cat([grid, rand, edges, -edges]).to(dev)
     n = x.numel()
     soft = torch.empty(n, dtype=torch.uint8, device=dev)
-    hard = torch.empty(n, dtype=torch.uint8, device=dev)
-    encode[(triton.cdiv(n, 1024),)](x, soft, hard, n, 1024)
+    if torch.cuda.get_device_capability() >= (9, 0):
+        hard = torch.empty(n, dtype=torch.uint8, device=dev)
+        encode[(triton.cdiv(n, 1024),)](x, soft, hard, n, 1024)
+    else:
+        encode_soft[(triton.cdiv(n, 1024),)](x, soft, n, 1024)
+        hard = x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
     torch.cuda.synchronize()
     nan = torch.isnan(x)
     bad = (soft != hard) & ~nan

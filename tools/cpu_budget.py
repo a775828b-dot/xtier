@@ -1,9 +1,10 @@
 """Expert worker threads for this process's CPUs: the CPUs of its cgroup cpuset (a container's; as the engine, which
-binds workers anywhere in it; without one, the affinity mask), capped by a cgroup v2 / v1 CPU quota, less one for the
-scheduler, rounded down to a multiple of the NUMA nodes that hold those CPUs (the engine gives every worker node the
-same number of threads). Prints the number; launch scripts use it for XTIER_THREADS. With --tp N the number is per
-rank: one scheduler per rank reserved, the rest split over the N ranks, each rounded down to a multiple of its share
-of the NUMA nodes (XTIER_TP_NODES=auto gives each rank its own group of nodes).
+binds workers anywhere in it; without one, the affinity mask), capped by a cgroup v2 / v1 CPU quota, less two per rank
+(the mailbox dispatcher and the scheduler/main threads, so XTIER_MAIN_CPUS=auto always has at least one CPU), rounded
+down to a multiple of the NUMA nodes that hold those CPUs (the engine gives every worker node the same number of
+threads). Prints the number; launch scripts use it for XTIER_THREADS. With --tp N the number is per rank: two CPUs per
+rank reserved, the rest split over the N ranks, each rounded down to a multiple of its share of the NUMA nodes
+(XTIER_TP_NODES=auto gives each rank its own group of nodes).
 
   python tools/cpu_budget.py [--reserve N] [--tp N]
 """
@@ -63,7 +64,7 @@ def cgroup_cpus():
     return None
 
 
-def threads(reserve=1, tp=1):
+def threads(reserve=2, tp=1):
     allowed = cgroup_cpus() or os.sched_getaffinity(0)
     n = len(allowed)
     q = quota_cpus()
@@ -79,5 +80,5 @@ def threads(reserve=1, tp=1):
 
 if __name__ == '__main__':
     tp = int(sys.argv[sys.argv.index('--tp') + 1]) if '--tp' in sys.argv else 1
-    reserve = int(sys.argv[sys.argv.index('--reserve') + 1]) if '--reserve' in sys.argv else tp
+    reserve = int(sys.argv[sys.argv.index('--reserve') + 1]) if '--reserve' in sys.argv else 2 * tp
     print(threads(reserve, tp))

@@ -22,7 +22,9 @@ from xtier.cache import prefill as cache_prefill  # noqa: E402
 from xtier.engine import placement  # noqa: E402
 from xtier.planner import probe  # noqa: E402
 
-E, H, I, K, THREADS = 64, 2560, 640, 8, 16
+_nodes = max(1, len(placement.cpu_nodes()))
+_cores = max(_nodes, (os.cpu_count() or 2) // 2)
+E, H, I, K, THREADS = 64, 2560, 640, 8, max(_nodes, min(16, _cores) // _nodes * _nodes)
 M = 300
 placement.apply(THREADS)
 layer = probe.Layer(E, H, I, K, 'nvfp4', THREADS)

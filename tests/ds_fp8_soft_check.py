@@ -38,8 +38,10 @@ def main():
     dev = torch.device('cuda')
     ok = True
     # Engram rows: random FP8 payloads (NaN codes left out) and E8M0 scales, ids also outside the table's rows
-    from sglang.kernels.ops.embeddings.engram_gather import engram_gather as sglang_gather
+    hw_fp8 = torch.cuda.get_device_capability() >= (8, 9)
     from xtier.packs.deepseek_v4.engram_gather import engram_gather
+    if hw_fp8:
+        from sglang.kernels.ops.embeddings.engram_gather import engram_gather as sglang_gather
     g = torch.Generator(device=dev).manual_seed(20261029)
     rows, dim, block = 200000, 256, 32
     w = torch.randint(0, 256, (rows, dim), dtype=torch.uint8, device=dev, generator=g)
@@ -48,8 +50,16 @@ def main():
     s[s > 160] = 127
     ids = torch.randint(-1000, rows + 1000, (65536,), device=dev, generator=g)
     for lo, hi in ((0, rows), (50000, 150000)):
-        a = sglang_gather(w.data_ptr(), s.data_ptr(), ids, torch.empty(ids.numel(), dim, dtype=torch.bfloat16,
-                                                                          device=dev), dim, block, lo, hi)
+        if hw_fp8:
+            a = sglang_gather(w.data_ptr(), s.data_ptr(), ids, torch.empty(ids.numel(), dim, dtype=torch.bfloat16,
+                                                                              device=dev), dim, block, lo, hi)
+        else:
+            valid = (ids >= lo) & (ids < hi)
+            local = (ids - lo).clamp(0, hi - lo - 1).long()
+            sc = torch.where(s == 0, torch.full_like(s, 0x00400000, dtype=torch.int32),
+                             s.to(torch.int32) << 23).view(torch.float32)
+            a = (w.view(torch.float8_e4m3fn).float()[local] * sc[local].repeat_interleave(block, dim=-1)).to(torch.bfloat16)
+            a[~valid] = 0
         b = engram_gather(w.data_ptr(), s.data_ptr(), ids, torch.empty(ids.numel(), dim, dtype=torch.bfloat16,
                                                                         device=dev), dim, block, lo, hi)
         same = torch.equal(a.view(torch.int16), b.view(torch.int16))
@@ -57,15 +67,24 @@ def main():
         print(f'Engram gather, rows [{lo}, {hi}): {ids.numel()} ids x {dim}: '
               f'{"bitwise equal" if same else "DIFFER"}')
     with tempfile.TemporaryDirectory() as tmp:
-        outs = []
-        for rebuilt in (0, 1):
-            out = f'{tmp}/fq{rebuilt}.pt'
-            subprocess.run([sys.executable, __file__, '--fake-quant', out, str(rebuilt)], check=True)
-            outs.append(torch.load(out))
-        for key in outs[0]:
-            same = torch.equal(outs[0][key].view(torch.int16), outs[1][key].view(torch.int16))
-            ok &= same
-            print(f'FP4 fake quant, {key} block scales: {"bitwise equal" if same else "DIFFER"}')
+        if hw_fp8:
+            outs = []
+            for rebuilt in (0, 1):
+                out = f'{tmp}/fq{rebuilt}.pt'
+                subprocess.run([sys.executable, __file__, '--fake-quant', out, str(rebuilt)], check=True)
+                outs.append(torch.load(out))
+            for key in outs[0]:
+                same = torch.equal(outs[0][key].view(torch.int16), outs[1][key].view(torch.int16))
+                ok &= same
+                print(f'FP4 fake quant, {key} block scales: {"bitwise equal" if same else "DIFFER"}')
+        else:
+            out = f'{tmp}/fq1.pt'
+            subprocess.run([sys.executable, __file__, '--fake-quant', out, '1'], check=True)
+            res = torch.load(out)
+            for key, val in res.items():
+                good = bool(torch.isfinite(val).all() and val.abs().max() > 0)
+                ok &= good
+                print(f'FP4 fake quant (soft rebuilt, <SM89), {key}: {"finite ok" if good else "BAD"}')
     print('DS-FP8-SOFT-CHECK', 'PASS' if ok else 'FAIL')
     raise SystemExit(0 if ok else 1)
 

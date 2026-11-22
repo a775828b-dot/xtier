@@ -32,6 +32,7 @@ def fp8(x):
 # K / V of ROWS tokens with per-token magnitudes over 4 decades (E4M3 subnormals included)
 k8, v8 = (fp8(torch.randn(ROWS, HEADS, DIM, device=DEV) * 10 ** torch.empty(ROWS, 1, 1, device=DEV).uniform_(-3, 1))
           for _ in range(2))
+ref_k, ref_v = (k8, v8) if torch.cuda.get_device_capability() >= (8, 9) else (k8.to(torch.bfloat16), v8.to(torch.bfloat16))
 raw = (k8.view(torch.uint8), v8.view(torch.uint8), None, None, None, None)
 ok = True
 
@@ -54,7 +55,7 @@ for label, cu, zero_fill in (('compact', cu_k, 0), ('page-aligned', torch.arange
         out_v = out_k.clone()
         args = (req_to_token, req_indices, indices, seq_lens, cu, out_k, out_v, batch, topk)
         if fn == 'sglang':
-            qwen_sparse_kv_extraction_compact_triton(k8, v8, *args, zero_fill_cols=zero_fill)
+            qwen_sparse_kv_extraction_compact_triton(ref_k, ref_v, *args, zero_fill_cols=zero_fill)
         else:
             qsa_fp4.gather(raw, *args, zero_fill_cols=zero_fill)
         outs.append((out_k, out_v))
@@ -66,7 +67,7 @@ for label, cu, zero_fill in (('compact', cu_k, 0), ('page-aligned', torch.arange
 p_req = torch.tensor([1, 3], dtype=torch.int64, device=DEV)
 p_lens = [37000, 64000]
 p_cu = torch.tensor([0] + p_lens, device=DEV).cumsum(0).to(torch.int32)
-ref = pack_qsa_prefill_kv(k=k8, v=v8, req_to_token=req_to_token, req_indices=p_req, cu_k=p_cu,
+ref = pack_qsa_prefill_kv(k=ref_k, v=ref_v, req_to_token=req_to_token, req_indices=p_req, cu_k=p_cu,
                           total_k=sum(p_lens), max_k=max(p_lens), output_dtype=torch.bfloat16)
 got = qsa_fp4.pack(raw, req_to_token, p_req, p_cu, sum(p_lens), max(p_lens), torch.bfloat16)
 same = torch.equal(ref[0].view(torch.int16), got[0].view(torch.int16)) and torch.equal(ref[1].view(torch.int16),

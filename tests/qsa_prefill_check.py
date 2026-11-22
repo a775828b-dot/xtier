@@ -9,10 +9,13 @@ import sys
 import time
 from pathlib import Path
 
-# TileLang picks its HIP target first when a ROCm toolkit is installed (the server gets xtier.platform's fix)
-os.environ.setdefault('TILELANG_DEFAULT_TARGET', '{"kind": "cuda", "arch": "sm_120"}')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch  # noqa: E402
+
+# TileLang picks its HIP target first when a ROCm toolkit is installed (the server gets xtier.platform's fix)
+if torch.cuda.is_available():
+    _maj, _min = torch.cuda.get_device_capability()
+    os.environ.setdefault('TILELANG_DEFAULT_TARGET', f'{{"kind": "cuda", "arch": "sm_{_maj}{_min}"}}')
 
 from sglang.srt.layers.attention.qsa import mqa  # noqa: E402
 

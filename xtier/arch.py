@@ -1,8 +1,8 @@
 """What this GPU gives XTier's own Triton kernels, and software decoding where it gives less.
 
 - FP4 (E2M1) to FP16: the cvt.rn.f16x2.e2m1x2 instruction needs SM100 or newer (SM120 included); RTX 30 / 40 series
-  (SM86 / SM89) build the FP16 bits with integer operations (XTIER_FP4_DECODE=hw|soft|auto).
-- FP8 (E4M3) to FP32: Triton has float8e4nv from SM89 on; RTX 30 series (SM86) build the FP32 bits with integer
+  (SM80 / SM86 / SM89) build the FP16 bits with integer operations (XTIER_FP4_DECODE=hw|soft|auto).
+- FP8 (E4M3) to FP32: Triton has float8e4nv from SM89 on; A100 / RTX 30 series (SM80 / SM86) build the FP32 bits with integer
   operations (XTIER_FP8_DECODE=hw|soft|auto). The other way, ``e4m3_bits`` encodes FP32 in software as the conversion
   Triton emits from SM89 on (round to nearest even, saturating), for kernels that store FP8 on those GPUs.
 The software paths give exactly the values of the conversions (tests/fp4_decode_check.py, tests/fp8_decode_check.py),

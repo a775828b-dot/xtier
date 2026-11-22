@@ -22,6 +22,8 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier.arch import e4m3_f32
+
 logger = logging.getLogger(__name__)
 GROUP = 128
 MAX_M = 16
@@ -54,10 +56,10 @@ def _w8_fused(X, W, S, P, CNT, BIAS, Y, M, N, K, SPAN, NG, SLICES: tl.constexpr,
         ks = k0 + kk + tl.arange(0, BK)
         kmask = ks < K
         x = tl.load(X + rows[:, None] * K + ks[None, :], mask=(rows[:, None] < M) & kmask[None, :], other=0.0)
-        w = tl.load(W + cols[:, None] * K + ks[None, :], mask=cmask[:, None] & kmask[None, :], other=0.0)
+        w = tl.load(W + cols[:, None] * K + ks[None, :], mask=cmask[:, None] & kmask[None, :], other=0)
         # the last slice may extend past K: its group scale is masked too
         s = tl.load(S + cols * NG + (k0 + kk) // 128, mask=cmask & (k0 + kk < K), other=0.0)
-        wb = (w.to(tl.float32) * s[:, None]).to(tl.bfloat16)
+        wb = (e4m3_f32(w) * s[:, None]).to(tl.bfloat16)
         acc = tl.dot(x, tl.trans(wb), acc)
     omask = (rows[:, None] < M) & cmask[None, :]
     if SLICES == 1:
@@ -85,9 +87,9 @@ def _w8_dequant(W, S, D, N, K, NG, BN: tl.constexpr, BK: tl.constexpr):
     rows = tl.program_id(0) * BN + tl.arange(0, BN)
     ks = tl.program_id(1) * BK + tl.arange(0, BK)
     mask = (rows[:, None] < N) & (ks[None, :] < K)
-    w = tl.load(W + rows[:, None] * K + ks[None, :], mask=mask, other=0.0)
+    w = tl.load(W + rows[:, None] * K + ks[None, :], mask=mask, other=0)
     s = tl.load(S + rows * NG + (tl.program_id(1) * BK) // 128, mask=rows < N, other=0.0)
-    tl.store(D + rows[:, None] * K + ks[None, :], (w.to(tl.float32) * s[:, None]).to(tl.bfloat16), mask=mask)
+    tl.store(D + rows[:, None] * K + ks[None, :], (e4m3_f32(w) * s[:, None]).to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -150,7 +152,7 @@ def gemm_w8(x, q, s, bias=None, cnt=None):
         cnt = torch.zeros(triton.cdiv(n, bn), dtype=torch.int32, device=x.device)
     part = torch.empty((slices, MAX_M, n), device=x.device, dtype=torch.float32) if slices > 1 else x
     y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
-    _w8_fused[(triton.cdiv(n, bn), slices)](x, q, s, part, cnt, bias if bias is not None else x, y, m, n, k, span,
+    _w8_fused[(triton.cdiv(n, bn), slices)](x, q.view(torch.uint8), s, part, cnt, bias if bias is not None else x, y, m, n, k, span,
                                             k // GROUP, slices, MAX_M, bn, block_k, bias is not None,
                                             num_warps=warps, num_stages=stages)
     return y
@@ -159,7 +161,7 @@ def gemm_w8(x, q, s, bias=None, cnt=None):
 def dequant(q, s):
     n, k = q.shape
     d = torch.empty((n, k), device=q.device, dtype=torch.bfloat16)
-    _w8_dequant[(triton.cdiv(n, 32), triton.cdiv(k, 128))](q, s, d, n, k, k // GROUP, 32, 128)
+    _w8_dequant[(triton.cdiv(n, 32), triton.cdiv(k, 128))](q.view(torch.uint8), s, d, n, k, k // GROUP, 32, 128)
     return d
 
 
@@ -215,7 +217,7 @@ def quantize_model(model):
         layer.weight = torch.nn.Parameter(q, requires_grad=False)
         layer._xtier_fp8_scale = sc
         layer._xtier_w8_cnt = torch.zeros(triton.cdiv(q.shape[0], 32), dtype=torch.int32, device=q.device)
-        layer._xtier_w8a8 = bool(w8a8 is not None and w8a8.search(name))
+        layer._xtier_w8a8 = bool(w8a8 is not None and w8a8.search(name) and torch.cuda.get_device_capability(q.device) >= (8, 9))
         w8a8_layers += layer._xtier_w8a8
         bf16_bytes += w.numel() * 2
         fp8_bytes += q.numel() + sc.numel() * 4

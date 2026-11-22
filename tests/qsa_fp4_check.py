@@ -12,6 +12,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch  # noqa: E402
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+    print('SKIP: NVFP4 KV cache quantize requires an SM90 or newer GPU')
+    sys.exit(0)
+
 from sglang.srt.layers.attention.qsa.sparse_attn import (pack_qsa_prefill_kv,  # noqa: E402
                                                          qwen_sparse_kv_extraction_compact_triton)
 from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil  # noqa: E402

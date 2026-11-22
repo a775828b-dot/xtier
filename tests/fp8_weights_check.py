@@ -52,11 +52,13 @@ for n, k in SHAPES:
     del graph
     xp = torch.randn(512, k, generator=g, device='cuda').bfloat16()
     ref = xp.double() @ ref_w.T
-    e_w8a8 = rel(f.gemm_w8a8(xp, q, s), ref)
+    hw_fp8 = torch.cuda.get_device_capability() >= (8, 9)
+    e_w8a8 = rel(f.gemm_w8a8(xp, q, s), ref) if hw_fp8 else None
     e_deq = rel(torch.nn.functional.linear(xp, f.dequant(q, s)), ref)
-    ok = worst < 5e-3 and replay_ok and e_w8a8 < 5e-2 and e_deq < 5e-3
+    ok = worst < 5e-3 and replay_ok and (e_w8a8 is None or e_w8a8 < 5e-2) and e_deq < 5e-3
     bad += not ok
+    w8a8_s = f'{e_w8a8:.2e}' if e_w8a8 is not None else 'skip (<SM89)'
     print(f'N={n:5d} K={k:5d}: decode rel {worst:.2e}, graph replays {"bitwise" if replay_ok else "DIFFERENT"}, '
-          f'W8A8 prefill rel {e_w8a8:.2e}, dequant prefill rel {e_deq:.2e} -> {"ok" if ok else "FAIL"}', flush=True)
+          f'W8A8 prefill rel {w8a8_s}, dequant prefill rel {e_deq:.2e} -> {"ok" if ok else "FAIL"}', flush=True)
 print('FP8-WEIGHTS-CHECK', 'PASS' if not bad else f'FAIL ({bad})')
 sys.exit(0 if not bad else 1)

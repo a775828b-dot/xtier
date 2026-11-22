@@ -88,9 +88,9 @@ MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（双 RTX
 
 | 显卡 | 状态 |
 |---|---|
-| Blackwell（SM120） | 开发和测速平台（RTX PRO 5000），下面的测速都在这上面测 |
-| RTX 40 系（SM89） | 支持。RTX 4090 实测：Qwen3.8 整模型在单卡 24 GB + 120 GB 内存上照抄 0 错、120K 上下文（[配置](configs/qwen38-rtx4090-3090/README.md)）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证；GLM 要关投机解码。详见[报告](docs/reports/2026-10-29-rtx40.md) |
-| RTX 30 系（SM86） | 支持。RTX 3090 实测：Qwen3.8 整模型在单卡 24 GB 上照抄 0 错、120K 上下文，decode 约 42 tok/s（云主机 28 个 CPU 线程）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证。FP8 全部软件解码（与硬件逐位相同），GLM 用 BF16 KV、要关投机解码。详见[报告](docs/reports/2026-10-29-rtx30.md) |
+| Blackwell（SM120） | 开发和测速平台（RTX PRO 5000），下面的测速都在这上面测；另已在 RTX PRO 6000 96 GB（Colab G4）上实测 Qwen3.8 整模型（含 MTP，照抄 0 错） |
+| Ada / RTX 40 系（SM89） | 支持。RTX 4090 实测：Qwen3.8 整模型在单卡 24 GB + 120 GB 内存上照抄 0 错、120K 上下文（[配置](configs/qwen38-rtx4090-3090/README.md)）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证；GLM 要关投机解码（[报告](docs/reports/2026-10-29-rtx40.md)）。另已在 NVIDIA L4 24 GB（50% SSD 冷专家）上实测 Qwen3.8 整模型 |
+| Ampere / RTX 30 系 & A100（SM86 / SM80） | 支持。RTX 3090 实测：Qwen3.8 整模型在单卡 24 GB 上照抄 0 错、120K 上下文，decode 约 42 tok/s（云主机 28 个 CPU 线程）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证（[报告](docs/reports/2026-10-29-rtx30.md)）。A100 40 GB（SM80）实测：Qwen3.8 整模型（含 MTP）照抄 0/8、全量免模型单测通过；FP8 全部软件解码（与硬件逐位相同），GLM 用 BF16 KV、要关投机解码 |
 
 ## 多卡（张量并行）
 

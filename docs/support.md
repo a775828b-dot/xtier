@@ -17,10 +17,13 @@
 | 显卡 | Qwen3.8 Flash Next | GLM-5.3 Flash | DeepSeek V4.1 Flash 1017 | 说明 |
 |---|---|---|---|---|
 | RTX PRO 5000 72 GB（SM120） | 整模型 | 整模型 | 整模型 | 开发和测速平台，每个版本都回归 |
+| RTX PRO 6000 Blackwell 96 GB（SM120） | 整模型（含 MTP） | 未验证 | 未验证 | Colab G4 实测（48T EPYC AVX-512）：320 槽 + NVMe PLE，MTP=0/1 照抄均 0/8，全量免模型单测通过 |
 | RTX 4090 24 GB（SM89） | 整模型（含 MTP） | 前 8 层截层；整模型只模拟 | 第 20 层单层；整模型只模拟 | GLM 要关投机解码；DeepSeek 还没有 24 GB 卡的配置 |
+| NVIDIA L4 24 GB（SM89） | 整模型（50% 冷卸载，不含 MTP） | 未验证 | 未验证 | Colab L4（22 GB 显存 + 53 GB 内存）实测：50% SSD 冷专家 + NVMe PLE + 40 槽起服问答正常，全量免模型单测通过 |
 | RTX 3090 24 GB（SM86） | 整模型（含 MTP） | 前 8 层截层（BF16 KV）；整模型只模拟 | 第 20 层单层；整模型只模拟 | FP8 全部软件解码；GLM 要关投机解码；DeepSeek 同上 |
+| NVIDIA A100 40 GB（SM80） | 整模型（含 MTP） | 未验证 | 未验证 | Colab A100-SXM4-40GB 实测：110 槽 + NVMe PLE，MTP=0/1 照抄均 0/8；FP8 权重与 KV 走软件解码，首次启动 Marlin FP8 PTX JIT 约 6–7 分钟 |
 | RTX 5090 32 GB（SM120） | 未验证 | 未验证 | 模拟（32 GB 显存 + 128 GB 内存，[报告](reports/2026-10-27-ds41-minimal.md)） | 和 RTX PRO 5000 同架构，真卡没跑过 |
-| 其他显卡 | 未验证 | 未验证 | 未验证 | 架构低于 SM86 不支持 |
+| 其他显卡 | 未验证 | 未验证 | 未验证 | 架构低于 SM80 不支持 |
 
 上表 DeepSeek 在 RTX 30 / 40 系的结果都早于 SGLang 6162b07。v0.1.0 在这两代卡上第一个请求会崩（[#10](https://github.com/a775828b-dot/xtier/pull/10)），v0.1.1 已修；
 修复后只在 RTX PRO 5000 上模拟 SM86 跑过整模型（照抄 0 错，NLL 1.197），真卡结果要等作者确认。
@@ -47,6 +50,7 @@ MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 
 | CPU | CPU 引擎 | 验证 |
 |---|---|---|
 | 2× EPYC 9334（Zen 4，NPS4，24 通道） | AVX-512 | 开发和测速平台 |
+| AMD EPYC 9B45（Colab G4，48 线程，AVX-512 BF16） | AVX-512 | Qwen3.8 整模型（含 MTP，RTX PRO 6000） |
 | 租用机的 Xeon（没有 AVX-512 BF16） | AVX2 | Qwen3.8 整模型（RTX 4090、RTX 3090 那两台），decode 明显受 CPU 限制 |
 | 2× EPYC 7642（Zen 2） | AVX2 | 未验证（`tools/isa_check.sh` 只查过库里没有 AVX-512 指令） |
 
