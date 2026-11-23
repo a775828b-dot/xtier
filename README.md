@@ -4,7 +4,7 @@
 
 XTier 是官方 [SGLang](https://github.com/sgl-project/sglang) 的插件（跟 main 分支），做 CPU/GPU 分层 MoE 推理：专家分布在显存和内存两层，按热度放置、按需调度；NVMe 只放大嵌入表的行（DeepSeek 的 Engram、Qwen 的 PLE）。内存放不下全部专家时，可选的冷专家池把少用的专家放到硬盘、用到时读回内存，池子大小和速度受限于硬盘速度和类型。
 
-**状态：早期开发**（[工作计划](docs/PLAN.md)）。Qwen3.8 Flash Next、GLM-5.3 Flash、DeepSeek V4.1 Flash 1017 跑在 SGLang main 上；MiniMax-M3.1-Flash 跑在 SGLang 的 M3.1 分支（PR #45925），已暂停开发（本机太慢、智力不强）。
+**状态：早期开发**（[工作计划](docs/PLAN.md)）。Hunyuan-4-Flash NVFP4、DeepSeek V4.1 Flash 1017、Qwen3.8 Flash Next、GLM-5.3 Flash 跑在 SGLang main 上；MiniMax-M3.1-Flash 跑在 SGLang 的 M3.1 分支（PR #45925），已暂停开发（本机太慢、智力不强）。
 
 - **不改 SGLang 源码**：只用官方插件框架的钩子（接在官方 KTransformers 混合推理的入口上），加载后自检是否接管成功。
 - **与模型无关**：混合推理包在官方 `FusedMoE` 的量化方法外面，用标准 MoE 层的模型装上就能跑（NVFP4、MXFP4 专家）。
@@ -20,7 +20,8 @@ xtier/
 │              冷专家池（可选，`XTIER_COLD=1`）：少用的专家放到硬盘（[设计](docs/design-cold-experts.md)）
 ├── planner/   规划器：本机探测的 GPU / CPU 耗时 + 路由档案 → 显存预算内每层的热专家槽数（按 CPU 和 GPU 同时算完分配），可在启动时自动算
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
-├── packs/     加速包：qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核、QSA 读 NVFP4 KV）、glm5_next（量化排除、DSA、NextN）、
+├── packs/     加速包：hy4_flash（混合 SWA+DSA 池、416 B/tok NVFP4 KV 与 L2 聚簇解包、FP8 IndexPool、Engram 放 NVMe、零补丁原生 5 层 DFly2 投机解码与置信度截断）、
+│              qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核、QSA 读 NVFP4 KV）、glm5_next（量化排除、DSA、NextN）、
 │              deepseek_v4（Engram 行放 NVMe 与跨块预热、SM120 mHC 精确核与 MXFP8 预填自调优、候选索引器、FP8 wo_a、分页索引器、DSpark 上下文草稿检索）、
 │              minimax_m3（SM120 通用栈、CUDA 上的 DSpark verify、草稿词表头 FP8、SM120 上读 NVFP4 KV）、
 │              speculative（通用投机解码：EAGLE 的热词表配无损拒绝采样、草稿温度、按置信度截断验证；DSpark 按置信度截断验证）
@@ -77,6 +78,7 @@ MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（双 RTX
 
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
+| Hunyuan-4-Flash NVFP4 | `hy4_flash` | 官方 main 上跑通（1M KV 池 / 1M 上下文 / 4 并发，含零补丁原生 5 层 DFly2 投机解码 + 置信度截断）：混合 SWA+DSA NVFP4 KV（`7.95 GB`，较基线省 `24.37 GB`）、FP8 IndexPool、Engram（64.7 GB）放 NVMe、208 层 FP8/W8A8 与共享专家掩蔽，照抄 0 错、PPL 无损 |
 | Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；加速包比基线 冷 prefill 快 5% / 24%（64K / 512K）；KV 存 NVFP4（与生产同参，加速包让官方 QSA 能读），省下的显存用来多放常驻层，启动台默认由规划器自动布局；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
 | GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包（FP8 权重、热词表拒绝采样、截断验证、弹性热专家槽）比基线 长回复每步快 22%，PPL 3.987 → 3.998 |
 | DeepSeek V4.1 Flash 1017 | `deepseek_v4` | 官方 main 上跑通（含 DSpark）：Engram 表（189 GB）的行放 NVMe（[设计](docs/design-tables-nvme.md)），照抄 0 错；加速包（含 FP8 wo_a、分页索引器、弹性热专家槽）比基线 长回复每步快 39%、冷 prefill 快 33% |
@@ -89,7 +91,7 @@ MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（双 RTX
 | 显卡 | 状态 |
 |---|---|
 | Blackwell（SM120） | 开发和测速平台（RTX PRO 5000 72 GB），下面的测速都在这上面测；另已在 RTX PRO 6000 Blackwell 96 GB（Colab G4）上实测 Qwen3.8 整模型（含 MTP，照抄 0/8）与全量免模型单测 |
-| Ada / RTX 40 系 & L4（SM89） | 支持。RTX 4090 实测：Qwen3.8 整模型在单卡 24 GB + 120 GB 内存上照抄 0 错、120K 上下文（[配置](configs/qwen38-rtx4090-3090/README.md)）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证；GLM 要关投机解码（[报告](docs/reports/2026-10-29-rtx40.md)）。另已在 NVIDIA L4 24 GB（50% SSD 冷专家）上实测 Qwen3.8 整模型与全量免模型单测 |
+| Ada / RTX 40 系 & L4 / L20（SM89） | 支持（含社区贡献的 `2×L20 TP=2` DeepSeek V4.1 配置，见 [configs/ds41-l20-tp2/](configs/ds41-l20-tp2/README.md)）。RTX 4090 实测：Qwen3.8 整模型在单卡 24 GB + 120 GB 内存上照抄 0 错、120K 上下文（[配置](configs/qwen38-rtx4090-3090/README.md)）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证；GLM 要关投机解码（[报告](docs/reports/2026-10-29-rtx40.md)）。另已在 NVIDIA L4 24 GB（50% SSD 冷专家）上实测 Qwen3.8 整模型与全量免模型单测 |
 | Ampere / RTX 30 系（SM86） | 支持。RTX 3090 实测：Qwen3.8 整模型在单卡 24 GB 上照抄 0 错、120K 上下文，decode 约 42 tok/s（云主机 28 个 CPU 线程）；GLM-5.3 截层、DeepSeek V4.1 单层测试通过，整模型在本机模拟验证。FP8 全部软件解码（与硬件逐位相同），GLM 用 BF16 KV、要关投机解码。详见[报告](docs/reports/2026-10-29-rtx30.md) |
 | Ampere / A100（SM80） | 支持。NVIDIA A100 40 GB 实测：Qwen3.8 整模型（含 MTP=0/1，110 槽 + NVMe PLE）照抄均 0/8，全量免模型单测通过。FP8 权重与 KV 全部软件解码（与硬件逐位相同）；首次启动 Marlin FP8 PTX JIT 约需 6–7 分钟，后续复用缓存 |
 
@@ -142,6 +144,18 @@ XTIER_GPU2_SLOTS=auto CUDA_VISIBLE_DEVICES=快卡,慢卡 bash configs/qwen38-rtx
 用 [bench/agent_bench.py](bench/agent_bench.py) 模拟编码代理：5 个会话从 64K 到约 500K，铺满 512K KV 池，多步调用工具，同一次启动
 连跑两轮。冷 prefill = 会话第一个请求里未命中缓存的 token / 首字，decode 只算长回复（≥ 300 token）。基线 = 启动台「关加速包」：
 官方 SGLang main 加 XTier 的混合推理和跑起来必需的修正，不开提速项，**不是原版 SGLang**。配置、精度和原始数据见[测速细节](docs/benchmarks.md)。
+
+### Hunyuan-4-Flash NVFP4
+
+RTX PRO 5000 72 GB · 1M KV 池 / 1M 上下文 / 4 并发（混合 SWA+DSA NVFP4 KV `7.95 GB`、208 层 FP8/W8A8、共享专家掩蔽、Engram NVMe 32 GiB L1 优先直映、152→289 弹性槽、48K 分块）：
+
+| 模式 | 单路 decode（bs=1） | 4 并发合计（bs=4） | 100K 召回 prefill | 4×128K 并发 prefill | 876K–950K 冷 prefill | 超长缓存 decode |
+|---|---:|---:|---:|---:|---:|---:|
+| XTier + 加速包 + **DFly2（默认，截断 0.20）** | **92.1**（稳态 124–152，照抄 306） | **186.8–190.4**（稳态 209–226） | 3,630（PASS） | 3,565 | 3,454（876K） | **87.5–110.8**（876K 稳态） |
+| XTier + 加速包（无投机） | 70.0（稳态） | 197.5–202.4（稳态） | 3,858（PASS） | 3,565 | 3,466（950K） | 68.6（950K 稳态） |
+| 初次跑通基线（全量 FP8 KV `32.32 GB`，BF16 稠密层） | 55–56（稳态） | 148–162（稳态） | 3,657（PASS） | — | 3,084（950K） | 43.8（950K 壁钟） |
+
+零补丁原生 5 层 DFly2 投机解码通过 `SpeculativeAlgorithm.register('DFLY')` 注册，内置融合 group-128 FP8 草稿 `lm_head` 与零分配 Triton 置信度截断（默认 `XTIER_DSPARK_TRUNCATE=0.20`，验证无损）：`bench/decode_speed.py` 混合推理/代码单路均速 92.1 tok/s（代码/文本稳态 124–152 tok/s，峰值 175 tok/s），`bench/copy_test.py` 照抄 `0/4` 差、接受长度 `5.80–5.84`、双路达 **298.8–306.1 tok/s**，PPL 100% 无损（`all nll = 2.329`），876K 缓存 decode 零 OOM 重试。
 
 ### DeepSeek V4.1 Flash 1017
 
@@ -246,6 +260,7 @@ SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速
 
 ## 版本更新
 
+- 2026-11-23（v0.1.9）：新增 **Hunyuan-4-Flash NVFP4** 完整加速包与启动台卡片（1M KV 池 / 1M 上下文 / 4 并发，全链路零 SGLang 源码补丁），并上线 **三层差异感知快速发版验证流程**（`tools/fast_verify.py`）。Hy4-Flash 特性：CPU 引擎与信箱扩展 `MAX_K=16` 与 `<1536,1536>` 特化；混合 SWA+DSA NVFP4 KV（`32.32 → 7.95 GB`）配 L2 聚簇解包走 FlashInfer；原生 FP8 Tensor Core IndexPool 变长 Top-K；64.7 GB Engram 行表放 NVMe（L1 优先直映）；208 层 FP8/W8A8 + 共享专家掩蔽 CPU 等待；零补丁原生 5 层 DFly2 投机解码（融合 FP8 草稿词表头 + 零分配 Triton 置信度截断 `XTIER_DSPARK_TRUNCATE=0.20`），`bs=1` 均速 92.1（稳态 124–152、照抄 306）tok/s、`bs=4` 186.8–190.4（稳态 226）tok/s、876K 缓存 decode 88–111 tok/s、照抄 0/4、PPL 无损。修复 `kv_fp4` 静态 gather 缓冲在短 prefill 扩容并触发弹性 `empty_cache()` 时的 CUDA 图悬垂指针隐患并补齐单测；`fp8_weights` 快核扩展至 `MAX_M=32`。社区贡献与兼容加固：合入 NVIDIA L20（SM89）16 组 FP8 GEMM 配置与 `2×L20 TP=2` DeepSeek 配置（#18）、SM86/89 软件 E4M3 位运算提速（#7）、SM89 block-FP8 钩子 `USE_INT64_OFFSETS` 签名守卫（#19）。发版验证：Tier 3 全量发布清单收敛为最新 3 个主力模型（`hy4flash`、`ds41`、`qwen38`），其余较早模型走 Tier 2 快速通道（`--models fast-track`）；本次 Tier 0（5/5）+ Tier 1（13/13）+ Tier 2（`hy4flash`、`glm53`、`ds41`）全绿通过。
 - 2026-11-22（v0.1.8）：跟进官方 SGLang main `4ce41378f9`（`084a5e9aae` 之后 672 个提交），并打包合入 11-19 的 **9,000+ 无损 prefill / 工具回传 1.1 s** 优化与 **通用层默认 CPU 多模态解码 + 核数限流**（`XTIER_CPU_IMAGE=1`、`XTIER_MM_CPU_WORKERS`，Tokenizer/API 进程 0 显存占用、避免默认 128 进程 fork 争抢 MoE 核）。依赖更新：`sglang-kernel 0.4.11`、`sgl-deep-gemm 0.2.9`、`sgl-fa3 0.1.0`、`tml-renderers 0.4.2`（torch 2.14.1+cu130 与 FlashInfer 0.7.4 不变）。移除上游已原生合入的 DS SM120 索引器与 EAGLE 热词表拒绝采样钩子（解锁上游 `use_fused_draft_sample`，GLM-5.3 每步 decode 快约 1–1.5 ms）。三个模型全量回归（含 DeepSeek 4 路高分多图 CPU 解码、固定验证、序号回绕与模拟 SM86）全部通过。[报告](docs/reports/2026-11-22-sglang-4ce4137.md)
 - 2026-11-19：全链路 100% 无损预填突破 9,000 tok/s 与工具回传提速（不改 48K 默认分块）。通用层：`_run_fp4` 锁页预重排 `UE8M0` 缩放 + 24 槽纯 DMA 管线 + 零同步位图/直方图 + 保序单遍 `_reduce_band` + 全双工 `CPU_SHARE`；`engine.cpp` 对 `m > 16` 放开动态工作窃取与私有 L2 缓冲；`hybrid_prefill` 持久化锁页缓冲；HTTP 入口并行 BPE 分词（7.5 倍）；`elastic.py` 补齐 2,048 暂存档位边界。DeepSeek 加速包：SM120 PTX 精确 `mhc.post`（消除 +22.5 GiB 显存尖峰）、24-bit `bf16x3` mHC 投影、`>=512` 行 CUTLASS MXFP8 自调优、L2 分组 BF16 `wo_a` 预填核、非末尾分块跳过冗余 SWA 重放及 640 token 混合预填阈值。DeepSeek V4.1 的 `agent_bench` 冷 prefill 64K 升至 5,719 / 7,713、500K 升至 8,950 / 8,930 tok/s（384K–500K 达 8,894–9,085 tok/s，458K 单次冷提示 9,180 tok/s），长回复 159.0 tok/s，743 token 工具回传首字 2.07 → 1.12 s；58 项单测、TSan/ASan、PPL、序号回绕与多模型回归全数通过，细节见[报告](docs/reports/2026-11-19-lossless-9k-prefill.md)。
 - 2026-11-18（v0.1.7）：无损 prefill 融合、Engram 跨块预热与 DSpark 上下文草稿检索（Recall，启动台默认开、主模型验证无损）。DeepSeek V4.1 冷 prefill 64K 升至 5,568 / 7,158、500K 升至 7,677 / 7,590 tok/s；agent_bench 长回复 153.5–154.0 tok/s、每步 28.8 ms（含工具调用的全部请求 180.4 tok/s、每步 26.5 ms）；4 个请求同时新写 258 tok/s（基于原文件改写 / 编辑时 332–382 tok/s）。通用层同步优化 1K–6K FP4 预填、NVMe 行表去重预热与弹性热专家槽保护；三个模型的整模型回归、PPL 和各 15 分钟 dsh 真实任务均 0 错通过，细节见[报告](docs/reports/2026-11-18-lossless-prefill-recall.md)。
