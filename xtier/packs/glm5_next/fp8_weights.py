@@ -26,7 +26,7 @@ from xtier.arch import e4m3_f32
 
 logger = logging.getLogger(__name__)
 GROUP = 128
-MAX_M = 16
+MAX_M = 32
 INCLUDE = r'[.](self_attn|mlp)[.]|eh_proj'
 EXCLUDE = r'(fused_qkv_a_proj|kv_b_proj|shared_experts|[.]gate$|visual|vision|weights_proj)'
 
@@ -140,7 +140,8 @@ _W8_CFG = {(4096, 8192): (64, 4, 2), (16384, 1536): (64, 4, 2), (4096, 16384): (
            # Hunyuan-4-Flash (o_proj, linear_gate, q_b_proj)
            (3072, 16384): (64, 4, 2), (16384, 3072): (64, 4, 2),
            (3072, 8192): (64, 4, 4), (8192, 3072): (64, 4, 3),
-           (16384, 1024): (64, 4, 3), (8192, 1024): (128, 8, 2)}
+           (16384, 1024): (64, 4, 3), (8192, 1024): (128, 8, 2),
+           (18432, 3072): (64, 4, 3), (3072, 9216): (64, 4, 4)}
 
 
 def gemm_w8(x, q, s, bias=None, cnt=None):
@@ -154,10 +155,11 @@ def gemm_w8(x, q, s, bias=None, cnt=None):
     bn, warps, stages = _W8_CFG.get((n, k), (block_n, 4, 3))
     if cnt is None or cnt.numel() < triton.cdiv(n, bn):
         cnt = torch.zeros(triton.cdiv(n, bn), dtype=torch.int32, device=x.device)
-    part = torch.empty((slices, MAX_M, n), device=x.device, dtype=torch.float32) if slices > 1 else x
+    bm = 16 if m <= 16 else 32
+    part = torch.empty((slices, bm, n), device=x.device, dtype=torch.float32) if slices > 1 else x
     y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
     _w8_fused[(triton.cdiv(n, bn), slices)](x, q.view(torch.uint8), s, part, cnt, bias if bias is not None else x, y, m, n, k, span,
-                                            k // GROUP, slices, MAX_M, bn, block_k, bias is not None,
+                                            k // GROUP, slices, bm, bn, block_k, bias is not None,
                                             num_warps=warps, num_stages=stages)
     return y
 

@@ -36,8 +36,14 @@ export XTIER_DOWN_PRECISION=${XTIER_DOWN_PRECISION:-bf16} XTIER_PREFILL_TILE_M=$
 export XTIER_GATE_BN=${XTIER_GATE_BN:-128} XTIER_GATE_LAUNCH=${XTIER_GATE_LAUNCH:-8,3}
 export XTIER_DOWN_BN=${XTIER_DOWN_BN:-128} XTIER_DOWN_BK=${XTIER_DOWN_BK:-64} XTIER_DOWN_LAUNCH=${XTIER_DOWN_LAUNCH:-8,3}
 BATCH=${BATCH:-49152}
+DFLY=${DFLY:-1}
 EXTRA=()
 if [ "${XTIER_HY4_HYBRID_SWA}" != "0" ]; then
   EXTRA+=(--swa-full-tokens-ratio "${XTIER_HY4_SWA_RATIO:-0.125}")
+fi
+if [ "${DFLY}" != "0" ]; then
+  export XTIER_DRAFT_LMHEAD_FP8=${XTIER_DRAFT_LMHEAD_FP8:-1}
+  export XTIER_DSPARK_TRUNCATE=${XTIER_DSPARK_TRUNCATE:-0.20}
+  EXTRA+=(--speculative-algorithm DFLY --speculative-num-draft-tokens "${DFLY_BLOCK_SIZE:-6}")
 fi
 exec $D/env/bin/python -m sglang.launch_server --model-path "$M" --served-model-name "${XTIER_SERVED_MODEL:-Hy4-flash-NVFP4}"   --host 127.0.0.1 --port ${PORT:-18192} --tp-size 1 --trust-remote-code --skip-server-warmup   --max-running-requests ${MAX_RUNNING_REQUESTS:-4} --chunked-prefill-size "$BATCH" --max-prefill-tokens "$BATCH"   --context-length ${CONTEXT:-1048576} --max-total-tokens ${KV_POOL:-1048576} --mem-fraction-static ${MEM:-0.88}   --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 --page-size 64   --dsa-decode-backend flashinfer_sparse_mla --dsa-prefill-backend flashinfer_sparse_mla   --disable-shared-experts-fusion --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode full   --reasoning-parser hunyuan --tool-call-parser hunyuan --watchdog-timeout 1200   --enable-metrics --enable-cache-report --weight-loader-drop-cache-after-load "${EXTRA[@]}" "$@"

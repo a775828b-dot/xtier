@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 NVFP4_KV_DIM = 416
 FP8_KV_DIM = 656
 TRITON_DECODE_MAX_ROWS = 16
+GATHER_DECODE_MAX_ROWS = 64
 
 CALC_KV_DIM = 'sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim'
 WRITE_MLA_KV = 'sglang.srt.mem_cache.memory_pool.MLATokenToKVPool._write_mla_kv_buffer'
@@ -419,8 +420,25 @@ _GATHER_IDX_CACHE = [None]
 _GATHER_DEFAULT_SLOTS = TRITON_DECODE_MAX_ROWS * 2048  # 32768 slots (~21.5 MiB), avoids reallocation in CUDA graphs.
 
 
+def ensure_gather_buffers(slots, device):
+    """Pre-size gather-unpack FP8 scratch buffers before CUDA graph capture."""
+    cap = max(int(slots), _GATHER_DEFAULT_SLOTS)
+    fp8_buf = _GATHER_FP8_CACHE[0]
+    if fp8_buf is None or fp8_buf.device != device or fp8_buf.numel() < cap * FP8_KV_DIM:
+        _GATHER_FP8_CACHE[0] = torch.empty(cap * FP8_KV_DIM, dtype=torch.uint8, device=device)
+    idx_buf = _GATHER_IDX_CACHE[0]
+    if idx_buf is None or idx_buf.device != device or idx_buf.numel() < cap:
+        _GATHER_IDX_CACHE[0] = torch.empty(cap, dtype=torch.int32, device=device)
+
+
 def gather_unpack_nvfp4_to_fp8(kv_cache, indices):
-    """Gather-unpack only decode ``indices`` into an L2-hot FP8 scratch buffer (CUDA-graph safe)."""
+    """Gather-unpack only decode ``indices`` into an L2-hot FP8 scratch buffer (CUDA-graph safe).
+
+    Once the static scratch buffers exist, larger eager calls (e.g. short prefills with
+    ``rows <= GATHER_DECODE_MAX_ROWS``) allocate transient buffers instead of replacing the
+    cached tensors so pointers already captured into CUDA graphs are never freed by
+    ``torch.cuda.empty_cache()``.
+    """
     rows, topk = indices.shape
     total = rows * topk
     if total == 0:
@@ -431,13 +449,17 @@ def gather_unpack_nvfp4_to_fp8(kv_cache, indices):
     idx = indices if indices.is_contiguous() else indices.contiguous()
     cap = max(total, _GATHER_DEFAULT_SLOTS)
     fp8_buf = _GATHER_FP8_CACHE[0]
-    if fp8_buf is None or fp8_buf.device != kv_cache.device or fp8_buf.numel() < cap * FP8_KV_DIM:
+    if fp8_buf is None or fp8_buf.device != kv_cache.device:
         fp8_buf = torch.empty(cap * FP8_KV_DIM, dtype=torch.uint8, device=kv_cache.device)
         _GATHER_FP8_CACHE[0] = fp8_buf
+    elif fp8_buf.numel() < total * FP8_KV_DIM:
+        fp8_buf = torch.empty(total * FP8_KV_DIM, dtype=torch.uint8, device=kv_cache.device)
     idx_buf = _GATHER_IDX_CACHE[0]
-    if idx_buf is None or idx_buf.device != kv_cache.device or idx_buf.numel() < cap:
+    if idx_buf is None or idx_buf.device != kv_cache.device:
         idx_buf = torch.empty(cap, dtype=torch.int32, device=kv_cache.device)
         _GATHER_IDX_CACHE[0] = idx_buf
+    elif idx_buf.numel() < total:
+        idx_buf = torch.empty(total, dtype=torch.int32, device=kv_cache.device)
 
     flat_src = kv_cache.view(torch.uint8).reshape(-1)
     flat_dst = fp8_buf[:total * FP8_KV_DIM]

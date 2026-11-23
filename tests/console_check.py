@@ -190,6 +190,9 @@ assert argv_hy4[0].endswith('run-hy4-xtier.sh') and env_hy4['XTIER_HY4_KV_FP4'] 
 assert env_hy4['BATCH'] == '49152' and env_hy4['XTIER_CACHE_SLOTS'] == '152'
 assert env_hy4['XTIER_CACHE_ELASTIC'] == '1' and env_hy4['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '288'
 assert env_hy4['KV_POOL'] == '1048576' and env_hy4['XTIER_ENGRAM_CACHE_GIB'] == '32'
+assert env_hy4['DFLY'] == '1' and env_hy4['XTIER_DSPARK_TRUNCATE'] == '0.20' and env_hy4['XTIER_DRAFT_LMHEAD_FP8'] == '1'
+env_hy4_nospec = console.build('hy4flash', {**hy4, 'spec': 'off'})[0]
+assert env_hy4_nospec['DFLY'] == '0' and env_hy4_nospec['XTIER_DSPARK_TRUNCATE'] == '0'
 env_hy4_fp8 = console.build('hy4flash', {**hy4, 'kv': 'fp8'})[0]
 assert env_hy4_fp8['XTIER_HY4_KV_FP4'] == '0' and env_hy4_fp8['XTIER_CACHE_SLOTS'] == '120'
 assert env_hy4_fp8['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '256'

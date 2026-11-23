@@ -83,7 +83,7 @@ def _moe_forward(original, self, hidden_states, forward_batch=None, apply_out_no
     bit-identical numerics and full CUDA-graph safety.
     """
     if (hidden_states.shape[0] == 0
-            or hidden_states.shape[0] > 16
+            or hidden_states.shape[0] > 32
             or getattr(self, 'shared_experts', None) is None):
         return original(self, hidden_states, forward_batch, apply_out_norm=apply_out_norm)
     from sglang.srt.models.hunyuan_v4_flash import _maybe_all_reduce
@@ -190,7 +190,7 @@ def _flashinfer_sparse_mla_forward(
         if rows <= kv_fp4.TRITON_DECODE_MAX_ROWS and kv_fp4.triton_fp8_decode_enabled():
             return kv_fp4.triton_sparse_mla_decode(q, kv_cache, indices, sink, sm_scale, kv_cache_dim)
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-        if rows <= kv_fp4.TRITON_DECODE_MAX_ROWS:
+        if rows <= kv_fp4.GATHER_DECODE_MAX_ROWS:
             fp8_buf, block_tables = kv_fp4.gather_unpack_nvfp4_to_fp8(kv_cache, indices)
             kv_arg = fp8_buf
             bt_arg = block_tables.unsqueeze(1)
@@ -273,15 +273,16 @@ def _run_post_process_pass(original, server_args, fn):
 
 
 def install_serving(registry, hook_type):
-    from xtier.packs.hy4_flash import swa
+    from xtier.packs.hy4_flash import dfly, swa
 
     registry.register(RUN_POST_PROCESS, _run_post_process_pass, hook_type.AROUND)
     swa.install_serving(registry, hook_type)
+    dfly.install_serving(registry, hook_type)
     return True
 
 
 def install(registry, hook_type):
-    from xtier.packs.hy4_flash import engram, indexpool_fp8, kv_fp4, swa
+    from xtier.packs.hy4_flash import dfly, engram, indexpool_fp8, kv_fp4, swa
 
     registry.register(DECODER_LAYER_INIT, _decoder_layer_init, hook_type.AFTER)
     registry.register(MOE_INIT, _moe_init, hook_type.AFTER)
@@ -295,4 +296,5 @@ def install(registry, hook_type):
     swa.install(registry, hook_type)
     kv_fp4.install(registry, hook_type)
     indexpool_fp8.install(registry, hook_type)
+    dfly.install(registry, hook_type)
     engram.install(registry, hook_type)
