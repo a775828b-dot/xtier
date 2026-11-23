@@ -253,6 +253,9 @@ def _is_sm89(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) == (8, 9)
 
 
+_SM89_HOPPER_HAS_I64_OFFSETS = None
+
+
 def _w8a8_block_fp8_sm89(original, A, B, As, Bs, block_size, output_dtype=None):
     import torch
     if output_dtype is None:
@@ -283,11 +286,20 @@ def _w8a8_block_fp8_sm89(original, A, B, As, Bs, block_size, output_dtype=None):
     def grid(META):
         return (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), split_k)
 
+    global _SM89_HOPPER_HAS_I64_OFFSETS
+    if _SM89_HOPPER_HAS_I64_OFFSETS is None:
+        import inspect
+        _SM89_HOPPER_HAS_I64_OFFSETS = (
+            'USE_INT64_OFFSETS' in inspect.signature(fk._w8a8_block_fp8_matmul_hopper.fn).parameters
+        )
+    kernel_kwargs = dict(needs_masking=needs_masking)
+    if _SM89_HOPPER_HAS_I64_OFFSETS:
+        kernel_kwargs['USE_INT64_OFFSETS'] = max(A.numel(), partials.numel()) >= 2**31
     fk._w8a8_block_fp8_matmul_hopper[grid](
         A, B, partials, As, Bs, M, N, K, block_n, block_k,
         A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2), C.stride(-1),
         As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0),
-        **config, needs_masking=needs_masking, USE_INT64_OFFSETS=max(A.numel(), partials.numel()) >= 2**31,
+        **config, **kernel_kwargs,
     )
     if split_k > 1:
         fk._reduce_block_fp8_split_k[(triton.cdiv(M * N, 256),)](partials, C, M * N, split_k, 256)
