@@ -11,7 +11,7 @@
 | **Tier 0（静态与契约门禁）** | **~10 s**（无 GPU） | 每次提交 / 推 `main` | `repo_check`、`planner_check`、`console_check --fast`（成对采样覆盖全部卡片，替代 280 万笛卡尔积）、`check_sglang --strict`（改核心/平台/钩子时同步跑 `--emulate sm86`） |
 | **Tier 1（差异感知单层 GPU 单测）** | **1–3 min** | 每次推 `main` / 小改动 | 根据 `git diff --name-only <base>` 自动匹配受影响模块的单测与代表 preset（`glm53` NVFP4 / `ds41_1017` MXFP4 / `hy4flash` NVFP4 top-16 / 各模型 pack 单测） |
 | **Tier 2（代表模型快检，单次启动）** | **5–7 min / 模型** | 常规推送 `main` / 候选版本 | 仅改单个模型 pack 时跑该模型；改核心层时跑代表锚点模型（覆盖 NVFP4 + MXFP4 + SWA/DSA + EAGLE/DSpark + Engram）。每个模型**只启动一次**，串行跑完 5 项门禁：启动与零致命日志扫描 → 4 块 2 并发照抄 → 2×4096 PPL → bs=1/并发 decode 速度 → 64K 大海捞针 + 零显存分配重试 |
-| **Tier 3（全量发布清单，见下 §1–§5）** | **2–4 h** | 大版本发版 / 跟进 SGLang 主线 | 全模型 520K/950K 长上下文、15 分钟 `dsh`、`abuse_test`、`2^31` 回绕、`SM86` 真机/模拟、干净 checkout 按快速开始演练 |
+| **Tier 3（全量发布清单，见下 §1–§5）** | **1.5–3 h** | 大版本发版 / 跟进 SGLang 主线 | **仅校验最新 3 个主力模型**（当前：`hy4flash`、`ds41`、`qwen38`）的 520K/950K 长上下文、15 分钟 `dsh`、`abuse_test`、`2^31` 回绕、`SM86` 真机/模拟、干净 checkout 演练；**其余较早模型**（如 `glm53` 等）统一走 **Tier 2 快速校验通道** |
 
 ```bash
 # 仅跑 Tier 0 + Tier 1（~1–3 min）
@@ -20,6 +20,9 @@ python tools/fast_verify.py --tier 1 --base origin/main
 # 跑 Tier 0 + 1 + 2（默认按 git diff 自动选模型，也可用 --models 指定）
 python tools/fast_verify.py --tier 2 --base origin/main
 python tools/fast_verify.py --tier 2 --base origin/main --models hy4flash,glm53
+
+# 大版本发版时：最新 3 个主力模型走 §3 全量 Tier 3，其余较早模型走 Tier 2 快速通道
+python tools/fast_verify.py --tier 2 --base origin/main --models fast-track
 
 # 预览将执行的检查项（不真正运行）
 python tools/fast_verify.py --tier 2 --base origin/main --dry-run
@@ -51,8 +54,8 @@ export CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 PATH=$CUDA_HOME
 
 | 内容 | 命令（都在 `tests/` 下） |
 |---|---|
-| 不需要模型 | `fp4_decode_check` `fp8_decode_check` `fp8_encode_check` `qsa_decode_check` `qsa_fp4_check` `qsa_fp8_check` `qsa_prefill_check` `ds_sparse_mla_check` `ds_fp8_soft_check` `hc_mix_check` `ple_blocks_check` `swiglu_oai_check` `spec_truncate_check` `glm_indexer_torch_check` `draft_bf16_check` `draft_lmhead_fp8_check` `ds_mxfp8_rows_check` `fp8_weights_check` `elastic_check` `elastic_need_check` `elastic_release_check` `elastic_chunk_check` `elastic_critical_check` `tables_check` `table_lookup_check` `ds_wo_a_check` `ds_w8a16_check` `direct_load_check` `pool_wrap_check` `prefill_errors_check` `startup_checks_check` |
-| 每个模型（`--preset ds41_1017`、`glm53`、`qwen38`） | `formats_check`；`mailbox_check --threads N`；`cache_check --threads N --slots 64`；`hybrid_prefill_check --threads N --slots 64 --lengths 100,500,1000`；`resident_prefill_check`；`miss_gpu_check --threads N`；DeepSeek 另跑 `prefill_fp4_retry_check`（SM120 的 FP4 prefill 失败后重跑）、`prefill_cpu_share_check --threads N`（CPU 分担 prefill） |
+| 不需要模型 | `fp4_decode_check` `fp8_decode_check` `fp8_encode_check` `qsa_decode_check` `qsa_fp4_check` `qsa_fp8_check` `qsa_prefill_check` `ds_sparse_mla_check` `ds_fp8_soft_check` `hc_mix_check` `ple_blocks_check` `swiglu_oai_check` `spec_truncate_check` `glm_indexer_torch_check` `draft_bf16_check` `draft_lmhead_fp8_check` `ds_mxfp8_rows_check` `fp8_weights_check` `elastic_check` `elastic_need_check` `elastic_release_check` `elastic_chunk_check` `elastic_critical_check` `tables_check` `table_lookup_check` `ds_wo_a_check` `ds_w8a16_check` `direct_load_check` `pool_wrap_check` `prefill_errors_check` `startup_checks_check` `hy4_flash_check` `sm89_block_fp8_check` |
+| 主力模型（`--preset hy4flash`、`ds41_1017`、`qwen38`，另按需带 `glm53`） | `formats_check`；`mailbox_check --threads N`；`cache_check --threads N --slots 64`；`hybrid_prefill_check --threads N --slots 64 --lengths 100,500,1000`；`resident_prefill_check`；`miss_gpu_check --threads N`；DeepSeek 另跑 `prefill_fp4_retry_check`（SM120 的 FP4 prefill 失败后重跑）、`prefill_cpu_share_check --threads N`（CPU 分担 prefill） |
 | CPU 模拟多卡 | `tp_check --preset glm53 --tp 2` |
 | 冷专家（往盘上写测试数据） | `cold_punch_check DIR`（再用 `XTIER_COLD_UNITS=3` 跑一次）；`cold_sole_copy_check DIR`；`cold_passes_check DIR1 DIR2`；`cold_prefill_check --store DIR1 DIR2` |
 | 两张卡 | `second_gpu_check` |
@@ -61,9 +64,11 @@ export CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 PATH=$CUDA_HOME
 
 CPU 引擎改了的话，再用线程检查（TSan）和内存检查（ASan、UBSan）构建引擎跑一遍并发驱动程序，0 报告：`tests/engine_san.sh thread|address DIR`（DIR 在支持 O_DIRECT 的盘上）。
 
-## 3. 整模型回归（每个模型）
+## 3. 整模型回归（Tier 3：最新 3 个主力模型）
 
-三个模型都用启动台默认配置，每项都要通过：
+Tier 3 全量回归固定覆盖**最新 3 个支持模型**（当前清单：**`hy4flash`（Hunyuan-4-Flash）**、**`ds41`（DeepSeek-V4.1-Flash）**、**`qwen38`（Qwen3.8-Flash）**）；每新增一个新主力模型时滚动替换最旧项。其余模型（如 `glm53` 等）发版前统一走 Tier 2 快速通道（`python tools/fast_verify.py --tier 2 --models fast-track`），不再逐项跑满全量清单。
+
+以下 3 个主力模型都用启动台默认配置，每项都要通过：
 
 | 测试 | 命令 | 通过标准 |
 |---|---|---|

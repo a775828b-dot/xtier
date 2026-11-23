@@ -45,6 +45,11 @@ sys.path.insert(0, str(ROOT))
 
 FATAL_LOG_RE = re.compile(r'Traceback|OutOfMemoryError|CUDA out of memory|FATAL|Scheduler hit|does not know')
 
+# Tier 3 full release checklist covers the latest 3 flagship models; older/other models validate
+# through the Tier 2 fast channel (`--models fast-track`).
+TIER3_MODELS = ('hy4flash', 'ds41', 'qwen38')
+FAST_TRACK_MODELS = ('glm53',)
+
 # Model metadata for Tier 2 compact live probes (mapped by xtier/console model id).
 MODEL_META = {
     'hy4flash': {
@@ -190,7 +195,20 @@ def select_tier1_tests(scopes):
 
 def select_tier2_models(scopes, explicit_models):
     if explicit_models:
-        return [m.strip() for m in explicit_models.split(',') if m.strip()]
+        out = []
+        for raw in explicit_models.split(','):
+            tok = raw.strip()
+            if not tok:
+                continue
+            if tok == 'tier3':
+                out.extend(TIER3_MODELS)
+            elif tok == 'fast-track':
+                out.extend(FAST_TRACK_MODELS)
+            elif tok == 'all':
+                out.extend(MODEL_META.keys())
+            else:
+                out.append(tok)
+        return list(dict.fromkeys(out))
     sc = set(scopes)
     models = []
     if 'hy4' in sc:
@@ -416,7 +434,7 @@ def main():
     ap = argparse.ArgumentParser(description='Tiered, diff-aware fast release verification for XTier')
     ap.add_argument('--tier', type=int, choices=(0, 1, 2), default=2, help='Highest tier to run (0=static, 1=+unit, 2=+live)')
     ap.add_argument('--base', default='origin/main', help='Git ref to diff against (default: origin/main)')
-    ap.add_argument('--models', default='', help='Comma-separated Tier 2 models override (e.g. hy4flash,glm53)')
+    ap.add_argument('--models', default='', help='Comma-separated Tier 2 models or aliases: tier3, fast-track, all (e.g. hy4flash,glm53)')
     ap.add_argument('--port', type=int, default=0, help='Optional fixed port for Tier 2 servers')
     ap.add_argument('--out', default='', help='Optional JSON summary output path')
     ap.add_argument('--dry-run', action='store_true', help='Print verification plan without executing')
