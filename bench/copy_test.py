@@ -24,6 +24,7 @@ P.add_argument('--concurrency', type=int, default=1)
 P.add_argument('--tag', required=True)
 P.add_argument('--source', default='/data/fast/workspaces/ds41-1017/source/python/sglang/srt/managers/scheduler.py')
 P.add_argument('--ignore-first-indent', action='store_true')
+P.add_argument('--reasoning-effort', default='')
 P.add_argument('--temperature', type=float, default=0.0)
 P.add_argument('--out', default='bench/results/copy')
 A = P.parse_args()
@@ -37,7 +38,8 @@ url = f'http://127.0.0.1:{A.port}/v1/chat/completions'
 
 def run(c):
     body = dict(model=A.model, temperature=A.temperature, max_tokens=4000, stream=False,
-                chat_template_kwargs={'enable_thinking': False},
+                chat_template_kwargs=({'reasoning_effort': A.reasoning_effort} if A.reasoning_effort
+                                      else {'enable_thinking': False}),
                 messages=[{'role': 'user', 'content': '把 <src> 和 </src> 之间的内容逐字原样输出，不要增删改任何字符，'
                            '不要加代码块标记，不要解释。\n<src>\n' + c + '\n</src>'}])
     req = urllib.request.Request(url, json.dumps(body).encode(), {'Content-Type': 'application/json'})

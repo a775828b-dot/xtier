@@ -17,6 +17,9 @@ PRESETS = {
     'ds41_1017': ('/data/fast/nvme1/models/deepseek-ai/DeepSeek-V4.1-Flash-1017', 'layers.{layer}.ffn.experts.{e}.', ('w1', 'w3', 'w2'),
                   5120, 2304, 384, 6, 10.0, 20, 6, 'mxfp4', {'DYNAMIC': '2', 'DOWN_BF16': '1', 'DOWN_GRAIN': '24', 'SPIN_COUNT': '1048576', 'THP': '0'}),
     # compressed-tensors NVFP4 W4A4 (weight_packed, weight_global_scale = 1 / scale_2)
+    'hy4flash': ('/data/fast/nvme1/models/huggingface/atakans/Hy4-flash-NVFP4', 'model.layers.{layer}.mlp.experts.{e}.',
+                 ('gate_proj', 'up_proj', 'down_proj'), 1536, 1536, 512, 16, 10.0, 20, 4, 'nvfp4',
+                 {'DYNAMIC': '2', 'DOWN_BF16': '1', 'SPIN_COUNT': '1048576'}),
     'minimax_m31': ('/data/fast/nvme2/models/modelscope/MiniMax/MiniMax-M3.1-Flash', 'language_model.model.layers.{layer}.block_sparse_moe.experts.{e}.',
                     ('w1', 'w3', 'w2'), 6144, 3072, 128, 4, 7.0, 20, 8, 'nvfp4', {'SPIN_COUNT': '1048576'}),
 }

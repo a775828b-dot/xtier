@@ -52,6 +52,39 @@ assert not any('CPUWeight' in a for a in scoped._wrap('u-guard', ['guard'])), sc
 assert scoped._wrap('u', ['server'], 0)[-1] == 'server' and console._wrap('u', ['server'], 10000) == ['server']
 assert core.Console(models, tempfile.mkdtemp(prefix='xtier-console-'), runner='systemd', cpu_weight=0).cpu_weight == 0
 
+FAST = '--fast' in sys.argv
+FAST_CAP = 20000
+
+
+def _sample_forms(m, d):
+    """Default + all 1-way, 2-way pairwise, and note/off_when boundary forms (for --fast on huge cards)."""
+    opts = m['options']
+    keys = [o['key'] for o in opts]
+    seen, out = set(), []
+
+    def add(form):
+        key = tuple(form[k] for k in keys)
+        if key not in seen:
+            seen.add(key)
+            out.append(form)
+
+    add(dict(d))
+    for o in opts:
+        for val, _ in o['choices']:
+            add({**d, o['key']: val})
+    for i, oi in enumerate(opts):
+        for oj in opts[i + 1:]:
+            for vi, _ in oi['choices']:
+                for vj, _ in oj['choices']:
+                    add({**d, oi['key']: vi, oj['key']: vj})
+    for n in m.get('notes', []):
+        add({**d, **n['when']})
+    for o in opts:
+        for cond in o.get('off_when', []):
+            add({**d, **cond})
+    return out
+
+
 combos = 0
 for mid, m in models.items():
     keys = [o['key'] for o in m['options']]
@@ -66,8 +99,12 @@ for mid, m in models.items():
             assert set(cond) <= set(keys), (mid, o['key'], cond)
     for n in m.get('notes', []):
         assert set(n['when']) <= set(keys), (mid, n)
-    for values in itertools.product(*[[c[0] for c in o['choices']] for o in m['options']]):
-        form = dict(zip(keys, values))
+    total = 1
+    for o in m['options']:
+        total *= len(o['choices'])
+    forms = (_sample_forms(m, d) if FAST and total > FAST_CAP
+             else (dict(zip(keys, v)) for v in itertools.product(*[[c[0] for c in o['choices']] for o in m['options']])))
+    for form in forms:
         if any(console.unavailable(o).get(form[o['key']]) for o in m['options']):   # not on this machine: refused
             try:
                 console.validate(mid, form)
@@ -146,6 +183,19 @@ assert console.build('ds41', {**ds, 'packs': 'off'})[0]['KV_POOL'] == '524288'
 assert 'KV 池 1M' in next(o for o in models['ds41']['options'] if o['key'] == 'context')['label']
 assert 'KV 池 1M' not in next(o for o in models['glm53']['options'] if o['key'] == 'context')['label']
 cold = next(o for o in models['ds41']['options'] if o['key'] == 'cold')
+# hy4flash defaults: NVFP4 hybrid SWA KV, 48K chunk, 152 base -> 288 elastic slots, 32 GiB L1-weighted Engram
+hy4 = console.defaults('hy4flash')
+env_hy4, argv_hy4 = console.build('hy4flash', hy4)
+assert argv_hy4[0].endswith('run-hy4-xtier.sh') and env_hy4['XTIER_HY4_KV_FP4'] == '1'
+assert env_hy4['BATCH'] == '49152' and env_hy4['XTIER_CACHE_SLOTS'] == '152'
+assert env_hy4['XTIER_CACHE_ELASTIC'] == '1' and env_hy4['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '288'
+assert env_hy4['KV_POOL'] == '1048576' and env_hy4['XTIER_ENGRAM_CACHE_GIB'] == '32'
+env_hy4_fp8 = console.build('hy4flash', {**hy4, 'kv': 'fp8'})[0]
+assert env_hy4_fp8['XTIER_HY4_KV_FP4'] == '0' and env_hy4_fp8['XTIER_CACHE_SLOTS'] == '120'
+assert env_hy4_fp8['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '256'
+env_hy4_base = console.build('hy4flash', {**hy4, 'packs': 'off'})[0]
+assert env_hy4_base['XTIER_HY4_HYBRID_SWA'] == '0' and env_hy4_base['XTIER_HY4_KV_FP4'] == '0'
+assert env_hy4_base['XTIER_CACHE_SLOTS'] == '48' and env_hy4_base['BATCH'] == '16384'
 if not console.unavailable(cold):
     env, argv = console.build('ds41', console.validate('ds41', {'cold': '30'}))
     assert env['XTIER_COLD'] == '1' and env['XTIER_COLD_FRACTION'] == '0.30' and len(env['XTIER_COLD_PATHS'].split(':')) == 4

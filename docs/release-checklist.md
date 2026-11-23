@@ -1,6 +1,31 @@
 # 发布前检查清单
 
-每次发版或跟进 SGLang 时用。[回到文档目录](README.md)
+每次推送 `main`、发版或跟进 SGLang 时用。[回到文档目录](README.md)
+
+## 0. 快速分层验证流程（推荐日常与常规发版）
+
+随着支持的模型增多（Qwen3.8 / GLM-5.3 / DeepSeek V4.1 / Hunyuan-4-Flash），每个模型都跑完 45–60 分钟全套长回归已不现实。使用 [tools/fast_verify.py](../tools/fast_verify.py) 按改动面分层验证：
+
+| 层级 | 目标耗时 | 适用场景 | 执行内容 |
+|---|---|---|---|
+| **Tier 0（静态与契约门禁）** | **~10 s**（无 GPU） | 每次提交 / 推 `main` | `repo_check`、`planner_check`、`console_check --fast`（成对采样覆盖全部卡片，替代 280 万笛卡尔积）、`check_sglang --strict`（改核心/平台/钩子时同步跑 `--emulate sm86`） |
+| **Tier 1（差异感知单层 GPU 单测）** | **1–3 min** | 每次推 `main` / 小改动 | 根据 `git diff --name-only <base>` 自动匹配受影响模块的单测与代表 preset（`glm53` NVFP4 / `ds41_1017` MXFP4 / `hy4flash` NVFP4 top-16 / 各模型 pack 单测） |
+| **Tier 2（代表模型快检，单次启动）** | **5–7 min / 模型** | 常规推送 `main` / 候选版本 | 仅改单个模型 pack 时跑该模型；改核心层时跑代表锚点模型（覆盖 NVFP4 + MXFP4 + SWA/DSA + EAGLE/DSpark + Engram）。每个模型**只启动一次**，串行跑完 5 项门禁：启动与零致命日志扫描 → 4 块 2 并发照抄 → 2×4096 PPL → bs=1/并发 decode 速度 → 64K 大海捞针 + 零显存分配重试 |
+| **Tier 3（全量发布清单，见下 §1–§5）** | **2–4 h** | 大版本发版 / 跟进 SGLang 主线 | 全模型 520K/950K 长上下文、15 分钟 `dsh`、`abuse_test`、`2^31` 回绕、`SM86` 真机/模拟、干净 checkout 按快速开始演练 |
+
+```bash
+# 仅跑 Tier 0 + Tier 1（~1–3 min）
+python tools/fast_verify.py --tier 1 --base origin/main
+
+# 跑 Tier 0 + 1 + 2（默认按 git diff 自动选模型，也可用 --models 指定）
+python tools/fast_verify.py --tier 2 --base origin/main
+python tools/fast_verify.py --tier 2 --base origin/main --models hy4flash,glm53
+
+# 预览将执行的检查项（不真正运行）
+python tools/fast_verify.py --tier 2 --base origin/main --dry-run
+```
+
+---
 
 ## 1. 自动检查（CI）
 
