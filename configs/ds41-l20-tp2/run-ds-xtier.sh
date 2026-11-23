@@ -106,8 +106,8 @@ export XTIER_HYBRID_PREFILL_MAX=0           # no "uncached routes go to the CPU"
 export XTIER_SPLIT_PREFILL_MAX=${XTIER_SPLIT_PREFILL_MAX:-6144}
 export XTIER_DOWN_PRECISION=tf32 XTIER_PREFILL_TILE_M=64
 # The SM120 128-wide prefill tile does not fit in the 99 KiB of shared memory an SM89 SM has; these
-# are the L20-safe tiles (XTIER_TILES_PROD=0 keeps the source defaults).
-if [ "${XTIER_TILES_PROD:-0}" = 1 ]; then
+# are the L20-safe tiles (TILES_PROD=0 keeps the source defaults).
+if [ "${TILES_PROD:-0}" = 1 ]; then
   export XTIER_GATE_BN=${XTIER_GATE_BN:-128} XTIER_GATE_LAUNCH=${XTIER_GATE_LAUNCH:-8,3}
   export XTIER_DOWN_BN=${XTIER_DOWN_BN:-128} XTIER_DOWN_BK=${XTIER_DOWN_BK:-64} XTIER_DOWN_LAUNCH=${XTIER_DOWN_LAUNCH:-8,3}
 fi
