@@ -74,6 +74,7 @@ def _tile_k(n):
 
 _shared = {}
 _glob = {}             # table [MAX_LAYERS, E], owner [MAX_LAYERS, E], state [2], ring / seqs addresses
+_between = [None]      # optional per-call GPU work run between _kernels and mailbox.signal(2)
 
 
 @triton.jit
@@ -583,6 +584,10 @@ class LayerPool:
                                _miss['cap'], triton.next_power_of_2(m * k), _miss['cp'])
         self.mailbox.signal(stream, m, k, 1)
         self._kernels(m, k, x, routing, sc['gout'])
+        fn = _between[0]
+        if fn is not None:
+            _between[0] = None
+            fn()
         self.mailbox.signal(stream, m, k, 2)
         _unpack[(triton.cdiv(m * self.H, BLOCK),)](Pointer(sout, torch.float32), sc['gout'], Pointer(out, torch.float32),
                                                    m * self.H, BLOCK)

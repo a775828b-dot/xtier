@@ -46,7 +46,7 @@ from xtier.engine import CpuPlan, Mailbox, placement
 logger = logging.getLogger(__name__)
 SLOT_TOKENS = 16     # tokens per mailbox slot at the most (engine DECODE_M, mailbox MAX_SLOT_M, cache/pool.py MAX_M)
 SLOT_ROUTES = 128    # routes (tokens x top-k) per slot: the width of the packing kernels (kernels.pack, cache/pool.py)
-MAX_TOP_K = 10
+MAX_TOP_K = 16
 DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured graphs keep its address)
 
 

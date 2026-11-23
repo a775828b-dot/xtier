@@ -699,7 +699,7 @@ class Prefill:
 
     def _run(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16):
         global _slots, _unpacked, _pending, _copy_stream
-        if m < 1 or not 1 <= k <= 10:
+        if m < 1 or not 1 <= k <= 16:
             raise ValueError('Invalid prefill shape')
         H, I, E, CH = self.hidden, self.inter, self.experts, self.chunk
         n_chunks = (E + CH - 1) // CH

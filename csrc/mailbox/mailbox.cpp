@@ -778,7 +778,7 @@ void *xtier_mailbox_create(void *plan) {
 }
 int xtier_mailbox_prepare(void *bridge,void *stream,int m,int k,int shadow) {
     try {
-        if(!bridge||m<1||m>MAX_SLOT_M||k<1||k>10)throw std::runtime_error("Invalid bridge shape");
+        if(!bridge||m<1||m>MAX_SLOT_M||k<1||k>16)throw std::runtime_error("Invalid bridge shape");
         auto*b=static_cast<Bridge*>(bridge);std::lock_guard<std::mutex> lock(b->slot_mutex);
         b->find(static_cast<cudaStream_t>(stream),m,k,shadow!=0);return 0;
     }catch(const std::exception&e){error=e.what();return -1;}
@@ -786,7 +786,7 @@ int xtier_mailbox_prepare(void *bridge,void *stream,int m,int k,int shadow) {
 int xtier_mailbox_enqueue(void *bridge,void *stream,int m,int k,const void *x,const void *ids,
                        const void *routing,void *output,int shadow) {
     try {
-        if(!bridge||!x||!ids||!routing||!output||m<1||m>MAX_SLOT_M||k<1||k>10)
+        if(!bridge||!x||!ids||!routing||!output||m<1||m>MAX_SLOT_M||k<1||k>16)
             throw std::runtime_error("Invalid enqueue arguments");
         auto*b=static_cast<Bridge*>(bridge);
         if(b->failed.load(std::memory_order_acquire))throw std::runtime_error("Prior CPU callback failed");
@@ -803,7 +803,7 @@ int xtier_mailbox_enqueue(void *bridge,void *stream,int m,int k,const void *x,co
 }
 int xtier_mailbox_slot(void *bridge,void *stream,int m,int k,void **pointers) {
     try {
-        if(!bridge||!pointers||m<1||m>MAX_SLOT_M||k<1||k>10)throw std::runtime_error("Invalid slot query");
+        if(!bridge||!pointers||m<1||m>MAX_SLOT_M||k<1||k>16)throw std::runtime_error("Invalid slot query");
         auto*b=static_cast<Bridge*>(bridge);std::lock_guard<std::mutex> lock(b->slot_mutex);
         auto*s=b->find(static_cast<cudaStream_t>(stream),m,k,false);
         auto *base=static_cast<char*>(s->storage);
@@ -814,7 +814,7 @@ int xtier_mailbox_slot(void *bridge,void *stream,int m,int k,void **pointers) {
 }
 int xtier_mailbox_notify(void *bridge,void *stream,int m,int k) {
     try {
-        if(!bridge||m<1||m>MAX_SLOT_M||k<1||k>10)throw std::runtime_error("Invalid notify arguments");
+        if(!bridge||m<1||m>MAX_SLOT_M||k<1||k>16)throw std::runtime_error("Invalid notify arguments");
         auto*b=static_cast<Bridge*>(bridge);
         if(b->failed.load(std::memory_order_acquire))throw std::runtime_error("Prior CPU callback failed");
         auto st=static_cast<cudaStream_t>(stream);std::lock_guard<std::mutex> lock(b->slot_mutex);
@@ -824,7 +824,7 @@ int xtier_mailbox_notify(void *bridge,void *stream,int m,int k) {
 }
 int xtier_mailbox_slot2(void *bridge,void *stream,int m,int k,void **pointers) {
     try {
-        if(!bridge||!pointers||m<1||m>MAX_SLOT_M||k<1||k>10)throw std::runtime_error("Invalid slot query");
+        if(!bridge||!pointers||m<1||m>MAX_SLOT_M||k<1||k>16)throw std::runtime_error("Invalid slot query");
         auto*b=static_cast<Bridge*>(bridge);std::lock_guard<std::mutex> lock(b->slot_mutex);
         auto*s=b->find(static_cast<cudaStream_t>(stream),m,k,false);
         auto *base=static_cast<char*>(s->storage);
@@ -835,7 +835,7 @@ int xtier_mailbox_slot2(void *bridge,void *stream,int m,int k,void **pointers) {
 }
 int xtier_mailbox_signal(void *bridge,void *stream,int m,int k,int part) {
     try {
-        if(!bridge||m<1||m>MAX_SLOT_M||k<1||k>10||part<1||part>2)throw std::runtime_error("Invalid signal arguments");
+        if(!bridge||m<1||m>MAX_SLOT_M||k<1||k>16||part<1||part>2)throw std::runtime_error("Invalid signal arguments");
         auto*b=static_cast<Bridge*>(bridge);
         if(b->failed.load(std::memory_order_acquire))throw std::runtime_error("Prior CPU callback failed");
         auto st=static_cast<cudaStream_t>(stream);std::lock_guard<std::mutex> lock(b->slot_mutex);

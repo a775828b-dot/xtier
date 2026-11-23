@@ -1,6 +1,6 @@
 // Ported from lkqmoe 0.5.6 (commit 93edcc1).
 // Independent NVFP4 CPU MoE, generic over the model: hidden size H and expert
-// intermediate size I (both multiples of 64), 10..512 experts, top-k<=10, optional
+// intermediate size I (both multiples of 64), 10..512 experts, top-k<=16, optional
 // SwiGLU clamp limit, set per plan at creation. Qwen3.8 (2560/640), DeepSeek V4.1
 // (5120/2304) and GLM-5.3 (4096/2048) shapes are template-specialised from the same code;
 // other shapes use the runtime instantiation. Decode calls hold <=16 tokens (DECODE_M); synchronous prefill groups up to 2048.
@@ -82,7 +82,7 @@ namespace {
 #define XTIER_DOWN_R4 4
 #endif
 static_assert(XTIER_DOWN_R4==1||XTIER_DOWN_R4==2||XTIER_DOWN_R4==4,"XTIER_DOWN_R4 must be 1, 2 or 4");
-constexpr int MAX_M=XTIER_PREFILL_MICRO_TOKENS,MAX_K=10,MAX_BATCH=2048,MAX_EXPERTS=512,
+constexpr int MAX_M=XTIER_PREFILL_MICRO_TOKENS,MAX_K=16,MAX_BATCH=2048,MAX_EXPERTS=512,
               MAX_ROUTES=MAX_EXPERTS+(MAX_BATCH*MAX_K+MAX_M-1)/MAX_M,MAX_NODES=16,DECODE_M=16;
 static_assert(MAX_M==4||MAX_M==8,"XTIER_PREFILL_MICRO_TOKENS must be 4 or 8");
 constexpr float fp4[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};
@@ -1098,6 +1098,7 @@ template<bool MX> class Plan: public PlanBase {
         if(hidden==2560&&inter==640)run<2560,640>(node,lane,lanes);        // Qwen3.8 Flash Next
         else if(hidden==5120&&inter==2304)run<5120,2304>(node,lane,lanes); // DeepSeek V4.1 Flash
         else if(hidden==4096&&inter==2048)run<4096,2048>(node,lane,lanes); // GLM-5.3 Flash
+        else if(hidden==1536&&inter==1536)run<1536,1536>(node,lane,lanes); // Hunyuan-4-Flash
         else run<0,0>(node,lane,lanes);
     }
 

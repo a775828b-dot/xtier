@@ -74,7 +74,7 @@ int xtier_set_swiglu(void *plan, float alpha, float beta);
 int xtier_shape(void *plan, int *shape);
 
 // x: BF16 bits [m,H], ids: int32 [m,k], routing: float32 [m,k].
-// y: float32 [m,H]. m=1..2048, k=1..10. Buffers must not alias.
+// y: float32 [m,H]. m=1..2048, k=1..16. Buffers must not alias.
 // FP32 intermediate and accumulation; no BF16 rounding after SiLU.
 // One caller per plan; different plans serialize on a process-wide shared pool.
 // All active plans must request the same thread count. Create after worker spawn;
