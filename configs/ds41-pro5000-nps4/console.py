@@ -45,11 +45,11 @@ MODEL = {
     'name': 'DeepSeek V4.1 Flash 1017', 'code': 'DSV4.1-1017', 'port': 18190, 'served': 'DeepSeek-V4.1-Flash-1017',
     'spec': 'DSpark', 'arch': '40 层 · 384 专家 · Engram 189 GB 行放 NVMe · MXFP4',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2400,
-    # README agent speed (production's agent_bench, two rounds, 2026-11-19: these defaults, compact verification,
-    # context Recall on, expert calls of up to 16 tokens): decode of the long responses (>= 300 tokens),
-    # cold prefill of the 64K / 500K sessions (mean of the rounds; 384K-500K sessions reach 8,894-9,085 tok/s)
-    'bench': {'kind': 'agent', 'dec': '159.0', 'pre': '6716 / 8940',
-              'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token；含工具调用全部请求 177.1），prefill = 64K / 500K 会话的冷 prefill'},
+    # README agent speed (production's agent_bench, two rounds, 2026-11-24: these defaults, compact verification,
+    # context Recall on, expert calls of up to 24 tokens): decode of the long responses (>= 300 tokens),
+    # cold prefill of the 64K / 500K sessions (mean of the rounds; both 500K rounds exceed 9,000 tok/s)
+    'bench': {'kind': 'agent', 'dec': '155.4', 'pre': '6968 / 9030',
+              'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token；含工具调用全部请求 163.9，4 路同时新写 268），prefill = 64K / 500K 会话的冷 prefill'},
     'options': _common() + [
         # compact since 2026-11-12, with 4 running requests: a step's time goes by the rows verified in all (a tier of
         # 6 rows each), so with several requests it pays to verify fewer tokens a request
