@@ -44,8 +44,8 @@ from xtier.cache import tail
 from xtier.engine import CpuPlan, Mailbox, placement
 
 logger = logging.getLogger(__name__)
-SLOT_TOKENS = 16     # tokens per mailbox slot at the most (engine DECODE_M, mailbox MAX_SLOT_M, cache/pool.py MAX_M)
-SLOT_ROUTES = 128    # routes (tokens x top-k) per slot: the width of the packing kernels (kernels.pack, cache/pool.py)
+SLOT_TOKENS = 24     # tokens per mailbox slot at the most (engine DECODE_M, mailbox MAX_SLOT_M, cache/pool.py MAX_M)
+SLOT_ROUTES = 144    # routes (tokens x top-k) per slot: 24 tokens at top-6 (DS4.1), 18 at top-8, 14 at top-10
 MAX_TOP_K = 16
 DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured graphs keep its address)
 
@@ -92,6 +92,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self._source = None     # where the bulk parameters come from: 'copy' (the loader), 'direct', 'store'
         self._reads = []        # 'direct': the noted reads of the layer's expert tensors (direct.locate)
         self._cold_plan = None  # 'store': the layer's cold.LayerPlan
+        self._cold_max_width = None
 
     # -- construction ---------------------------------------------------------------------------------------------
     def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype,
@@ -267,10 +268,14 @@ class XTierMoEMethod(FusedMoEMethodBase):
             prefill_cold = cold.attach(self.plan, lp, inputs, self.format.name) if lp else None
         if lp is not None:   # a mailbox call (decode) reads the experts it misses all at once, it cannot go in passes
             top_k = getattr(layer, 'top_k', None) or MAX_TOP_K
-            need = min(self.experts, slot_width(top_k) * top_k)
-            if self.plan.slots < need:
+            w_def = slot_width(top_k)
+            min_w = min(16, w_def)
+            min_need = min(self.experts, min_w * top_k)
+            if self.plan.slots < min_need:
                 raise RuntimeError(f'xtier cold: layer {self.cfg.layer_id} keeps {self.plan.slots} experts in RAM, a '
-                                   f'decode call of {slot_width(top_k)} tokens can route to {need}: lower XTIER_COLD_FRACTION')
+                                   f'decode call of {min_w} tokens can route to {min_need}: lower XTIER_COLD_FRACTION')
+            if self.plan.slots < min(self.experts, w_def * top_k):
+                self._cold_max_width = max(1, self.plan.slots // top_k)
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
@@ -354,10 +359,14 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if timed:
             torch.cuda.current_stream().synchronize()
             t0 = time.perf_counter()
+        rsf = layer.moe_runner_config.routed_scaling_factor
+        scale = float(rsf) if (rsf is not None and rsf != 1.0 and not layer.should_fuse_routed_scaling_factor_in_topk) else 1.0
+        decode_fused = False
         if m <= config.decode_max() or capturing:
             if not capturing:   # short prompts never reach a prefill branch: the policy must start here too
                 self._cache_start()
-            out = self._decode(x, ids, weights, m, k)
+            out = self._decode(x, ids, weights, m, k, out_bf16=True, scale=scale)
+            decode_fused = True
             self.calls['decode'] += 1
         elif self.pool is not None and self.pool.full and config.resident_prefill():
             from xtier.cache.prefill import resident_prefill
@@ -389,36 +398,42 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if timed:
             torch.cuda.current_stream().synchronize()
             self._time(m, time.perf_counter() - t0)
-        out = out.to(x.dtype)
-        rsf = layer.moe_runner_config.routed_scaling_factor
-        if rsf is not None and rsf != 1.0 and not layer.should_fuse_routed_scaling_factor_in_topk:
-            out.mul_(rsf)
+        if not decode_fused:
+            out = out.to(x.dtype)
+            if scale != 1.0:
+                out.mul_(scale)
         return StandardCombineInput(hidden_states=out)
 
-    def _decode(self, x, ids, weights, m, k):
+    def _decode(self, x, ids, weights, m, k, out_bf16=False, scale=1.0):
         H = self.hidden
         if m > DECODE_ROWS:
             raise ValueError(f'xtier: a {m}-token call on the decode path (decode buffer: {DECODE_ROWS} tokens); prefill '
                              'cannot be captured in a CUDA graph (--cuda-graph-backend-prefill disabled), and '
                              'XTIER_DECODE_MAX must stay below the buffer')
-        out = XTierMoEMethod._decode_out.get(H)
-        if out is None:
-            out = XTierMoEMethod._decode_out[H] = torch.empty((DECODE_ROWS, H), dtype=torch.float32, device=x.device)
+        if out_bf16:
+            out = torch.empty((m, H), dtype=torch.bfloat16, device=x.device)
+            elem = 2
+        else:
+            out = XTierMoEMethod._decode_out.get(H)
+            if out is None:
+                out = XTierMoEMethod._decode_out[H] = torch.empty((DECODE_ROWS, H), dtype=torch.float32, device=x.device)
+            elem = 4
         stream = torch.cuda.current_stream().cuda_stream
         active = XTierMoEMethod._active
-        width = slot_width(k)
+        width = min(slot_width(k), self._cold_max_width) if self._cold_max_width else slot_width(k)
         for start in range(0, m, width):
             n = min(width, m - start)
             xs, ids_s, ws = x.data_ptr() + start * H * 2, ids.data_ptr() + start * k * 4, weights.data_ptr() + start * k * 4
             act = active.data_ptr() + start * 4 if active is not None else 0
+            out_ptr = out.data_ptr() + start * H * elem
             if self.pool is not None:
-                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act)
+                self.pool.decode(stream, n, k, xs, ids_s, ws, out_ptr, act, out_bf16=out_bf16, scale=scale)
                 continue
             slot = self.mailbox.slot(stream, n, k)
             kernels.pack(slot, n, k, xs, ids_s, ws, H, act)
             self.mailbox.notify(stream, n, k)
-            kernels.unpack(slot, n, out.data_ptr() + start * H * 4, H)
-        return out[:m]
+            kernels.unpack(slot, n, out_ptr, H, out_bf16=out_bf16, scale=scale)
+        return out if out_bf16 else out[:m]
 
     def _cpu_prefill(self, x, ids, weights, m, k):
         H = self.hidden

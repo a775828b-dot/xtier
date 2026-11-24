@@ -170,7 +170,7 @@ def _mix_stats_hook(original, hc, x):
 
 def _b12x_or_cutlass_hook(original, input, weight, *args, **kwargs):
     rows = input.numel() // input.shape[-1]
-    if rows >= 512:
+    if rows >= int(os.environ.get('XTIER_DS_MXFP8_CUTLASS_MIN_M', '768')):
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
         from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_blockscaled_linear
 

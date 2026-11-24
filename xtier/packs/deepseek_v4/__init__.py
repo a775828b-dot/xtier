@@ -84,6 +84,7 @@ DRAFT_PROJECT = 'sglang.srt.models.dspark.project_through_lm_head'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
 REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
 MXFP8_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_blockscaled_linear'
+MOE_FORWARD_NORMAL = 'sglang.srt.models.deepseek_v2.DeepseekV2MoE.forward_normal'
 FLASH_MLA = 'sglang.kernels.ops.attention.flash_mla_interface.flash_mla_with_kvcache'
 SPARSE_PREFILL = 'sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend._use_sparse_prefill'
 FP8_CONFIG_DIR = Path(__file__).with_name('fp8_configs')
@@ -94,6 +95,7 @@ _prefetching = {}   # Engram layer's hash index -> (its EngramEmbedding on the r
 _next_chunk_windows = [None]
 _last_hasher = [None]
 _swa_tail_override = [None]
+_swa_skip_tail_layers = [False]
 _lookahead_lock = threading.Lock()
 _lookahead_cv = threading.Condition(_lookahead_lock)
 _lookahead_job = [None]
@@ -245,6 +247,7 @@ def _on_forward_batch_init(ret, cls, batch, model_runner=None, *args, **kwargs):
     from xtier.backend import prefill as _backend_prefill
     _next_chunk_windows[0] = None
     _swa_tail_override[0] = None
+    _swa_skip_tail_layers[0] = False
     _backend_prefill.set_more_chunks(False)
     if not batch.forward_mode.is_extend_without_speculative():
         return ret
@@ -284,6 +287,8 @@ def _on_forward_batch_init(ret, cls, batch, model_runner=None, *args, **kwargs):
                 rem = len(full0) - end0
                 if rem > 0:
                     _swa_tail_override[0] = max(1, 128 - rem)
+                    if rem >= 128 and os.environ.get('XTIER_DS_SKIP_INTERMEDIATE_TAIL_LAYERS', '1') != '0':
+                        _swa_skip_tail_layers[0] = True
     return ret
 
 
@@ -403,12 +408,59 @@ def _fp8_configs(original, N, K, block_n, block_k):
     return original(N, K, block_n, block_k)
 
 
+class _IntermediateSkipReplayTail:
+    """Skips L20..39 tail layers on non-final prefill chunks where >=128 tokens remain in future chunks:
+    SGLang has already executed L20's write_tail_source_kv on all chunk rows before invoking run(), and no token in
+    this chunk falls within the final chunk's 128-token SWA floor or produces final logits / DSpark draft inputs."""
+
+    def __init__(self, model):
+        self._model = model
+        self._tail_start = model.late_layer_start + (1 if getattr(model, 'tail_writes_source_kv', False) else 0)
+
+    def breaks_out_of_prefill_graph(self, tail, *, num_tokens):
+        return False
+
+    def plan(self, tail, *, forward_batch, num_tokens, tail_in_graph):
+        if (not _swa_skip_tail_layers[0]
+                or tail is None
+                or tail_in_graph
+                or tail.positions.shape[0] != 1
+                or getattr(tail, 'cp_metadata', None) is not None):
+            return False, None
+        from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+        from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+        from sglang.srt.runtime_context import get_parallel
+        if (get_is_capture_mode()
+                or get_parallel().attn_dp_size > 1
+                or get_global_expert_distribution_recorder().recording):
+            return False, None
+        return True, None
+
+    def run(self, *, state, positions, input_ids, input_ids_global, forward_batch, capture_dspark,
+            dp_rows=None, out_rows=None):
+        _swa_skip_tail_layers[0] = False
+        model = self._model
+        hc_cfg = model.layers[model.end_layer - 1].hc_cfg
+        state = state.materialized(hc_cfg)
+        aux = []
+        if capture_dspark:
+            cap_ids = getattr(model, 'dspark_layers_to_capture', None) or ()
+            n_cap = sum(1 for i in range(self._tail_start, model.end_layer) if i in cap_ids)
+            if n_cap:
+                base_h = state.residual[:, 0].contiguous() if state.residual.dim() == 3 else state.residual.contiguous()
+                aux = [base_h] * n_cap
+        return state.residual, state.pre, aux
+
+
 def _replay_tail(original, cls, model, *args, **kwargs):
     from xtier import config
     if config.enabled():
-        logger.info('xtier: DeepSeek V4.1 decoder replay tail runs eagerly (no row-bucket graphs: their MoE calls of up '
-                    'to %s rows cannot be captured through XTier)',
-                    os.environ.get('SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS', '2048'))
+        logger.info('xtier: DeepSeek V4.1 decoder replay tail runs eagerly (intermediate chunks with >=128 remaining '
+                    'tokens skip L20..39 after L20 source KV write)')
+        if (getattr(model, 'tail_writes_source_kv', False)
+                and getattr(model, 'late_layer_start', None) is not None
+                and os.environ.get('XTIER_DS_SKIP_INTERMEDIATE_TAIL_LAYERS', '1') != '0'):
+            return _IntermediateSkipReplayTail(model)
         return None
     return original(cls, model, *args, **kwargs)
 
@@ -425,9 +477,119 @@ def _b12x_rows():
     return frozenset(rows)
 
 
+_fast_mxfp8_state = [None]   # lazily initialized (raw_quant, sf_128x4, runner, gemm_cache, plan_fn, alpha_fn)
+_b12x_plan_memo = {}         # (m, n, k, dev_idx) -> (compiled_gemm, alpha_for_launch) or None
+
+
+def _init_fast_mxfp8():
+    st = _fast_mxfp8_state[0]
+    if st is not None:
+        return st
+    try:
+        from flashinfer import SfLayout
+        from flashinfer.gemm import gemm_base
+        from flashinfer.quantization import fp8_quantization as fq
+        raw_q = fq.get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100
+        runner = gemm_base._b12x_gemm_mxfp8_runner(12, 0, True, torch.bfloat16)
+        kcache = getattr(gemm_base, '_B12X_MM_MXFP8_KERNEL_CACHE', None)
+        plan_fn = getattr(gemm_base, '_default_dense_plan', None)
+        alpha_fn = getattr(gemm_base, '_prepare_alpha_for_launch', None)
+        st = (raw_q, SfLayout.layout_128x4, runner, kcache, plan_fn, alpha_fn)
+    except Exception as exc:
+        logger.debug('xtier: SM120 fast MXFP8 eager dispatch unavailable: %s', exc)
+        st = False
+    _fast_mxfp8_state[0] = st
+    return st
+
+
+def _moe_forward_normal_hook(original, self, hidden_states, *args, **kwargs):
+    from xtier.backend import prefill as _bp
+    if (not torch.cuda.is_current_stream_capturing()
+            and isinstance(hidden_states, torch.Tensor) and hidden_states.is_cuda
+            and hidden_states.dim() == 2 and hidden_states.shape[0] >= 640
+            and os.environ.get('XTIER_DS_MXFP8_REUSE_QUANT', '1') != '0'):
+        _bp._moe_prequant_want[0] = hidden_states.data_ptr()
+        _bp._moe_prequant_slot[0] = None
+        try:
+            return original(self, hidden_states, *args, **kwargs)
+        finally:
+            _bp._moe_prequant_want[0] = None
+            _bp._moe_prequant_slot[0] = None
+    return original(self, hidden_states, *args, **kwargs)
+
+
 def _mxfp8_linear(original, input, *args, **kwargs):
-    if kwargs.get('backend', 'cutlass') == 'cutlass' and input.numel() // input.shape[-1] in _b12x_rows():
+    rows = input.numel() // input.shape[-1]
+    if kwargs.get('backend', 'cutlass') == 'cutlass' and rows in _b12x_rows():
         kwargs['backend'] = 'b12x'
+    if (len(args) >= 2 and isinstance(input, torch.Tensor) and input.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+            and not torch._dynamo.is_compiling()
+            and os.environ.get('XTIER_DS_MXFP8_FAST_EAGER', '1') != '0'
+            and torch.cuda.get_device_capability(input.device) == (12, 0)):
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        if not is_batch_invariant_mode_enabled():
+            weight, weight_scale = args[0], args[1]
+            input_scale = args[2] if len(args) > 2 else kwargs.get('input_scale')
+            bias = args[3] if len(args) > 3 else kwargs.get('bias')
+            output_dtype = args[4] if len(args) > 4 else kwargs.get('output_dtype')
+            backend = args[5] if len(args) > 5 else kwargs.get('backend', 'cutlass')
+            if (input.is_contiguous() and weight.is_cuda and weight.is_contiguous()
+                    and weight.dtype == torch.float8_e4m3fn):
+                k = input.shape[-1]
+                n, k_w = weight.shape
+                if k == k_w and k % 32 == 0:
+                    st = _init_fast_mxfp8()
+                    if st:
+                        raw_q, sf_128x4, runner, kcache, plan_fn, alpha_fn = st
+                        input_2d = input.view(-1, k)
+                        out_dtype = output_dtype or (
+                            input_2d.dtype if input_2d.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                            else torch.bfloat16
+                        )
+                        q_input, x_scale_u8 = None, None
+                        if input_scale is not None:
+                            q_input, x_scale_u8 = input_2d, input_scale
+                        else:
+                            from xtier.backend import prefill as _bp
+                            slot = _bp._moe_prequant_slot[0]
+                            if slot is not None:
+                                ptr, shp, strm, c_xq, c_xs = slot
+                                if (ptr == input_2d.data_ptr() and shp == tuple(input_2d.shape)
+                                        and strm == torch.cuda.current_stream(input.device).cuda_stream):
+                                    q_input, x_scale_u8 = c_xq, c_xs
+                                    _bp._moe_prequant_slot[0] = None
+                            if q_input is None and input_2d.dtype in (torch.bfloat16, torch.float16):
+                                q_input, x_scale_u8 = raw_q(input_2d, sf_128x4, 32, True)
+                        if q_input is not None:
+                            if backend == 'b12x' and k % 128 == 0 and out_dtype == torch.bfloat16 and weight_scale.ndim == 1:
+                                out = torch.empty((rows, n), device=input.device, dtype=out_dtype)
+                                dev_idx = input.device.index or 0
+                                pkey = (rows if rows <= 1024 else -1, n, k, dev_idx)
+                                entry = _b12x_plan_memo.get(pkey)
+                                if entry is None and rows <= 1024 and kcache is not None and plan_fn is not None and alpha_fn is not None:
+                                    runner(inputs=[q_input, weight.t(), x_scale_u8, weight_scale, out_dtype, out, None], tactic=-1)
+                                    plan = plan_fn(rows, n, k, input.device)
+                                    ckey = (32, plan.mma_tiler_mn, (1, 1), plan.swap_ab, False, 'sm120', None, True, out_dtype)
+                                    hit = kcache.get(ckey)
+                                    if hit is not None:
+                                        entry = _b12x_plan_memo[pkey] = (hit[0], alpha_fn(None, input.device))
+                                    if bias is not None:
+                                        out += bias
+                                    return out.view(*input.shape[:-1], n)
+                                if entry is not None:
+                                    c_gemm, alpha = entry
+                                    c_gemm(q_input, weight, out, (rows + 127) // 128, (n + 127) // 128, (k // 32 + 3) // 4,
+                                           x_scale_u8.data_ptr(), weight_scale.data_ptr(), alpha)
+                                else:
+                                    runner(inputs=[q_input, weight.t(), x_scale_u8, weight_scale, out_dtype, out, None], tactic=-1)
+                                if bias is not None:
+                                    out += bias
+                                return out.view(*input.shape[:-1], n)
+                            pin_tactic = args[5] if len(args) > 5 else kwargs.get('pin_tactic', False)
+                            return original(q_input.view(*input.shape), weight, weight_scale,
+                                            input_scale=x_scale_u8, bias=bias, output_dtype=out_dtype,
+                                            backend=backend, pin_tactic=pin_tactic)
     return original(input, *args, **kwargs)
 
 
@@ -459,6 +621,8 @@ def install(registry, hook_type):
     if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
+    if torch.cuda.get_device_capability() == (12, 0):
+        registry.register(MOE_FORWARD_NORMAL, _moe_forward_normal_hook, hook_type.AROUND)
     if torch.cuda.get_device_capability()[0] < 9:
         from xtier.packs.deepseek_v4 import mhc_splitk, sparse_mla
         registry.register(FLASH_MLA, sparse_mla.flash_mla_with_kvcache, hook_type.AROUND)

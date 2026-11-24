@@ -377,6 +377,9 @@ logger = logging.getLogger(__name__)
 _first_plan = None
 _more_chunks = [False]
 _last_plan = None
+_moe_prequant_want = [None]
+_moe_prequant_slot = [None]
+_deferred_gpu_learn = []
 
 
 def set_more_chunks(flag: bool) -> None:
@@ -398,10 +401,25 @@ def _pending_chunks(pending):
     return chunks
 
 
+def _flush_deferred_gpu_learn(sync=False):
+    rem = []
+    for item in _deferred_gpu_learn:
+        plan, tokens, skip, waits, ev0, ev1 = item
+        if sync:
+            ev1.synchronize()
+        elif not ev1.query():
+            rem.append(item)
+            continue
+        gpu_s = ev0.elapsed_time(ev1) * 1e-3
+        plan._share_learn_gpu(tokens, skip, waits, gpu_s)
+    _deferred_gpu_learn[:] = rem
+
+
 def drain_prefetch():
     """Release any in-flight source ownership before model teardown or tests."""
     global _pending
     with _lock:
+        _flush_deferred_gpu_learn(sync=True)
         if _pending is not None:
             for _, done, _ in _pending_chunks(_pending):
                 done.synchronize()
@@ -1145,9 +1163,7 @@ class Prefill:
         worker = _share_worker.launch(work)
         return worker, rows, n, buf, result
 
-    def _share_learn(self, tokens, skip, mine, waits, gpu_s, result):
-        """The costs of the next split from this call's times (waits: the chunks uploaded during the call); a log
-        line now and then."""
+    def _share_learn_gpu(self, tokens, skip, waits, gpu_s):
         cost = _share_cost[(self.hidden, self.inter, self.chunk)]
         if waits >= 4:   # the upload time of a chunk, within a factor of four of the link's
             up = min(max(gpu_s * 1e3 / waits, 0.25 * cost['up0']), 4 * cost['up0'])
@@ -1156,6 +1172,21 @@ class Prefill:
         if gpu_routes >= 4096 and gpu_s > 0:
             g_per = gpu_s * 1e6 / gpu_routes
             cost['gpu_us'] = 0.8 * cost['gpu_us'] + 0.2 * min(max(g_per, 0.15), 1.0)
+        s = _share_seen
+        s['gpu_s'] += gpu_s
+        if time.monotonic() - s['logged'] > 30 and s['calls'] >= 20:
+            s['logged'] = time.monotonic()
+            logger.info('xtier prefill CPU share: %d calls, %.0f%% of the expert chunks not uploaded (%.0f%% on the CPU '
+                        'with %.1f%% of the routes), GPU part %.0f ms / CPU part %.0f ms a call; costs: upload %.2f ms a '
+                        'chunk, CPU %.1f us a route', s['calls'], 100 * s['skipped'] / s['chunks'],
+                        100 * s['cpu_chunks'] / s['chunks'], 100 * s['cpu_routes'] / max(s['routes'], 1),
+                        1e3 * s['gpu_s'] / s['calls'], 1e3 * s['cpu_s'] / s['calls'], cost['up_ms'], cost['cpu_us'])
+            s.update(calls=0, chunks=0, skipped=0, cpu_chunks=0, routes=0, cpu_routes=0, gpu_s=0.0, cpu_s=0.0)
+
+    def _share_learn(self, tokens, skip, mine, waits, gpu_s, result):
+        """The costs of the next split from this call's times (waits: the chunks uploaded during the call); a log
+        line now and then."""
+        cost = _share_cost[(self.hidden, self.inter, self.chunk)]
         cpu_routes = sum(int(tokens[j]) for j in mine)
         if mine and cpu_routes >= 64 and 's' in result:
             per = result['s'] * 1e6 / cpu_routes
@@ -1167,16 +1198,9 @@ class Prefill:
         s['cpu_chunks'] += len(mine)
         s['routes'] += sum(int(c) for c in tokens)
         s['cpu_routes'] += cpu_routes
-        s['gpu_s'] += gpu_s
         s['cpu_s'] += result.get('s', 0.0)
-        if time.monotonic() - s['logged'] > 30 and s['calls'] >= 20:
-            s['logged'] = time.monotonic()
-            logger.info('xtier prefill CPU share: %d calls, %.0f%% of the expert chunks not uploaded (%.0f%% on the CPU '
-                        'with %.1f%% of the routes), GPU part %.0f ms / CPU part %.0f ms a call; costs: upload %.2f ms a '
-                        'chunk, CPU %.1f us a route', s['calls'], 100 * s['skipped'] / s['chunks'],
-                        100 * s['cpu_chunks'] / s['chunks'], 100 * s['cpu_routes'] / max(s['routes'], 1),
-                        1e3 * s['gpu_s'] / s['calls'], 1e3 * s['cpu_s'] / s['calls'], cost['up_ms'], cost['cpu_us'])
-            s.update(calls=0, chunks=0, skipped=0, cpu_chunks=0, routes=0, cpu_routes=0, gpu_s=0.0, cpu_s=0.0)
+        if gpu_s is not None:
+            self._share_learn_gpu(tokens, skip, waits, gpu_s)
 
     def _run_fp4(self, x, out, ids, routing, m, k, stream):
         """XTIER_PREFILL_FP4=1 (SM100+/SM120, MXFP4, BF16 out, unit global scales): prefill through
@@ -1422,11 +1446,14 @@ class Prefill:
                     workspace = torch.empty(self._fp4_ws_bytes, dtype=torch.uint8, device='cuda')
                 else:
                     workspace = None
+                _flush_deferred_gpu_learn(sync=False)
                 fast_glue = max_nr > 0 and H % 32 == 0 and os.environ.get('XTIER_PREFILL_FP4_FAST_GLUE', '1') != '0'
                 if fast_glue:
                     xq_all, xsf_all = mxfp8_quantize(x_t, is_sf_swizzled_layout=False, alignment=32)
                     if xq_all.shape == (m, H) and xsf_all.numel() == m * (H // 32):
                         xsf_all = xsf_all.view(m, H // 32).view(torch.uint8)
+                        if _moe_prequant_want[0] == x:
+                            _moe_prequant_slot[0] = (x, (m, H), compute.cuda_stream, xq_all, block_scale_interleave(xsf_all))
                         xq_buf = torch.empty((max_nr, H), dtype=torch.float8_e4m3fn, device='cuda')
                         xsf_buf = torch.empty((max_nr, H // 32), dtype=torch.uint8, device='cuda')
                         ids_buf = torch.empty((max_nr, k), dtype=torch.int32, device='cuda')
@@ -1437,7 +1464,13 @@ class Prefill:
 
                 single_reduce = fast_glue or total_gpu == 0
                 if single_reduce:
-                    band_cap = max(max_nr, int(os.environ.get('XTIER_PREFILL_FP4_BAND_ROWS', '65536')))
+                    env_band = os.environ.get('XTIER_PREFILL_FP4_BAND_ROWS')
+                    if env_band:
+                        band_cap = max(max_nr, int(env_band))
+                    elif total_gpu > 65536 and total_gpu <= 393216 and (torch.cuda.mem_get_info()[0] / (1 << 30)) >= 6.0:
+                        band_cap = max(max_nr, total_gpu)
+                    else:
+                        band_cap = max(max_nr, 65536)
                     bands = []  # [(r_start, r_end, last_chunk_j), ...]
                     if total_gpu > 0:
                         b_start = 0
@@ -1594,10 +1627,16 @@ class Prefill:
                     cross.sort(key=lambda t: t[0])
                     _pending = (_Fp4Prefetch(target), cross[0][1], cross[0][2], cross[1:])
                     self.prefetch_submissions += 1
-                torch.cuda.current_stream().synchronize()
+                async_sync = os.environ.get('XTIER_PREFILL_ASYNC_SYNC', '0') != '0'
+                if not async_sync:
+                    torch.cuda.current_stream().synchronize()
                 if share is not None:
-                    gpu_s = gpu_start_ev.elapsed_time(gpu_end_ev) * 1e-3
-                    self._share_learn(host[:n_chunks], skip, mine, share[2], gpu_s, share_result)
+                    if async_sync:
+                        self._share_learn(host[:n_chunks], skip, mine, share[2], None, share_result)
+                        _deferred_gpu_learn.append((self, list(host[:n_chunks]), set(skip), share[2], gpu_start_ev, gpu_end_ev))
+                    else:
+                        gpu_s = gpu_start_ev.elapsed_time(gpu_end_ev) * 1e-3
+                        self._share_learn(host[:n_chunks], skip, mine, share[2], gpu_s, share_result)
                 for p in (self, target):
                     if p is not None:
                         p._fp4_residency = None
@@ -1607,6 +1646,11 @@ class Prefill:
                     retired = []
                     for j in range(len(_slots)):
                         if j not in keep and _slots[j] is not None:
+                            if async_sync:
+                                if freed[j] is not None:
+                                    compute.wait_event(freed[j])
+                                for t in _slots[j]:
+                                    t.record_stream(_copy_stream)
                             retired += [weakref.ref(t) for t in _slots[j]]
                             _slots[j] = None
                             _slot_res[j] = None
@@ -1621,6 +1665,8 @@ class Prefill:
                 _slot_free_ev = list(freed)
             except BaseException:
                 torch.cuda.synchronize()
+                _deferred_gpu_learn.clear()
+                _moe_prequant_slot[0] = None
                 _pending = None
                 _slots = None
                 _slot_res = None

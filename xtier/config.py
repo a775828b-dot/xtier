@@ -15,7 +15,7 @@
   XTIER_PREBUILD=1           build the FlashInfer modules requests would build before loading the model (prebuild.py)
   XTIER_DECODE_MAX=64       calls of up to this many tokens use the mailbox (CUDA-graph capturable); larger ones
                              are prefill
-  XTIER_SLOT_TOKENS=16       tokens of one decode call (a mailbox slot) at the most: the requests of a decode step
+  XTIER_SLOT_TOKENS=24       tokens of one decode call (a mailbox slot) at the most: the requests of a decode step
                              share calls, so two requests' 12 verify rows are one call and an expert both route to is
                              computed once (8: calls of 8 tokens, as before 2026-11-12). Within the 128 routes a
                              slot holds (12 tokens at top-10); 8 with the second GPU's pool (backend/method.py)
@@ -95,7 +95,7 @@ def decode_max() -> int:
 
 
 def slot_tokens() -> int:
-    return max(1, min(16, _int('XTIER_SLOT_TOKENS', 16)))
+    return max(1, min(24, _int('XTIER_SLOT_TOKENS', 24)))
 
 
 def cpu_prefill_batch() -> int:

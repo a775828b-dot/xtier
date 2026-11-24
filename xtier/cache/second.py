@@ -134,9 +134,9 @@ class SecondLayer:
                                                 ALPHA=pool.alpha, BETA=pool.beta, num_warps=cfg['gw'], num_stages=cfg['gs'])
                 # XTIER_GPU2_SLOW=n, test only: a slower GPU, n more times the same work (the same result)
                 for _ in range(1 + int(os.environ.get('XTIER_GPU2_SLOW', '0'))):
-                    _down[(nk, H // cfg['dbn'])](s['mid'], slot_list, slot_exp, self.arena[1], self.arena[3], self.g2,
-                                                 s['part'], m, H, I, MAX_M, cfg['dbn'], pool.bk_i, MX=pool.prefill.mxfp4,
-                                                 num_warps=cfg['dw'], num_stages=cfg['ds'])
+                    _down[(nk, H // pool.dbn)](s['mid'], slot_list, slot_exp, self.arena[1], self.arena[3], self.g2,
+                                               s['part'], m, H, I, MAX_M, pool.dbn, pool.bk_i, MX=pool.prefill.mxfp4,
+                                               num_warps=cfg['dw'], num_stages=cfg['ds'])
                 _combine[(m, triton.cdiv(H, 1024))](s['part'], rslot, routing, Pointer(s['host_out'], torch.float32), H, k,
                                                     MAX_M, 1024)
                 if lib.xtier_mailbox_gpu2_capture_end(pool.mailbox.bridge, st, m, k) < 0:

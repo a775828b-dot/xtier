@@ -36,8 +36,9 @@ MODELS = 'sglang.srt.models.deepseek_v4'
 APPLY = f'{MODELS}._apply_wo_a_bf16_matmul'
 STREAMING = f'{MODELS}._dequant_fp8_wo_a_streaming'
 LOAD = f'{MODELS}.DeepseekV4ForCausalLM.load_weights'
-SCALE_NAME = re.compile(r'(?:^|\.)layers\.(\d+)\.attn\.wo_a\.scale$')
-LAYER_NAME = re.compile(r'(?:^|\.)layers\.(\d+)\.')
+DRAFT_LOAD = 'sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark.load_weights'
+SCALE_NAME = re.compile(r'(?:^|\.)(layers|mtp)\.(\d+)\.attn\.wo_a\.scale$')
+LAYER_NAME = re.compile(r'(?:^|\.)(layers|stages)\.(\d+)\.')
 BLOCK = 32                        # the checkpoint's FP8 block (rows and columns)
 FAST_SHAPE = (2, 1024, 4096)      # (groups, rank, dim) of SGLang's own BF16 fast paths (TP4): left to them
 MAX_T = int(os.environ.get('XTIER_DS_WO_A_MAX_T', '96'))
@@ -182,7 +183,8 @@ def _tap(weights):
     for name, tensor in weights:
         m = SCALE_NAME.search(name) if _capture[0] is not None else None
         if m:
-            _capture[0][int(m.group(1))] = tensor.detach().clone()
+            kind = 'stages' if m.group(1) == 'mtp' else 'layers'
+            _capture[0][(kind, int(m.group(2)))] = tensor.detach().clone()
         yield name, tensor
 
 
@@ -196,7 +198,7 @@ def _load_weights(original, self, weights, *args, **kwargs):
         return original(self, weights, *args, **kwargs)
     _capture[0] = {}
     try:
-        result = original(self, weights, *args, **kwargs)
+        result = original(self, _tap(weights), *args, **kwargs)
         captured = _capture[0]
     finally:
         _capture[0] = None
@@ -214,14 +216,19 @@ def _convert(model, captured):
     done, kept, freed = 0, [], 0
     for name, mod in model.named_modules():
         m = LAYER_NAME.search(name + '.')
-        if not (m and int(m.group(1)) in captured and all(hasattr(mod, a) for a in ('wo_a', 'o_lora_rank',
-                                                                                   'n_local_groups'))):
+        if not m:
             continue
-        layer, w = int(m.group(1)), getattr(mod.wo_a, 'weight', None)
+        layer = int(m.group(2))
+        ckey = (m.group(1), layer)
+        if ckey not in captured and layer in captured:
+            ckey = layer
+        if not (ckey in captured and all(hasattr(mod, a) for a in ('wo_a', 'o_lora_rank', 'n_local_groups'))):
+            continue
+        w = getattr(mod.wo_a, 'weight', None)
         if w is None or w.dtype != torch.bfloat16 or not w.is_cuda or w.dim() != 2:
             continue
         G, R = mod.n_local_groups, mod.o_lora_rank
-        s = captured[layer].to(device=w.device).float().contiguous()
+        s = captured[ckey].to(device=w.device).float().contiguous()
         sn, sk = s.shape
         ok = (G, R, w.shape[1]) != FAST_SHAPE and w.shape == (sn * BLOCK, sk * BLOCK) and G * R == w.shape[0]
         if ok:
@@ -251,3 +258,4 @@ def install(registry, hook_type):
     if os.environ.get('XTIER_DS_WO_A_FP8', '1') != '0':
         registry.register(STREAMING, _streaming, hook_type.AROUND)
         registry.register(LOAD, _load_weights, hook_type.AROUND)
+        registry.register(DRAFT_LOAD, _load_weights, hook_type.AROUND)

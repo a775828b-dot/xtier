@@ -30,7 +30,7 @@
 #include <vector>
 
 namespace {
-constexpr int MAX_SLOT_M=16; // decode tokens per slot (DSpark verifies 6 a request: two requests in one slot)
+constexpr int MAX_SLOT_M=24; // decode tokens per slot (DSpark verifies 6 a request: up to four requests in one slot)
 thread_local std::string error;
 // XTIER_ROUTE_TRACE=<file> (research, default off): the dispatcher thread appends one record per CPU
 // decode call: TraceHead (realtime ns at start, wall/gate/down ns, layer = bridge creation order, m, k,
@@ -585,7 +585,7 @@ void CUDART_CB execute(void *p) noexcept {
     const bool pool=b->pool.load(std::memory_order_relaxed)!=0;
     if(pool) {
         // distinct experts of the call (original routes; skipped tokens are -1) and how many the GPU served
-        int seen[MAX_SLOT_M*10],n=0,hit=0;
+        int seen[MAX_SLOT_M*16],n=0,hit=0;
         for(int i=0;i<m*k;i++) {
             int e=s->orig[i];if(e<0)continue;
             bool dup=false;for(int j=0;j<n;j++)if(seen[j]==e){dup=true;break;}

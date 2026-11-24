@@ -136,6 +136,7 @@ import threading
 _hybrid_lock = threading.Lock()
 _hybrid_host = {}
 _hybrid_worker = None
+_hybrid_d2h_stream = None
 
 
 def _get_hybrid_buffers(H, k, m):
@@ -156,7 +157,7 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     the others at the same time on the CPU engine (FP32); the two partial sums are added in FP32.
     x: BF16 [m, H], ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current stream) -> FP32 [m, H].
     The residency is read once at the start: swaps are applied only by decode windows, which do not run meanwhile."""
-    global _hybrid_worker
+    global _hybrid_worker, _hybrid_d2h_stream
     from xtier.backend.prefill import _PersistentWorker
 
     H, I, S = pool.H, pool.I, pool.S
@@ -164,25 +165,34 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     g13, g2 = prefill._globals()
     m, k = ids.shape
     with _hybrid_lock:
+        main = torch.cuda.current_stream(x.device)
+        if _hybrid_d2h_stream is None:
+            _hybrid_d2h_stream = torch.cuda.Stream(device=x.device)
         slot = pool.table[ids.long()]                       # [m, k]: slot of each route, -1 = on the CPU
         on_gpu = slot >= 0
-        # CPU part: inputs staged in persistent pinned memory, GPU routes as id -1 (the engine skips them)
+        cpu_ids = torch.where(on_gpu, -1, ids).to(torch.int32)
+        # CPU part: stage on _hybrid_d2h_stream and wake the CPU worker immediately while GPU sorts/counts tiles
         buf = _get_hybrid_buffers(H, k, m)
         x_h, ids_h, w_h, out_h = buf['x'], buf['ids'], buf['w'], buf['out']
-        x_h[:m].copy_(x, non_blocking=True)
-        ids_h[:m].copy_(torch.where(on_gpu, -1, ids).to(torch.int32), non_blocking=True)
-        w_h[:m].copy_(weights, non_blocking=True)
-        # GPU part: routes sorted by slot (CPU routes last, no tile), one host rendezvous for the tile metadata
-        key = torch.where(on_gpu, slot, S).reshape(-1)
-        order = torch.argsort(key, stable=True).to(torch.int32)
-        counts = torch.bincount(key, minlength=S + 1)[:S]
-        host = torch.cat([counts, pool.owner[:S].to(counts.dtype)]).cpu().tolist()   # also completes the staging copies
-        errors = []
-
         prev_ev = buf.get('ev')
+        ready_ev = torch.cuda.Event()
+        ready_ev.record(main)
+        with torch.cuda.stream(_hybrid_d2h_stream):
+            _hybrid_d2h_stream.wait_event(ready_ev)
+            x_h[:m].copy_(x, non_blocking=True)
+            ids_h[:m].copy_(cpu_ids, non_blocking=True)
+            w_h[:m].copy_(weights, non_blocking=True)
+            d2h_done = torch.cuda.Event()
+            d2h_done.record(_hybrid_d2h_stream)
+        x.record_stream(_hybrid_d2h_stream)
+        cpu_ids.record_stream(_hybrid_d2h_stream)
+        weights.record_stream(_hybrid_d2h_stream)
+        del cpu_ids
+        errors = []
 
         def cpu_part():
             try:
+                d2h_done.synchronize()
                 if prev_ev is not None:
                     prev_ev.synchronize()
                 for s0 in range(0, m, cpu_batch):
@@ -196,6 +206,11 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
             _hybrid_worker = _PersistentWorker('xtier-hybrid-prefill')
         worker = _hybrid_worker.launch(cpu_part)
         try:
+            # GPU part: routes sorted by slot (CPU routes last, no tile), one host rendezvous for the tile metadata
+            key = torch.where(on_gpu, slot, S).reshape(-1)
+            order = torch.argsort(key, stable=True).to(torch.int32)
+            counts = torch.bincount(key, minlength=S + 1)[:S]
+            host = torch.cat([counts, pool.owner[:S].to(counts.dtype)]).cpu().tolist()
             counts, owner = host[:S], host[S:]
             bm = 64 if sum(counts) >= 48 * max(1, sum(1 for c in counts if c)) else 32
             small = bm == 32

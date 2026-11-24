@@ -54,10 +54,10 @@ from xtier.arch import HW_FP4, e2m1_f16, e4m3_f32
 from xtier.backend.kernels import Pointer
 
 logger = logging.getLogger(__name__)
-MAX_M = 16             # token tile of the GPU kernels = the tokens of a decode slot at the most
+MAX_M = 24             # max tokens of a decode slot (m<=16 single tile, 17..24 weight-reuse 2x16 tiles)
 MAX_LAYERS = 128       # rows of the global residency table
 RING = 4096            # command ring entries (csrc/mailbox POOL_RING)
-MAX_ROUTES = 128       # m*k per call (16 tokens up to top-8, 12 at top-10: backend/method.py slot_width)
+MAX_ROUTES = 144       # m*k per call (24 tokens at top-6, 18 at top-8, 14 at top-10: backend/method.py slot_width)
 MISS_CHUNK = 8192      # words (8 bytes) per program of _miss_copy
 BLOCK = 1024
 CONFIG = dict(gbn=32, dbn=64, bk=256, gw=4, gs=2, dw=4, ds=2)
@@ -78,24 +78,29 @@ _between = [None]      # optional per-call GPU work run between _kernels and mai
 
 
 @triton.jit
-def _pack(X, IDS, ROUTE, ACT, TABLE, SX, SIDS, SROUTE, SORIG, USED, RANK, RSLOT, SLOT_LIST, SLOT_EXP, OWNER,
-          NX, NK, K: tl.constexpr, S, HAS_ACT: tl.constexpr, SP: tl.constexpr, B: tl.constexpr):
-    i = tl.program_id(0) * B + tl.arange(0, B)
-    tl.store(SX + i, tl.load(X + i, i < NX), i < NX)
+def _pack(X, IDS, ROUTE, ACT, TABLE, SX, SIDS, SROUTE, SORIG, USED, RANK, RSLOT, SLOT_LIST, SLOT_EXP, TOK_MASK, OWNER,
+          NX, NK, K: tl.constexpr, S, HAS_ACT: tl.constexpr, FULL: tl.constexpr, MAX_R: tl.constexpr,
+          SP: tl.constexpr, B: tl.constexpr):
+    if not FULL:
+        i = tl.program_id(0) * B + tl.arange(0, B)
+        tl.store(SX + i, tl.load(X + i, i < NX), i < NX)
     if tl.program_id(0) == 0:
-        j = tl.arange(0, 128)
+        j = tl.arange(0, 256)
+        mr = j < MAX_R
         mk = j < NK
         ids = tl.load(IDS + j, mk, other=-1)
         if HAS_ACT:  # skipped tokens (truncated verify): -1 on both halves
             ids = tl.where(tl.load(ACT + j // K, mk, other=1) != 0, ids, -1)
         slot = tl.load(TABLE + ids, mk & (ids >= 0), other=-1)
-        tl.store(SIDS + j, tl.where(slot >= 0, -1, ids), mk)
-        tl.store(SORIG + j, ids, mk)
-        tl.store(SROUTE + j, tl.load(ROUTE + j, mk), mk)
+        if not FULL:
+            tl.store(SIDS + j, tl.where(slot >= 0, -1, ids), mk)
+            tl.store(SORIG + j, ids, mk)
+            tl.store(SROUTE + j, tl.load(ROUTE + j, mk), mk)
         # used slots -> compact ranks (static shapes): SLOT_LIST[rank] = slot, RSLOT[route] = rank or -1
         s = tl.arange(0, SP)
         tl.store(USED + s, 0, mask=s < S)
-        tl.store(SLOT_LIST + j, -1)  # j covers all MAX_ROUTES (=128) entries
+        tl.store(SLOT_LIST + j, -1, mask=mr)
+        tl.store(TOK_MASK + j, 0, mask=mr)
         tl.debug_barrier()
         tl.store(USED + slot, 1, mask=mk & (slot >= 0))
         tl.debug_barrier()
@@ -107,38 +112,44 @@ def _pack(X, IDS, ROUTE, ACT, TABLE, SX, SIDS, SROUTE, SORIG, USED, RANK, RSLOT,
         tl.debug_barrier()
         r = tl.load(RANK + slot, mask=mk & (slot >= 0), other=-1)
         tl.store(RSLOT + j, tl.where(slot >= 0, r, -1), mk)
+        tbit = 1 << (j // K)
+        tl.atomic_or(TOK_MASK + r, tbit, mask=mk & (r >= 0))
 
 
 @triton.jit
 def _commit(RING_P, SEQS, STATE, TABLE, OWNER, E, NR: tl.constexpr):
-    """Window start: apply posted swaps. New experts whose copy has landed enter the table; then replaced
-    experts of newly posted swaps leave it (and `applied` lets the copy stream overwrite their slots).
-    Publish before evict: a landed expert may already be the victim of a newer swap (posted after it landed,
-    before this window), and must end up out of the table. A swap is always evicted in an earlier window
-    than it is published (its copy waits for `applied`). Table and owner rows both have stride E. Sequence numbers
-    wrap (uint32 on the host, the same bits as int32 here): only their differences count, the low bits index the
-    ring (NR is a power of two)."""
+    """Window start: apply posted swaps in parallel across 256 lanes. Publish before evict with an explicit CTA
+    barrier: within a single publish or evict batch, copy_after_applied + busy[slot] guarantee distinct (layer, slot)
+    and distinct (layer, ein), while a landed expert immediately chosen as victim in the next round is published in
+    Loop 1 before Loop 2 evicts it."""
     posted = tl.atomic_add(SEQS, 0, sem='acquire', scope='sys')
     landed = tl.atomic_add(SEQS + 32, 0, sem='acquire', scope='sys')
     done = tl.load(STATE)
     pub = tl.load(STATE + 1)
     publish = tl.minimum(landed - pub, done - pub)
-    for j in range(0, publish):
+    tid = tl.arange(0, 256)
+    for base in range(0, publish, 256):
+        j = base + tid
+        m = j < publish
         i = ((pub + 1 + j) & (NR - 1)) * 4
-        layer = tl.load(RING_P + i, volatile=True)
-        ein = tl.load(RING_P + i + 1, volatile=True)
-        slot = tl.load(RING_P + i + 3, volatile=True)
-        if ein >= 0:   # -1: a slot the elastic cache released (cache/elastic.py), nothing to publish
-            tl.store(TABLE + layer * E + ein, slot)
-        tl.store(OWNER + layer * E + slot, ein)
-    tl.store(STATE + 1, pub + publish)
-    for j in range(0, posted - done):
+        layer = tl.load(RING_P + i, mask=m, other=0, volatile=True)
+        ein = tl.load(RING_P + i + 1, mask=m, other=-1, volatile=True)
+        slot = tl.load(RING_P + i + 3, mask=m, other=0, volatile=True)
+        tl.store(TABLE + layer * E + ein, slot, mask=m & (ein >= 0))
+        tl.store(OWNER + layer * E + slot, ein, mask=m)
+    tl.debug_barrier()
+    evict = posted - done
+    for base in range(0, evict, 256):
+        j = base + tid
+        m = j < evict
         i = ((done + 1 + j) & (NR - 1)) * 4
-        layer = tl.load(RING_P + i, volatile=True)
-        out = tl.load(RING_P + i + 2, volatile=True)
-        if out >= 0:
-            tl.store(TABLE + layer * E + out, -1)
+        layer = tl.load(RING_P + i, mask=m, other=0, volatile=True)
+        out = tl.load(RING_P + i + 2, mask=m, other=-1, volatile=True)
+        tl.store(TABLE + layer * E + out, -1, mask=m & (out >= 0))
+    tl.debug_barrier()
+    tl.store(STATE + 1, pub + publish)
     tl.store(STATE, posted)
+    tl.debug_barrier()
     tl.atomic_xchg(SEQS + 16, posted, sem='release', scope='sys')
 
 
@@ -170,7 +181,8 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
 @triton.jit
 def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False):
+             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False,
+             TOK_MASK=None):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -181,10 +193,14 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
         slot = p
     slot = slot.to(tl.int64)
     e = tl.load(SLOT_EXP + p).to(tl.int64)
-    tok = tl.arange(0, BM)
+    tok = tl.arange(0, 16)
+    if TOK_MASK is not None and not STAGED:
+        sm = (tok[:, None] < M) & (((tl.load(TOK_MASK + p) >> tok[:, None]) & 1) != 0)
+    else:
+        sm = tok[:, None] < M
     n = tl.program_id(1) * BN + tl.arange(0, BN)
-    accg = tl.zeros((BM, BN), dtype=tl.float32)
-    accu = tl.zeros((BM, BN), dtype=tl.float32)
+    accg = tl.zeros((16, BN), dtype=tl.float32)
+    accu = tl.zeros((16, BN), dtype=tl.float32)
     for k0 in range(0, H, BK):
         ke = k0 + 2 * tl.arange(0, BK // 2)
         xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
@@ -204,12 +220,13 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
-    tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(tl.bfloat16), mask=tok[:, None] < M)
+    tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(tl.bfloat16), mask=sm)
 
 
 @triton.jit
 def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.constexpr,
-          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False, STAGED: tl.constexpr = False):
+          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
+          STAGED: tl.constexpr = False, TOK_MASK=None):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -220,22 +237,143 @@ def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.
         slot = p
     slot = slot.to(tl.int64)
     e = tl.load(SLOT_EXP + p).to(tl.int64)
-    tok = tl.arange(0, BM)
+    tok = tl.arange(0, 16)
+    if TOK_MASK is not None and not STAGED:
+        sm = (tok[:, None] < M) & (((tl.load(TOK_MASK + p) >> tok[:, None]) & 1) != 0)
+    else:
+        sm = tok[:, None] < M
     h = tl.program_id(1) * BN + tl.arange(0, BN)
-    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    acc = tl.zeros((16, BN), dtype=tl.float32)
     for k0 in range(0, I, BK):
         ke = k0 + 2 * tl.arange(0, BK // 2)
-        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=sm, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+        ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=sm, other=0.0).to(tl.bfloat16 if MX else tl.float16)
         wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX)
         acc = tl.dot(ae, tl.trans(wl), acc)
         acc = tl.dot(ao, tl.trans(wh), acc)
     acc = acc * tl.load(G2 + e)
-    tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
+    tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=sm)
 
 
 @triton.jit
-def _combine(PART, RSLOT, W, GOUT, H: tl.constexpr, K: tl.constexpr, BM: tl.constexpr, B: tl.constexpr):
+def _gate_up_2x16(X, SLOT_LIST, SLOT_EXP, TOK_MASK, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
+                  STRIDE_M: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
+                  ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False):
+    p = tl.program_id(0)
+    slot = tl.load(SLOT_LIST + p)
+    if slot < 0:
+        return
+    row = p
+    if STAGED:
+        row = slot
+        slot = p
+    slot = slot.to(tl.int64)
+    e = tl.load(SLOT_EXP + p).to(tl.int64)
+    tmask = 0xFFFFFF if STAGED else tl.load(TOK_MASK + p)
+    mlo = tmask & 0xFFFF
+    mhi = (tmask >> 16) & 0xFF
+    has_lo = mlo != 0
+    has_hi = mhi != 0
+    tok0 = tl.arange(0, 16)
+    tok1 = 16 + tl.arange(0, 16)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    accg0 = tl.zeros((16, BN), dtype=tl.float32)
+    accu0 = tl.zeros((16, BN), dtype=tl.float32)
+    accg1 = tl.zeros((16, BN), dtype=tl.float32)
+    accu1 = tl.zeros((16, BN), dtype=tl.float32)
+    G: tl.constexpr = 32 if MX else 16
+    XDTYPE: tl.constexpr = tl.bfloat16 if MX else tl.float16
+    for k0 in range(0, H, BK):
+        ke = k0 + 2 * tl.arange(0, BK // 2)
+        gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
+        ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
+        if has_lo:
+            xe0 = tl.load(X + tok0[:, None] * H + ke[None, :], mask=tok0[:, None] < M, other=0.0).to(XDTYPE)
+            xo0 = tl.load(X + tok0[:, None] * H + ke[None, :] + 1, mask=tok0[:, None] < M, other=0.0).to(XDTYPE)
+            accg0 = tl.dot(xe0, tl.trans(gl), accg0)
+            accg0 = tl.dot(xo0, tl.trans(gh), accg0)
+            accu0 = tl.dot(xe0, tl.trans(ul), accu0)
+            accu0 = tl.dot(xo0, tl.trans(uh), accu0)
+        if has_hi:
+            xe1 = tl.load(X + tok1[:, None] * H + ke[None, :], mask=tok1[:, None] < M, other=0.0).to(XDTYPE)
+            xo1 = tl.load(X + tok1[:, None] * H + ke[None, :] + 1, mask=tok1[:, None] < M, other=0.0).to(XDTYPE)
+            accg1 = tl.dot(xe1, tl.trans(gl), accg1)
+            accg1 = tl.dot(xo1, tl.trans(gh), accg1)
+            accu1 = tl.dot(xe1, tl.trans(ul), accu1)
+            accu1 = tl.dot(xo1, tl.trans(uh), accu1)
+    gg = tl.load(G13 + e * 2)
+    gu = tl.load(G13 + e * 2 + 1)
+    if has_lo:
+        g0 = accg0 * gg
+        u0 = accu0 * gu
+        if LIMIT > 0:
+            u0 = tl.minimum(tl.maximum(u0, -LIMIT), LIMIT)
+            g0 = tl.minimum(g0, LIMIT)
+        val0 = (g0 / (1.0 + tl.exp(-ALPHA * g0)) * (u0 + BETA)) if (ALPHA != 1.0 or BETA != 0.0) else (g0 / (1.0 + tl.exp(-g0)) * u0)
+        tm0 = (tok0[:, None] < M) & (((mlo >> tok0[:, None]) & 1) != 0)
+        tl.store(MID + (row * STRIDE_M + tok0[:, None]) * I + n[None, :], val0.to(tl.bfloat16), mask=tm0)
+    if has_hi:
+        g1 = accg1 * gg
+        u1 = accu1 * gu
+        if LIMIT > 0:
+            u1 = tl.minimum(tl.maximum(u1, -LIMIT), LIMIT)
+            g1 = tl.minimum(g1, LIMIT)
+        val1 = (g1 / (1.0 + tl.exp(-ALPHA * g1)) * (u1 + BETA)) if (ALPHA != 1.0 or BETA != 0.0) else (g1 / (1.0 + tl.exp(-g1)) * u1)
+        tm1 = (tok1[:, None] < M) & (((mhi >> (tok1[:, None] - 16)) & 1) != 0)
+        tl.store(MID + (row * STRIDE_M + tok1[:, None]) * I + n[None, :], val1.to(tl.bfloat16), mask=tm1)
+
+
+@triton.jit
+def _down_2x16(MID, SLOT_LIST, SLOT_EXP, TOK_MASK, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.constexpr,
+               STRIDE_M: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
+               STAGED: tl.constexpr = False):
+    p = tl.program_id(0)
+    slot = tl.load(SLOT_LIST + p)
+    if slot < 0:
+        return
+    row = p
+    if STAGED:
+        row = slot
+        slot = p
+    slot = slot.to(tl.int64)
+    e = tl.load(SLOT_EXP + p).to(tl.int64)
+    tmask = 0xFFFFFF if STAGED else tl.load(TOK_MASK + p)
+    mlo = tmask & 0xFFFF
+    mhi = (tmask >> 16) & 0xFF
+    has_lo = mlo != 0
+    has_hi = mhi != 0
+    tok0 = tl.arange(0, 16)
+    tok1 = 16 + tl.arange(0, 16)
+    tm0 = (tok0[:, None] < M) & (((mlo >> tok0[:, None]) & 1) != 0)
+    tm1 = (tok1[:, None] < M) & (((mhi >> (tok1[:, None] - 16)) & 1) != 0)
+    h = tl.program_id(1) * BN + tl.arange(0, BN)
+    acc0 = tl.zeros((16, BN), dtype=tl.float32)
+    acc1 = tl.zeros((16, BN), dtype=tl.float32)
+    G: tl.constexpr = 32 if MX else 16
+    XDTYPE: tl.constexpr = tl.bfloat16 if MX else tl.float16
+    for k0 in range(0, I, BK):
+        ke = k0 + 2 * tl.arange(0, BK // 2)
+        wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // G), I // G, BN, BK, MX)
+        if has_lo:
+            ae0 = tl.load(MID + (row * STRIDE_M + tok0[:, None]) * I + ke[None, :], mask=tm0, other=0.0).to(XDTYPE)
+            ao0 = tl.load(MID + (row * STRIDE_M + tok0[:, None]) * I + ke[None, :] + 1, mask=tm0, other=0.0).to(XDTYPE)
+            acc0 = tl.dot(ae0, tl.trans(wl), acc0)
+            acc0 = tl.dot(ao0, tl.trans(wh), acc0)
+        if has_hi:
+            ae1 = tl.load(MID + (row * STRIDE_M + tok1[:, None]) * I + ke[None, :], mask=tm1, other=0.0).to(XDTYPE)
+            ao1 = tl.load(MID + (row * STRIDE_M + tok1[:, None]) * I + ke[None, :] + 1, mask=tm1, other=0.0).to(XDTYPE)
+            acc1 = tl.dot(ae1, tl.trans(wl), acc1)
+            acc1 = tl.dot(ao1, tl.trans(wh), acc1)
+    sc = tl.load(G2 + e)
+    if has_lo:
+        tl.store(PART + (row * STRIDE_M + tok0[:, None]) * H + h[None, :], acc0 * sc, mask=tm0)
+    if has_hi:
+        tl.store(PART + (row * STRIDE_M + tok1[:, None]) * H + h[None, :], acc1 * sc, mask=tm1)
+
+
+@triton.jit
+def _combine(PART, RSLOT, W, GOUT, H: tl.constexpr, K: tl.constexpr, BM: tl.constexpr, B: tl.constexpr,
+             SCALE=1.0, OUT_BF16: tl.constexpr = False, HAS_SCALE: tl.constexpr = False):
     """GPU part of token t: sum over its GPU routes in route order (FP32); 0 when none."""
     t = tl.program_id(0)
     h = tl.program_id(1) * B + tl.arange(0, B)
@@ -245,15 +383,28 @@ def _combine(PART, RSLOT, W, GOUT, H: tl.constexpr, K: tl.constexpr, BM: tl.cons
         w = tl.load(W + t * K + q)
         acc += tl.where(r >= 0, w, 0.0) * tl.load(PART + (tl.maximum(r, 0) * BM + t) * H + h,
                                                   mask=(h < H) & (r >= 0), other=0.0)
-    tl.store(GOUT + t * H + h, acc, mask=h < H)
+    if OUT_BF16:
+        b = acc.to(tl.bfloat16)
+        if HAS_SCALE:
+            b = (b.to(tl.float32) * SCALE).to(tl.bfloat16)
+        tl.store(GOUT + t * H + h, b, mask=h < H)
+    else:
+        tl.store(GOUT + t * H + h, acc, mask=h < H)
 
 
 @triton.jit
-def _unpack(SOUT, GOUT, OUT, N, B: tl.constexpr):
+def _unpack(SOUT, GOUT, OUT, N, B: tl.constexpr, SCALE=1.0, OUT_BF16: tl.constexpr = False, HAS_SCALE: tl.constexpr = False):
     i = tl.program_id(0) * B + tl.arange(0, B)
     # .cv: always re-read host memory written by the CPU after the mailbox handshake.
-    c = tl.load(SOUT + i, i < N, cache_modifier='.cv')
-    tl.store(OUT + i, c + tl.load(GOUT + i, i < N), i < N)
+    c = tl.load(SOUT + i, i < N, other=0.0, cache_modifier='.cv')
+    val = c + tl.load(GOUT + i, i < N, other=0.0)
+    if OUT_BF16:
+        b = val.to(tl.bfloat16)
+        if HAS_SCALE:
+            b = (b.to(tl.float32) * SCALE).to(tl.bfloat16)
+        tl.store(OUT + i, b, i < N)
+    else:
+        tl.store(OUT + i, val, i < N)
 
 
 @triton.jit
@@ -320,6 +471,7 @@ def _scratch(H, I, dev):
             rslot=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             slot_list=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             slot_exp=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
+            tok_mask=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             # staging of the GPU-only path (full residency): written by _pack, never read
             sx=torch.empty((MAX_M, H), dtype=torch.int16, device=dev),
             sids=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
@@ -431,6 +583,7 @@ class LayerPool:
         self.bk_h, self.bk_i = _tile_k(H), _tile_k(I)   # gate/up reduce over H, down over I
         if not self.bk_h or not self.bk_i or I % CONFIG['gbn'] or H % CONFIG['dbn']:
             raise ValueError(f'xtier cache: unsupported shape H={H} I={I}')
+        self.dbn = 128 if (H % 128 == 0 and H >= 256) else CONFIG['dbn']
         dev = torch.device('cuda', torch.cuda.current_device())
         # same per-expert shapes as the prefill staging slots: w13, w2, s13, s2 (bytes, unchanged)
         from xtier.cache import elastic
@@ -512,35 +665,56 @@ class LayerPool:
         self.miss = _miss_layer(self)
         return len(experts)
 
-    def _kernels(self, m, k, x, routing, gout):
+    def _kernels(self, m, k, x, routing, gout, out_bf16=False, scale=1.0):
         """GPU part: gate/up and down over the used slots, per-token sum of the GPU routes into gout."""
         if self.globals is None:
             self.globals = self.prefill._globals()
         g13, g2 = self.globals
-        H, I, cfg, sc = self.H, self.I, CONFIG, self.scratch
+        H, I, cfg, dbn, sc = self.H, self.I, CONFIG, self.dbn, self.scratch
         nk = m * k
         xb = Pointer(x, torch.bfloat16)
-        _gate_up[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], self.arena[0], self.arena[2], g13,
-                                        sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
-                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
-                                        num_warps=cfg['gw'], num_stages=cfg['gs'])
-        _down[(nk, H // cfg['dbn'])](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
-                                     sc['part'], m, H, I, MAX_M, cfg['dbn'], self.bk_i,
-                                     MX=self.prefill.mxfp4, num_warps=cfg['dw'], num_stages=cfg['ds'])
+        if m <= 16:
+            _gate_up[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], self.arena[0], self.arena[2], g13,
+                                            sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
+                                            MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
+                                            TOK_MASK=sc['tok_mask'], num_warps=cfg['gw'], num_stages=cfg['gs'])
+            _down[(nk, H // dbn)](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
+                                  sc['part'], m, H, I, MAX_M, dbn, self.bk_i,
+                                  MX=self.prefill.mxfp4, TOK_MASK=sc['tok_mask'], num_warps=cfg['dw'], num_stages=cfg['ds'])
+        else:
+            _gate_up_2x16[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], sc['tok_mask'],
+                                                 self.arena[0], self.arena[2], g13,
+                                                 sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
+                                                 MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
+                                                 num_warps=cfg['gw'], num_stages=cfg['gs'])
+            _down_2x16[(nk, H // dbn)](sc['mid'], sc['slot_list'], sc['slot_exp'], sc['tok_mask'],
+                                       self.arena[1], self.arena[3], g2,
+                                       sc['part'], m, H, I, MAX_M, dbn, self.bk_i,
+                                       MX=self.prefill.mxfp4, num_warps=cfg['dw'], num_stages=cfg['ds'])
         if self.miss is not None:   # the missed experts _miss_select gave the GPU: into the staging slots, then as above
             mi, cap, stage = self.miss, _miss['cap'], self.miss['stage']
             _miss_copy[(cap * mi['n'], triton.cdiv(mi['words'], MISS_CHUNK))](
                 Pointer(mi['src'], torch.int64), Pointer(mi['dst'], torch.int64), mi['pieces'], _miss['e'], mi['n'],
                 MISS_CHUNK, 1024)
-            _gate_up[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], stage[0], stage[2], g13, sc['mid'], m, H, I,
-                                             self.limit, MAX_M, cfg['gbn'], self.bk_h, MX=self.prefill.mxfp4,
-                                             ALPHA=self.alpha, BETA=self.beta, STAGED=True, num_warps=cfg['gw'],
-                                             num_stages=cfg['gs'])
-            _down[(cap, H // cfg['dbn'])](sc['mid'], _miss['r'], _miss['e'], stage[1], stage[3], g2, sc['part'], m, H,
-                                          I, MAX_M, cfg['dbn'], self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
-                                          num_warps=cfg['dw'], num_stages=cfg['ds'])
+            if m <= 16:
+                _gate_up[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], stage[0], stage[2], g13,
+                                                 sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
+                                                 MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, STAGED=True,
+                                                 num_warps=cfg['gw'], num_stages=cfg['gs'])
+                _down[(cap, H // dbn)](sc['mid'], _miss['r'], _miss['e'], stage[1], stage[3], g2,
+                                       sc['part'], m, H, I, MAX_M, dbn, self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
+                                       num_warps=cfg['dw'], num_stages=cfg['ds'])
+            else:
+                _gate_up_2x16[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], sc['tok_mask'], stage[0], stage[2], g13,
+                                                      sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
+                                                      MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, STAGED=True,
+                                                      num_warps=cfg['gw'], num_stages=cfg['gs'])
+                _down_2x16[(cap, H // dbn)](sc['mid'], _miss['r'], _miss['e'], sc['tok_mask'], stage[1], stage[3], g2,
+                                            sc['part'], m, H, I, MAX_M, dbn, self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
+                                            num_warps=cfg['dw'], num_stages=cfg['ds'])
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout,
-                                            H, k, MAX_M, 1024)
+                                            H, k, MAX_M, 1024, SCALE=float(scale),
+                                            OUT_BF16=out_bf16, HAS_SCALE=(scale != 1.0))
 
     def _route(self, m, k, x, ids, routing, act, staging):
         H, sc = self.H, self.scratch
@@ -555,21 +729,23 @@ class LayerPool:
             # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
             # kernel acknowledged its eviction): apply the posted swaps
             _commit[(1,)](Pointer(_glob['ring'], torch.int32), Pointer(_glob['seqs'], torch.int32), _glob['state'],
-                          _glob['table'], _glob['owner'], self.E, RING)
-        _pack[(triton.cdiv(m * H, BLOCK),)](
+                          _glob['table'], _glob['owner'], self.E, RING, num_warps=4)
+        grid = (1,) if self.full else (triton.cdiv(m * H, BLOCK),)
+        _pack[grid](
             Pointer(x, torch.int16), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
             Pointer(act or ids, torch.int32), self.table, Pointer(sx, torch.int16), Pointer(sids, torch.int32),
             Pointer(sroute, torch.int32), Pointer(sorig, torch.int32), self.used, self.rank, sc['rslot'],
-            sc['slot_list'], sc['slot_exp'], self.owner, m * H, nk, k, self.S, bool(act),
-            triton.next_power_of_2(S), BLOCK)
+            sc['slot_list'], sc['slot_exp'], sc['tok_mask'], self.owner, m * H, nk, k, self.S, bool(act),
+            self.full, MAX_ROUTES, triton.next_power_of_2(S), BLOCK)
 
-    def decode(self, stream, m, k, x, ids, routing, out, act=0):
-        """One decode call of up to MAX_M tokens on the current stream (device addresses; out: FP32 [m, H])."""
+    def decode(self, stream, m, k, x, ids, routing, out, act=0, out_bf16=False, scale=1.0):
+        """One decode call of up to MAX_M tokens on the current stream (device addresses; out: FP32 or BF16 [m, H])."""
         sc = self.scratch
         if self.full:   # every expert on the GPU: no CPU part
             self._route(m, k, x, ids, routing, act, (sc['sx'].data_ptr(), sc['sids'].data_ptr(),
                                                     sc['sroute'].data_ptr(), sc['sorig'].data_ptr()))
-            self._kernels(m, k, x, routing, Pointer(out, torch.float32))
+            out_ptr = Pointer(out, torch.bfloat16 if out_bf16 else torch.float32)
+            self._kernels(m, k, x, routing, out_ptr, out_bf16=out_bf16, scale=scale)
             return
         if not self._pool_on:
             if self.mailbox.lib.xtier_mailbox_pool_enable(self.mailbox.bridge, 1) < 0:
@@ -589,8 +765,10 @@ class LayerPool:
             _between[0] = None
             fn()
         self.mailbox.signal(stream, m, k, 2)
-        _unpack[(triton.cdiv(m * self.H, BLOCK),)](Pointer(sout, torch.float32), sc['gout'], Pointer(out, torch.float32),
-                                                   m * self.H, BLOCK)
+        out_ptr = Pointer(out, torch.bfloat16 if out_bf16 else torch.float32)
+        _unpack[(triton.cdiv(m * self.H, BLOCK),)](Pointer(sout, torch.float32), sc['gout'], out_ptr,
+                                                   m * self.H, BLOCK, SCALE=float(scale),
+                                                   OUT_BF16=out_bf16, HAS_SCALE=(scale != 1.0))
 
 
 def started():
@@ -602,7 +780,7 @@ def commit_now():
     """The commit kernel on the current stream, outside a decode window (cache/elastic.py before releasing slots)."""
     E = _glob['E']
     _commit[(1,)](Pointer(_glob['ring'], torch.int32), Pointer(_glob['seqs'], torch.int32), _glob['state'],
-                  _glob['table'], _glob['owner'], E, RING)
+                  _glob['table'], _glob['owner'], E, RING, num_warps=4)
 
 
 def maybe_start():
