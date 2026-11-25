@@ -63,9 +63,21 @@ Full verification matrix: [support.md](support.md) (in Chinese).
 | Dual-GPU `TP=2` | No P2P/NVLink needed (NCCL fallback); 2× RTX 3090 +42–48% on Qwen3.8 ([report](reports/2026-10-30-tp.md)) |
 | Second-GPU hot pool (`XTIER_GPU2_SLOTS=auto`) | Offloads hot experts to a slower second GPU (`TP=1`), +28–40% in 24+16 GB emulation ([report](reports/2026-10-31-second-gpu-pool.md)) |
 
+## Test machine hardware
+
+All benchmarks and regressions below were measured on this single-node host:
+
+| Component | Specification |
+|---|---|
+| GPU | 1× NVIDIA RTX PRO 5000 72 GB Blackwell (SM120, 73,415 MiB, PCIe 5.0 ×16) |
+| CPU | 2× AMD EPYC 9334 (64 cores / 128 threads total, Zen 4, AVX-512 BF16, 8-NUMA NPS4) |
+| Memory | 384 GiB DDR5 (24-channel, 377 GiB usable) |
+| Storage | 4× Samsung 9100 PRO 1 TB (PCIe 5.0 NVMe, cold/model pool) · 2× Optane P5800X 400 GB U.2 (embedding tables) · 1× 990 PRO 1 TB |
+| OS & Stack | Ubuntu 24.04.4 LTS (Linux 7.0) · NVIDIA 595.99.02 · CUDA 13.0 · PyTorch 2.14.1 · SGLang main `4ce41378f9` |
+
 ## Speed
 
-One RTX PRO 5000 72 GB + 2× EPYC 9334 (NPS4) + 384 GiB DDR5, in `tok/s`. Baseline = console "packs off" (upstream SGLang + XTier hybrid backend + required bring-up fixes, **not stock SGLang**). Full methodology & accuracy: [benchmarks.md](benchmarks.md).
+Measured in `tok/s`. Baseline = console "packs off" (upstream SGLang + XTier hybrid backend + required bring-up fixes, **not stock SGLang**). Full methodology & accuracy: [benchmarks.md](benchmarks.md).
 
 ### Inkling-2-Small (594B / 17B, multimodal)
 
@@ -73,7 +85,7 @@ One RTX PRO 5000 72 GB + 2× EPYC 9334 (NPS4) + 384 GiB DDR5, in `tok/s`. Baseli
 
 | Mode | Decode bs=1 | Decode bs=2 agg | 64K cold prefill | 256K cold prefill | 500K cold prefill | 500K cached decode |
 |---|---:|---:|---:|---:|---:|---:|
-| **XTier + packs (default)** | **74.7** (r0 81.7) | **78.4** | **3,835** | **2,464** | **1,593** | **43.7** (peak 47.0) |
+| **XTier + packs (default)** | **74.7** (r0 81.7) | **78.4** | **3,986** | **2,497** | **1,627** | **46.0** (peak 55.1) |
 | Baseline (packs off) | 47.9 | ~43 | 1,591 | 1,217 | OOM | OOM |
 
 Packs vs baseline: **2.41× / 2.02×** faster 64K / 256K prefill, **+56% / +82%** faster `bs=1` / `bs=2` decode, and NVFP4 KV (6.75 GiB) unlocks 500K. 2-round `agent_bench` (64K→513K): **66.2 tok/s** long replies (66.3 overall, accept 4.02). Accuracy: 13-seg `ΔNLL +0.00423` / `KL 0.00938`, copy `0/8`, 256K/500K needles `5/5`. Plan A+/B2 & trace anatomy: [report](reports/2026-11-25-inkling2-small.md) (ZH).
@@ -135,6 +147,7 @@ When host DRAM cannot fit all experts, `XTIER_COLD=1` offloads the coldest tail 
 
 ## Recent changes
 
+- **2026-11-25**: **100% lossless prefill speedups** — zero-patch fused `RelLogitsProj + ShearingBias` Triton kernel (bitwise `max_diff=0`, `-645 ms` and `-6.9 GiB` peak VRAM per 64K chunk), VRAM-aware 1-band `_reduce_band` (`B=512`), active-run `_mxfp8_reduce_runs`, vectorized `_act_quant_fp8` + SM120 `stages=4` W8A8, and exact-slab `cudaHostRegister` `_share_buffers` + cold-aware `CPU_SHARE`; Inkling-2 64K cold prefill `3,835 → 3,986 tok/s` (~4,250 steady-state chunk), 500K `1,593 → 1,627 tok/s` (`-6.6 s`), copy `0/4` (`c=1/2`), PPL `2.7172` (ΔNLL `+0.00005`). [Report](reports/2026-11-25-inkling2-small.md)
 - **2026-11-25 (v0.1.10)**: adds zero-patch **Inkling-2-Small (594B multimodal)** pack & console card (default Plan A+: `cold=2%`, 45 hot slots, 64K single-chunk 3,835 tok/s, NVFP4 KV unlocking 500K, 2-round agent 66.3 tok/s; `cold=off` Plan B2 with `L47` full-GPU), plus the 11-24 DeepSeek 9K+ lossless speedups. [Report](reports/2026-11-25-inkling2-small.md)
 - **2026-11-24**: 100% lossless DeepSeek V4.1 & core speedups (24-token weight reuse, 43-layer FP8 `wo_a`, fused writeback, SM120 eager MXFP8), pushing 500K cold prefill >9,000 tok/s and 4-way fresh decode to 268 tok/s.
 - **2026-11-23 (v0.1.9)**: adds zero-patch **Hunyuan-4-Flash NVFP4** pack & native 5-layer DFly2 speculative decoding (1M NVFP4 KV 7.95 GB, bs=1 92.1 / bs=4 190 tok/s), `tools/fast_verify.py` 3-tier verification, and community SM89 L20 PRs (#18/#7/#19).

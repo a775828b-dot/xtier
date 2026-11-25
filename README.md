@@ -67,9 +67,21 @@ python -m xtier.console --port 8080             # 打开启动台（或直接运
 | 双卡张量并行（`TP=2`） | 无需 P2P / NVLink（走 NCCL），双 RTX 3090 跑 Qwen3.8 提速 +42–48%（[报告](docs/reports/2026-10-30-tp.md)） |
 | 异构双卡热专家池（`XTIER_GPU2_SLOTS=auto`） | 第二张慢卡只存热专家并代算（`TP=1`），模拟 24+16 GB 提速 +28–40%（[报告](docs/reports/2026-10-31-second-gpu-pool.md)） |
 
+## 测试机硬件配置
+
+下文所有测速与回归均在以下单机平台实测：
+
+| 部件 | 规格 |
+|---|---|
+| GPU | 1× NVIDIA RTX PRO 5000 72 GB Blackwell（SM120，73,415 MiB，PCIe 5.0 ×16） |
+| CPU | 2× AMD EPYC 9334（共 64 核 128 线程，Zen 4，AVX-512 BF16，8-NUMA NPS4） |
+| 内存 | 384 GiB DDR5（24 通道，系统可用 377 GiB） |
+| 存储 | 4× Samsung 9100 PRO 1 TB（PCIe 5.0 NVMe，冷专家/模型池）· 2× Optane P5800X 400 GB U.2（大嵌入表）· 1× 990 PRO 1 TB |
+| 系统与软件 | Ubuntu 24.04.4 LTS（Linux 7.0）· NVIDIA 595.99.02 · CUDA 13.0 · PyTorch 2.14.1 · SGLang main `4ce41378f9` |
+
 ## 测速
 
-平台：单卡 RTX PRO 5000 72 GB + 2× EPYC 9334（NPS4）+ 384 GiB DDR5，单位 `tok/s`。基线 = 启动台「关加速包」（官方 SGLang + XTier 混合后端与跑通必需修正，**不是原版 SGLang**）。详细配置、精度与原始数据见[测速细节](docs/benchmarks.md)。
+单位 `tok/s`。基线 = 启动台「关加速包」（官方 SGLang + XTier 混合后端与跑通必需修正，**不是原版 SGLang**）。详细配置、精度与原始数据见[测速细节](docs/benchmarks.md)。
 
 ### Inkling-2-Small（594B / 17B，多模态）
 
@@ -77,7 +89,7 @@ python -m xtier.console --port 8080             # 打开启动台（或直接运
 
 | 模式 | 单路 decode（bs=1） | 2 并发合计（bs=2） | 64K 冷 prefill | 256K 冷 prefill | 500K 冷 prefill | 500K 缓存 decode |
 |---|---:|---:|---:|---:|---:|---:|
-| **XTier + 加速包（默认）** | **74.7**（首轮 81.7） | **78.4** | **3,835** | **2,464** | **1,593** | **43.7**（峰 47.0） |
+| **XTier + 加速包（默认）** | **74.7**（首轮 81.7） | **78.4** | **3,986** | **2,497** | **1,627** | **46.0**（峰 55.1） |
 | 基线（关加速包） | 47.9 | ~43 | 1,591 | 1,217 | OOM | OOM |
 
 加速包对基线：64K / 256K 冷 prefill 提速 **2.41× / 2.02×**，短文 `bs=1` / `bs=2` 提速 **+56% / +82%**，NVFP4 KV（6.75 GiB）完整解锁 500K；两轮 `agent_bench`（64K→513K）长回复 **66.2 tok/s**（全部 66.3，接受长度 4.02）。精度：13 段 `ΔNLL +0.00423` / `KL 0.00938`，照抄 `0/8`，256K/500K 捞针全 `5/5`。方案 A+/B2 对比与解/预填剖析见[报告](docs/reports/2026-11-25-inkling2-small.md)。
@@ -139,6 +151,7 @@ SGLang M3.1 分支（PR #45925），64K 会话加速包对比官方代码 + 必�
 
 ## 版本更新
 
+- **2026-11-25**：**Prefill 100% 无损提速**——新增零补丁融合 `RelLogitsProj + ShearingBias` Triton 核（逐比特 `max_diff=0`，64K 省 645 ms 与 6.9 GiB 峰值显存）、显存感知 1-band `_reduce_band`（`B=512`）、`_mxfp8_reduce_runs` 活跃 run 归约、向量化 `_act_quant_fp8` + SM120 `stages=4` W8A8，以及精确 slab `cudaHostRegister` `_share_buffers` 与冷专家 `CPU_SHARE` 支持；Inkling-2 64K 冷 prefill `3,835 → 3,986 tok/s`（稳态块 ~4,250）、500K `1,593 → 1,627 tok/s`（`-6.6 s`），照抄 `0/4`（`c=1/2`）、PPL `2.7172`（ΔNLL `+0.00005`）零损。[报告](docs/reports/2026-11-25-inkling2-small.md)
 - **2026-11-25（v0.1.10）**：新增 **Inkling-2-Small（594B 多模态）** 零补丁加速包与启动台卡片（默认方案 A+：`cold=2%`、45 热槽、64K 单块 3,835 tok/s、NVFP4 KV 解锁 500K、两轮 agent 66.3 tok/s；`cold=off` 方案 B2 仅 `L47` 全驻），并打包合入 11-24 的 DeepSeek 无损 9K+ 优化。[报告](docs/reports/2026-11-25-inkling2-small.md)
 - **2026-11-24**：DeepSeek V4.1 与通用层新一轮 100% 无损提速（24-token 权重复用、43 层 FP8 `wo_a`、写回融合、SM120 Eager MXFP8 快分发），500K 冷 prefill 双破 9,000 tok/s，4 并发新写达 268 tok/s。
 - **2026-11-23（v0.1.9）**：新增 **Hunyuan-4-Flash NVFP4** 零补丁加速包与原生 5 层 DFly2 投机解码（1M 混合 NVFP4 KV 7.95 GB，bs=1 92.1 / bs=4 190 tok/s），上线 `tools/fast_verify.py` 三层快速验证，合入社区 L20（SM89）等 PR（#18/#7/#19）。

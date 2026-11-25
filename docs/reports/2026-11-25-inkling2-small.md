@@ -78,3 +78,30 @@ XTier v0.1.10，官方 SGLang main `4ce41378f9`（零源码改动），单卡 RT
 2. **Decode（突破 CPU 内存带宽墙）**：
    - **短期无损工程收益**：①修复 `bs=2` 尾端 **`4.33 ms` Host 同步间隙** + 解码期 8 层 Global Attention 切片投影（免 `3×16=48` 退回 `_w8a8_gemm`，省 `0.86 ms`），`bs=2` 可直接再提 `+8%–10%`；②引入 `tools/plan_auto.py` 按层路由集中度与 NVFP4/MXFP8 代价非均匀分配 45 槽（把更多热槽倾斜给高 miss/高代价层，减 `1–2 ms/步`）；③在 `cold=2%` 时为 97.9% 内存专家探索有限度 `XTIER_DECODE_MISS_GPU`（仅对 MXFP8 `L40..47` 或极低 CPU 负载时需权衡 PCIe 延迟 383 µs/专家）。
    - **物理天花板与硬件路线**：单步 `bs=1` 64% 耗时受限于 24 通道 DDR5 带宽读取 18–33 MB 大专家；无损条件下只有**加大显存（如 96 GB PRO 6000 或 `TP=2` 双卡将热槽翻倍至 100+ 槽）**或**允许轻微精损的动态尾部跳过（`XTIER_TAIL_SKIP`）**才能把 `bs=1` 从 ~70 tok/s 推上 100+ tok/s。
+## 6. 无损 Prefill 优化实测（v0.1.10 之后）
+
+针对第 4 节 Trace 暴露的瓶颈，落地以下 **100% 无损** 优化（零 SGLang 补丁）：
+
+1. **融合 `RelLogitsProj + ShearingBias` Triton 核（`xtier/packs/inkling2/attn.py`，`XTIER_INKLING2_FUSED_SHEAR=1`）**：
+   - 原实现先做 `einsum("thd,de->the")` 写出 `6.45 GiB` `rel_logits`（`350 ms`，144 次 32×32 WMMA），再由 CuTe `ShearingBias` 读回并重排写出 `8.06 GiB` `bias`（`614 ms`）。
+   - 改为挂钩 `RelLogitsProj.forward` + `_flash_attn_fwd`（走原生 `rel_bias_presheared=True`），在单个 Triton 核内对每个 token 直接以 `[48, 16] @ [16, 256]` Tensor Core `tl.dot` 计算并按 sheared 坐标写入 `_shear_bias_workspace`。
+   - 单层 64K 实测 `21.76 → 8.30 ms`（**2.62×**，48 层直省 **645 ms/64K 块**），SWA/Global/256K paged/2 并发不规则 batch/非连续 view 5 组边界单测均为 `inf_match=True`、`max_diff=0.00e+00` 逐比特一致，且直接省去 **`6.45 GiB` 中间显存**（64K prefill 峰值需求从 `43.9 → 37.0 GiB`）。
+2. **显存感知动态 1-band `_reduce_band`（`B=512`）+ `_mxfp8_reduce_runs` 活跃 run 归约（`xtier/backend/prefill.py`）**：
+   - 取消 `total_gpu <= 393216` 硬阈值，改为按当前可用显存留 `4.5 GiB` 裕量自动单 band 归约（消除 64K 8 轮 FP32 `acc` 往返）并将瓦片扩宽至 `B=512`。
+   - MXFP8 以 `_mxfp8_reduce_runs` + `torch.sort` 替代每子批 `_hist_rows`/`cumsum` + 全 token 扫描，消除空 CTA，FMA 精度 1-ULP 对齐。
+   - 提升暂存深度 `XTIER_PREFILL_FP4_SLOTS=12`、`XTIER_PREFILL_MXFP8_SLOTS=8`；单层 64K 实测 NVFP4 `132.8 → 129.5 ms`、MXFP8 `228.4 → 222.7 ms`，均已贴近 PCIe 5.0 x16 物理线速（`52–54 GB/s`）。
+3. **向量化 `_act_quant_fp8`（`ROWS_PER_CTA=8`）+ SM120 `_w8a8_gemm` `stages=4`（`xtier/packs/glm5_next/fp8_weights.py`）**：
+   - 逐比特 `0` 差异，量化提速 `1.58×`、SM120 W8A8 达 `283.8 TFLOPS`（实测已优于 FlashInfer CUTLASS / DeepGEMM / `mm_mxfp8` 在 RTX PRO 5000 上约 272–275 TFLOPS 的硬件上限）。
+4. **精确 slab `cudaHostRegister` `_share_buffers` + 冷专家 `CPU_SHARE` 解锁（`xtier/backend/prefill.py`）**：
+   - 消除 `pin_memory=True` 扩容时 PyTorch `CachingHostAllocator` 按 2 的幂永久锁住 3–6.5 GiB 主机内存的问题；解锁冷专家模式下对 100% 驻留内存块（`0 .. C//CH - 1`）的 CPU 分担（单测 `nvme_reads_delta=0`）。
+   - 实测消融确认：Inkling-2 48 层 MoE 已贴近 PCIe 5.0 物理线速且 384 专家分布较均衡，开 112 线程 CPU 分担会与 PCIe 5.0 DMA 争用 24 通道 DDR5（单块上传 `2.6 → 3.43 ms`），因此 Inkling-2 默认关闭 `XTIER_PREFILL_CPU_SHARE=0`（仍保留为启动台可选项，并惠及高稀疏路由模型）。
+
+| 指标（Inkling-2 Plan A+ 默认） | v0.1.10 | 无损 Prefill 优化后 | 变化 |
+|---|---:|---:|---:|
+| 64K 冷 Prefill（首次 / 稳态块） | 3,835 tok/s（17.10 s） | **3,986 tok/s（16.46 s）** / 稳态 ~4,250 | **-0.64 s（+3.9%）** |
+| 256K 冷 Prefill | 2,464 tok/s（106.4 s） | **2,497 tok/s（105.0 s）** | **-1.4 s（+1.3%）** |
+| 500K 冷 Prefill | 1,593 tok/s（313.9 s） | **1,627 tok/s（307.3 s）** | **-6.6 s（+2.1%）** |
+| 64K Prefill 峰值显存需求 | 43.9 GiB | **37.0 GiB** | **-6.9 GiB** |
+| 实测全程峰值显存 / 最低可用内存 | 72.3 GiB / 12 GiB | **71.9 GiB / 9.2 GiB**（同机含 1.8M 语料客户端） | 0 OOM 重试 |
+| 照抄（`T=0.01`，`c=1 / c=2`） | `0/4` / `0/4` | **`0/4` / `0/4`** | 100% 无损 |
+| 13 段 PPL（docs/agent/zh） | `2.7171`（NLL `0.99955`） | **`2.7172`（NLL `0.99960`）** | ΔNLL `+0.00005`（零漂移） |

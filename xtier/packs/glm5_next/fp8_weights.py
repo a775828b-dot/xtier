@@ -94,14 +94,17 @@ def _w8_dequant(W, S, D, N, K, NG, BN: tl.constexpr, BK: tl.constexpr):
 
 
 @triton.jit
-def _act_quant_fp8(X, Q, S, M, K, NG, BK: tl.constexpr):
-    r = tl.program_id(0).to(tl.int64)
+def _act_quant_fp8(X, Q, S, M, K, NG, ROWS_PER_CTA: tl.constexpr, BK: tl.constexpr):
+    r0 = tl.program_id(0).to(tl.int64) * ROWS_PER_CTA
     g = tl.program_id(1).to(tl.int64)
+    rs = r0 + tl.arange(0, ROWS_PER_CTA)
     ks = g * BK + tl.arange(0, BK)
-    x = tl.load(X + r * K + ks, mask=ks < K, other=0.0).to(tl.float32)
-    s = tl.maximum(tl.max(tl.abs(x), 0) / 448.0, 1e-12)
-    tl.store(Q + r * K + ks, (x / s).to(tl.float8e4nv), mask=ks < K)
-    tl.store(S + r * NG + g, s)
+    rm = rs < M
+    mask = rm[:, None] & (ks[None, :] < K)
+    x = tl.load(X + rs[:, None] * K + ks[None, :], mask=mask, other=0.0).to(tl.float32)
+    s = tl.maximum(tl.max(tl.abs(x), axis=1) / 448.0, 1e-12)
+    tl.store(Q + rs[:, None] * K + ks[None, :], (x / s[:, None]).to(tl.float8e4nv), mask=mask)
+    tl.store(S + rs * NG + g, s, mask=rm)
 
 
 @triton.jit
@@ -174,13 +177,23 @@ def dequant(q, s):
     return d
 
 
-def gemm_w8a8(x, q, s, bias=None, bm=128, bn=128, warps=8, stages=3):
+_W8A8_STAGES = {}
+
+
+def gemm_w8a8(x, q, s, bias=None, bm=128, bn=128, warps=8, stages=None):
     """x [M, K] BF16 (prefill), q FP8 [N, K], s FP32 [N, K / 128] -> [M, N] BF16."""
     m, k = x.shape
     n, ng = q.shape[0], k // GROUP
     xq = torch.empty((m, k), device=x.device, dtype=torch.float8_e4m3fn)
     xs = torch.empty((m, ng), device=x.device, dtype=torch.float32)
-    _act_quant_fp8[(m, ng)](x, xq, xs, m, k, ng, GROUP)
+    rows_per_cta = 8 if m >= 64 else 1
+    _act_quant_fp8[(triton.cdiv(m, rows_per_cta), ng)](x, xq, xs, m, k, ng, rows_per_cta, GROUP, num_warps=4)
+    if stages is None:
+        dev_idx = x.device.index
+        stages = _W8A8_STAGES.get(dev_idx)
+        if stages is None:
+            stages = 4 if torch.cuda.get_device_capability(x.device)[0] >= 12 else 3
+            _W8A8_STAGES[dev_idx] = stages
     y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
     _w8a8_gemm[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](xq, xs, q, s, y, m, n, k, ng, bm, bn, GROUP, 8,
                                                           num_warps=warps, num_stages=stages)

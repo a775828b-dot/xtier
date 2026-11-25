@@ -34,8 +34,8 @@ MODEL = {
     'name': 'Inkling-2 Small', 'code': 'INKLING2-S', 'port': 18195, 'served': 'Inkling-2-Small',
     'spec': 'DSpark', 'arch': '48 层（40 SWA + 8 全局）· 384 专家 top-8 · 40 NVFP4 + 8 MXFP8 · 多模态',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 3600, 'guard_gib': 8,
-    'bench': {'kind': 'agent', 'dec': '66.2', 'pre': '3835 / 1593',
-              'title': '方案 A+（2% 冷专家，45 热槽，12 GiB 可用内存）：64K/500K 文本冷 prefill 3835 / 1593 tok/s，'
+    'bench': {'kind': 'agent', 'dec': '66.2', 'pre': '3986 / 1627',
+              'title': '方案 A+（2% 冷专家，45 热槽，12 GiB 可用内存）：64K/500K 文本冷 prefill 3986 / 1627 tok/s，'
                        '短测速 1 路 74.7 / 2 路 78.4，64K 稳态 decode 66.7（42.0 ms/step）；'
                        'agent_bench 两轮 64K–500K 长回复 66.2 tok/s（全部 66.3，接受长度 4.02）'},
     'options': _common() + [
@@ -46,11 +46,11 @@ MODEL = {
                      ['08', '8% · 约 28 GiB 放 4 块 NVMe（稳妥内存 ~30 GiB，方案 A）'],
                      ['15', '15% · 约 53 GiB 放硬盘'],
                      ['off', '关 · 仅 L47 全驻 GPU 零内存（方案 B2，48K 分块 + 35 热槽）']],
-         'hint': '方案 A+（2% 冷专家，376/384 在内存）：仅 0.2–0.7 次/步读盘，2 分钟快载，45 热槽，64K 单块 3835 tok/s；'
+         'hint': '方案 A+（2% 冷专家，376/384 在内存）：仅 0.2–0.7 次/步读盘，2 分钟快载，45 热槽，64K 单块 3986 tok/s；'
                  '方案 B2（关冷专家）：仅将 1 个 MXFP8 层 L47（11.75 GiB）全驻 GPU 换出内存，无 NVMe 读盘，48K 分块 2846 tok/s + 35 热槽'},
         elastic_option('on', 'prefill 时仅留 1 基础槽释放 40+ GiB 显存，decode 时压榨至 70.6/73.4 GiB（方案 A+ 45 槽 / 方案 B2 35 槽）'),
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '65664',
-         'choices': [['65664', '64K 单块 · 实测推荐（3835 tok/s）'], ['49152', '48K'], ['32768', '32K'], ['16384', '16K']],
+         'choices': [['65664', '64K 单块 · 实测推荐（3986 tok/s）'], ['49152', '48K'], ['32768', '32K'], ['16384', '16K']],
          'hint': '方案 A+ 配合弹性底座（base=1）支持 65664 单块吃下完整 64K 提示；方案 B2 自动使用 48K（49152）',
          'off_when': [{'packs': 'off'}, {'cold': 'off'}]},
         {'key': 'truncate', 'label': 'DSpark 在线截断', 'default': '0.20',
@@ -58,8 +58,8 @@ MODEL = {
          'hint': '通过 OnlineAcceptanceEstimator 按接受概率跳过低收益草稿验证（仅加速不改采样分布，照抄与 PPL/KL 全项无损）',
          'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
         miss_option([{'cold': c} for c in ('02', '08', '15')]),
-        share_option('on', '读长提示时由 CPU 分担路由较少的专家块（方案 B2 关冷专家时生效）',
-                     [{'cold': c} for c in ('02', '08', '15')]),
+        share_option('off', '读长提示时由 CPU 分担路由较少的内存常驻专家块（Inkling-2 MoE 已贴近 PCIe 5.0 线速，默认关以避免内存带宽争用）',
+                     [{'packs': 'off'}]),
         interleave_option([['64', '64 步 / 块'], ['32', '32 步 / 块']], '64',
                           '一个请求在读长提示时，每读完一块先让其他并发请求 decode 这么多步'),
     ],
@@ -95,6 +95,7 @@ def build(o, port):
             XTIER_INKLING2_KV_FP4='0', XTIER_FP8_WEIGHTS='0',
             XTIER_RECALL='0', XTIER_DSPARK_TRUNCATE='0',
             XTIER_DRAFT_LMHEAD_FP8='0', XTIER_INKLING2_MARKOV_PAD2='0',
+            XTIER_INKLING2_FUSED_SHEAR='0', XTIER_PREFILL_CPU_SHARE='0',
         )
     else:
         env.update(
@@ -107,6 +108,7 @@ def build(o, port):
             XTIER_CACHE_ELASTIC_IDLE_CHUNK='1024' if interleaving else '4',
             XTIER_DSPARK_TRUNCATE=o['truncate'] if o['spec'] == 'on' else '0',
         )
+        env.update(share_env(o))
     if not plan_b:
         env.update(
             XTIER_COLD='1', XTIER_FAST_LOAD='1',
@@ -119,7 +121,6 @@ def build(o, port):
             XTIER_CACHE_FULL='47', XTIER_PREFILL_FP4_PRESWIZZLE='0',
         )
         env.update(miss_env(o))
-        env.update(share_env(o))
     return env, [str(HERE / 'run-inkling2-xtier.sh'), *interleave_args(o)]
 
 
@@ -135,6 +136,6 @@ def tags(o):
         out.append('弹性热专家')
     if o['packs'] == 'on' and o['spec'] == 'on' and o['truncate'] != '0':
         out.append(f"在线截断 {o['truncate']}")
-    if o['cold'] == 'off':
+    if o['packs'] == 'on':
         out += share_tags(o)
     return out + interleave_tags(o)

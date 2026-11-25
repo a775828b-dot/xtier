@@ -404,22 +404,32 @@ def _mxfp8_act_bf16(MID13, MID, I: tl.constexpr, B: tl.constexpr,
 
 
 @tr.jit
-def _mxfp8_reduce_chunk(OUT2, PAD_POS, WEIGHTS, PERM, ROFF, ACC, B: tl.constexpr, HID: tl.constexpr):
-    """Deterministic weighted reduction of one MXFP8 chunk's valid routes into FP32 ACC[m, H]."""
-    tok = tl.program_id(0).to(tl.int64)
+def _mxfp8_reduce_runs(OUT2, PAD_POS, WEIGHTS, PERM, TOK_SORTED, ACC, NB,
+                       B: tl.constexpr, HID: tl.constexpr):
+    """Deterministic active-token weighted reduction of one MXFP8 sub-batch into FP32 ACC[m, H].
+    Only the first index of each consecutive token run in TOK_SORTED reduces that run in ascending
+    PERM order, eliminating empty-token CTAs and per-sub-batch histogram/cumsum launches."""
+    idx = tl.program_id(0)
+    tok = tl.load(TOK_SORTED + idx).to(tl.int64)
+    if idx > 0:
+        prev = tl.load(TOK_SORTED + idx - 1).to(tl.int64)
+        if prev == tok:
+            return
     c = tl.program_id(1) * B + tl.arange(0, B)
     cm = c < HID
-    s0 = tl.load(ROFF + tok)
-    s1 = tl.load(ROFF + tok + 1)
-    if s0 == s1:
-        return
     acc = tl.load(ACC + tok * HID + c, mask=cm, other=0.0)
-    for idx in range(s0, s1):
-        p = tl.load(PERM + idx).to(tl.int64)
-        prow = tl.load(PAD_POS + p).to(tl.int64)
-        w = tl.load(WEIGHTS + p)
-        v = tl.load(OUT2 + prow * HID + c, mask=cm, other=0.0).to(tl.float32)
-        acc += v * w
+    cur = idx
+    while cur < NB:
+        t_cur = tl.load(TOK_SORTED + cur).to(tl.int64)
+        if t_cur != tok:
+            cur = NB
+        else:
+            p = tl.load(PERM + cur).to(tl.int64)
+            prow = tl.load(PAD_POS + p).to(tl.int64)
+            w = tl.load(WEIGHTS + p)
+            v = tl.load(OUT2 + prow * HID + c, mask=cm, other=0.0).to(tl.float32)
+            acc += v * w
+            cur += 1
     tl.store(ACC + tok * HID + c, acc, mask=cm)
 
 
@@ -606,15 +616,35 @@ def cpu_share():
 
 
 def _share_buffers(H, k, n):
-    """Pinned host memory for n rows of the CPU part (x, ids, weights in; FP32 out), kept between calls."""
+    """Page-locked host memory for n rows of the CPU part (x, ids, weights in; FP32 out), kept between calls.
+    Uses one contiguous pageable slab registered with cudaHostRegister (unregistered and freed before growing)
+    instead of torch's pin_memory=True CachingHostAllocator, which rounds allocations up to powers of two and
+    retains every old bucket permanently."""
     b = _share_host.get((H, k))
     if b is None or b['cap'] < n:
+        cudart = _runtime()
+        if b is not None:
+            torch.cuda.synchronize()
+            cudart.cudaHostUnregister(b['_reg'])
+            _share_host.pop((H, k), None)
+            del b
         cap = -(-max(n, 4096) // 4096) * 4096
+        align = lambda v: (v + 4095) // 4096 * 4096
+        off_x = 0
+        off_ids = align(off_x + cap * H * 2)
+        off_w = align(off_ids + cap * k * 4)
+        off_out = align(off_w + cap * k * 4)
+        total = align(off_out + cap * H * 4)
+        raw = torch.empty(total + 4096, dtype=torch.uint8)
+        pad = (4096 - (raw.data_ptr() & 4095)) & 4095
+        slab = raw[pad:pad + total]
+        _check(cudart.cudaHostRegister(slab.data_ptr(), total, 0), 'cudaHostRegister')
         b = _share_host[(H, k)] = dict(
-            cap=cap, x=torch.empty((cap, H), dtype=torch.bfloat16, pin_memory=True),
-            ids=torch.empty((cap, k), dtype=torch.int32, pin_memory=True),
-            w=torch.empty((cap, k), dtype=torch.float32, pin_memory=True),
-            out=torch.empty((cap, H), dtype=torch.float32, pin_memory=True))
+            cap=cap, _raw=raw, _reg=slab.data_ptr(),
+            x=slab[off_x:off_x + cap * H * 2].view(torch.bfloat16).view(cap, H),
+            ids=slab[off_ids:off_ids + cap * k * 4].view(torch.int32).view(cap, k),
+            w=slab[off_w:off_w + cap * k * 4].view(torch.float32).view(cap, k),
+            out=slab[off_out:off_out + cap * H * 4].view(torch.float32).view(cap, H))
     return b
 
 
@@ -1202,10 +1232,11 @@ class Prefill:
             for t in ((1,) if weights_only else (1, 3)):
                 slot[t][i].copy_(a[t][r], non_blocking=True)
 
-    def _share_plan(self, tokens, issued, skip):
+    def _share_plan(self, tokens, issued, skip, blocked=None):
         """XTIER_PREFILL_CPU_SHARE: split this call's expert chunks by its routes. tokens[j]: the tokens routed into
-        chunk j; issued: the chunks whose upload has started (they stay on the GPU). Adds to `skip` the chunks that
-        are not uploaded and returns the ones among them the CPU computes (the others have no token)."""
+        chunk j; issued: the chunks whose upload has started (they stay on the GPU); blocked: chunks not eligible for
+        CPU compute (e.g. chunks containing NVMe cold experts) that still need GPU upload if non-empty. Adds to `skip`
+        the chunks that are not uploaded and returns the ones among them the CPU computes (the others have no token)."""
         key = (self.hidden, self.inter, self.chunk)
         cost = _share_cost.get(key)
         if cost is None:   # PCIe 5.0 x16; refined from the calls
@@ -1217,8 +1248,10 @@ class Prefill:
         # routes were known (the slot ring, the previous layer's prefetch) arrive while the attention computes, the
         # others one after the other on the copy engine during the call (2026-11-10, DeepSeek V4.1: 36 of 48 chunks,
         # 94 ms of a layer's 219). Its arithmetic over the uploaded experts only bounds it from below.
-        free = sorted((int(c), j) for j, c in enumerate(tokens) if j not in issued)
-        waits = len(free)
+        cant_cpu = issued if not blocked else (issued | blocked)
+        free = sorted((int(c), j) for j, c in enumerate(tokens) if j not in cant_cpu)
+        extra_waits = sum(1 for j in (blocked or ()) if j not in issued and j not in skip and int(tokens[j]) > 0)
+        waits = len(free) + extra_waits
         gpu_routes = sum(int(c) for c in tokens)
         cpu, mine = 0.0, []
         for count, j in free:
@@ -1256,6 +1289,9 @@ class Prefill:
         buf = _share_buffers(H, k, n)
         gx = x_t.index_select(0, rows)
         gi = torch.where(routes, ids_t, -1).index_select(0, rows)
+        if self.cold is not None and self.cold.vexpert is not None:
+            vexp = torch.tensor(self.cold.vexpert, dtype=torch.int32, device='cuda')
+            gi = torch.where(gi >= 0, vexp[gi.clamp(min=0).long()], gi)
         gw = torch.where(routes, w_t, 0.0).index_select(0, rows)
         gx_ev = torch.cuda.Event()
         gx_ev.record(compute)
@@ -1505,9 +1541,11 @@ class Prefill:
                                 skip.add(j)
                             self.chunks_skipped += 1
                     share = None
-                    if cpu_share() and self.cold is None and self.native is not None and n_chunks > 1:
+                    if cpu_share() and self.native is not None and n_chunks > 1:
+                        ram_chunks = (self.cold.C // CH) if (self.cold is not None and self.cold.vexpert is not None) else n_chunks
+                        blocked = set(range(ram_chunks, n_chunks)) if ram_chunks < n_chunks else None
                         waits = n_chunks - len(issued)
-                        mine = self._share_plan(host[:n_chunks], issued, skip)
+                        mine = self._share_plan(host[:n_chunks], issued, skip, blocked=blocked)
                         share = (self._share_start(mine, touch, x_t, ids_t, w_t, k, n_chunks) if mine else None, mine,
                                  waits - len(skip), time.perf_counter())
                         defer_cross[0] = share[0] is not None
@@ -1640,8 +1678,16 @@ class Prefill:
                     env_band = os.environ.get('XTIER_PREFILL_FP4_BAND_ROWS')
                     if env_band:
                         band_cap = max(max_nr, int(env_band))
-                    elif total_gpu > 65536 and total_gpu <= 393216 and (torch.cuda.mem_get_info()[0] / (1 << 30)) >= 6.0:
-                        band_cap = max(max_nr, total_gpu)
+                    elif total_gpu > 65536:
+                        avail_gib = torch.cuda.mem_get_info()[0] / (1 << 30)
+                        need_1_gib = total_gpu * H * 2 / (1 << 30)
+                        if need_1_gib <= avail_gib - 4.5:
+                            band_cap = max(max_nr, total_gpu)
+                        else:
+                            acc_gib = m * H * 4 / (1 << 30)
+                            budget_gib = max(0.0, avail_gib - acc_gib - 4.5)
+                            fit_rows = int(budget_gib * (1 << 30) // (H * 2))
+                            band_cap = max(max_nr, max(65536, (fit_rows // 65536) * 65536))
                     else:
                         band_cap = max(max_nr, 65536)
                     bands = []  # [(r_start, r_end, last_chunk_j), ...]
@@ -1748,9 +1794,9 @@ class Prefill:
                             if nb > 0:
                                 _hist_rows[(tr.cdiv(nb, 512),)](b_rows, rc, nb, 512, num_warps=4)
                             torch.cumsum(rc, 0, dtype=torch.int32, out=roff[1:])
-                            _reduce_band[(m, tr.cdiv(H, 256))](
+                            _reduce_band[(m, tr.cdiv(H, 512))](
                                 parts_buf, perm, roff, acc, parts_buf, roff, Pointer(out, torch.bfloat16),
-                                b_idx == 0, False, False, 256, H, num_warps=8)
+                                b_idx == 0, False, False, 512, H, num_warps=8)
                             next_band_idx = b_idx + 1
                             cur_band_b0 = bands[next_band_idx][0]
 
@@ -1790,17 +1836,17 @@ class Prefill:
                         if nb > 0:
                             _hist_rows[(tr.cdiv(nb, 512),)](b_rows, rc, nb, 512, num_warps=4)
                         torch.cumsum(rc, 0, dtype=torch.int32, out=roff[1:])
-                        _reduce_band[(m, tr.cdiv(H, 256))](
+                        _reduce_band[(m, tr.cdiv(H, 512))](
                             parts_buf, perm, roff, acc if acc is not None else parts_buf,
                             cpu_dev if has_cpu else parts_buf, cpu_idx if has_cpu else roff,
                             Pointer(out, torch.bfloat16),
-                            b_idx == 0, True, has_cpu, 256, H, num_warps=8)
+                            b_idx == 0, True, has_cpu, 512, H, num_warps=8)
                     else:
-                        _reduce_band[(m, tr.cdiv(H, 256))](
+                        _reduce_band[(m, tr.cdiv(H, 512))](
                             parts_buf, roff, roff, parts_buf,
                             cpu_dev if has_cpu else parts_buf, cpu_idx if has_cpu else roff,
                             Pointer(out, torch.bfloat16),
-                            True, True, has_cpu, 256, H, num_warps=8)
+                            True, True, has_cpu, 512, H, num_warps=8)
                 else:
                     _emit[(m, tr.cdiv(H, 256))](acc, Pointer(out, torch.bfloat16), 256, H)
 
@@ -2228,8 +2274,6 @@ class Prefill:
 
                     # Allocate reusable per-layer workspaces sized to peak_pad.
                     acc = torch.zeros((m, H), dtype=torch.float32, device='cuda')
-                    roff = torch.zeros(m + 1, dtype=torch.int32, device='cuda')
-                    rc = torch.empty(m, dtype=torch.int32, device='cuda')
                     xq_pad_buf = torch.empty((peak_pad, H), dtype=torch.float8_e4m3fn, device='cuda')
                     xsf_pad_buf = torch.empty((peak_pad, sf_cols), dtype=torch.uint8, device='cuda')
                     mid13_buf = torch.empty((peak_pad, 2 * I), dtype=torch.bfloat16, device='cuda')
@@ -2304,12 +2348,10 @@ class Prefill:
                                 grouped_mm_mxfp8(mid_q, w2_fp8, mid_sf_2d, s2_swiz, m_indptr_d, out=out2)
 
                                 nb = v_tok_b.numel()
-                                perm = torch.argsort(v_tok_b, stable=True).to(torch.int32)
-                                rc.zero_()
-                                _hist_rows[(tr.cdiv(nb, 512),)](v_tok_b, rc, nb, 512, num_warps=4)
-                                torch.cumsum(rc, 0, dtype=torch.int32, out=roff[1:])
-                                _mxfp8_reduce_chunk[(m, tr.cdiv(H, 256))](
-                                    out2, v_pos_b, v_w_b, perm, roff, acc, 256, H, num_warps=8)
+                                if nb > 0:
+                                    tok_sorted, perm = torch.sort(v_tok_b, stable=True)
+                                    _mxfp8_reduce_runs[(nb, tr.cdiv(H, 512))](
+                                        out2, v_pos_b, v_w_b, perm, tok_sorted, acc, nb, 512, H, num_warps=8)
                             w = None
                             ev = torch.cuda.Event(); ev.record(compute); freed[slot] = ev
                         else:
