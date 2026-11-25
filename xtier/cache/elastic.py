@@ -265,11 +265,16 @@ class Governor:
                     _check(lib, lib.xtier_mailbox_pool_shrink(k))
                     self._settle()           # the evictions leave the residency table before the granules go
                 freed = self.bytes(target, self.extra)
+                # cuMemUnmap invalidates the device VAs at once. _settle() above only drains the
+                # kernels launched before it; the scheduler does not take the governor lock, so a
+                # forward can still be submitted while the loop below unmaps. Drain both sides.
+                torch.cuda.synchronize()
                 for p in self.pools:
                     keep = self._slots(p, target)
                     for a in p.arena:
                         _check(lib, lib.xtier_mailbox_vmm_unmap(C.c_void_p(a.data_ptr()), keep * a[0].numel()))
                     p.active = keep
+                torch.cuda.synchronize()
                 n, self.extra = self.extra - target, target
             finally:
                 lib.xtier_mailbox_pool_resume()
