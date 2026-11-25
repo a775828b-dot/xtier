@@ -156,7 +156,7 @@ struct PoolCmd {int32_t layer,in,out,slot;};
 constexpr uint32_t POOL_RING=4096;
 struct PoolLayer {
     Bridge *bridge=nullptr;
-    int layer=0,S=0,E=0,H=0,I=0,group=16;
+    int layer=0,S=0,E=0,H=0,I=0,group=16,wdiv=2;
     bool elastic=false;               // XTIER_CACHE_ELASTIC: S slots of address space, the first `active` mapped
     int base=0;                       // slots mapped for good (the planner's / XTIER_CACHE_SLOTS count)
     std::atomic<int> active{0};       // slots the policy may fill: base + the elastic cache's extra ones
@@ -240,8 +240,8 @@ public:
     void upload(PoolLayer &L,int ram,int slot,char *const *arena,cudaStream_t stream) {
         const size_t H=L.H,I=L.I,IN=I/L.nodes,HN=H/L.nodes;
         // (arena, first row, rows per node, total rows, bytes per row) of each shard tensor, as prefill._shard_layout
-        const size_t lay[6][5]={{0,0,IN,2*I,H/2},{0,I,IN,2*I,H/2},{2,0,IN,2*I,H/L.group},{2,I,IN,2*I,H/L.group},
-                                {1,0,HN,H,I/2},{3,0,HN,H,I/L.group}};
+        const size_t lay[6][5]={{0,0,IN,2*I,H/L.wdiv},{0,I,IN,2*I,H/L.wdiv},{2,0,IN,2*I,H/L.group},{2,I,IN,2*I,H/L.group},
+                                {1,0,HN,H,I/L.wdiv},{3,0,HN,H,I/L.group}};
         for(int node=0;node<L.nodes;node++)for(int j=0;j<6;j++) {
             const size_t *q=lay[j];
             char *dst=arena[q[0]]+size_t(slot)*q[3]*q[4]+(q[1]+node*q[2])*q[4];
@@ -965,6 +965,11 @@ int xtier_mailbox_pool_attach(void *bridge,int layer,int slots,int active,int ex
         for(int node=0;node<L->nodes;node++) {
             void *ptr[6];size_t bytes[6];
             if(xtier_shard(b->plan,node,ptr,bytes)<0)throw std::runtime_error(xtier_last_error());
+            const size_t weight_width=bytes[0]/(size_t(ram_slots)*(L->I/L->nodes));
+            if(!weight_width || size_t(L->H)%weight_width)throw std::runtime_error("Invalid weight shard width");
+            const int wdiv=L->H/weight_width;
+            if((wdiv!=1&&wdiv!=2)||(node&&wdiv!=L->wdiv))throw std::runtime_error("Invalid weight width");
+            L->wdiv=wdiv;
             const size_t scale_width=bytes[2]/(size_t(ram_slots)*(L->I/L->nodes));
             if(!scale_width || size_t(L->H)%scale_width)throw std::runtime_error("Invalid scale shard width");
             const int group=L->H/scale_width;

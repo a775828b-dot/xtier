@@ -406,6 +406,11 @@ class Governor:
         from xtier.cache import pool
         if not pool.started():
             return
+        try:
+            from sglang.kernels.ops.attention.flash_attn.cute.interface import clear_shear_bias_workspace
+            clear_shear_bias_workspace()   # release grow-only FA4 rel_bias prefill scratch (6-8 GiB on Inkling-2)
+        except Exception:
+            pass
         torch.cuda.empty_cache()   # what the last prefill left cached in the allocator
         target = self.fit(torch.cuda.mem_get_info()[0] - self.reserve - self.buffer())
         if target <= self.extra:

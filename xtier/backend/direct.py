@@ -34,7 +34,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 ALIGN = 4096
-SCALE_LIMIT = {'mxfp4': 254, 'nvfp4': 126}   # the engine's check of its sources' block scales (engine.cpp)
+SCALE_LIMIT = {'mxfp4': 254, 'nvfp4': 126, 'mxfp8': 254}   # the engine's check of its sources' block scales (engine.cpp)
 # (bulk parameter index, loader shard) -> slot piece (xtier_shard order: gate, up, gate scales, up scales, down, down scales)
 PIECES = {(0, 'w1'): 0, (0, 'w3'): 1, (1, 'w2'): 4, (2, 'w1'): 2, (2, 'w3'): 3, (3, 'w2'): 5}
 
@@ -99,9 +99,10 @@ def locate(bulk, shard, expert, w, hidden, inter, experts, scale_format, tp_rank
         return None
     if piece is None or not 0 <= expert < experts:
         return None
-    group = 32 if scale_format == 'mxfp4' else 16
+    group = 32 if scale_format in ('mxfp4', 'mxfp8') else 16
+    wdiv = 1 if scale_format == 'mxfp8' else 2
     H, I = hidden, inter
-    cols = (H // 2, H // 2, H // group, H // group, I // 2, I // group)[piece]   # of the rank's slot piece
+    cols = (H // wdiv, H // wdiv, H // group, H // group, I // wdiv, I // group)[piece]   # of the rank's slot piece
     if piece < 4:   # w1 / w3 and their scales: the rank's rows, one range of the tensor
         shape, start, nbytes, columns = (I * tp_size, cols), tp_rank * I * cols, I * cols, None
     else:           # w2 and its scales: the rank's columns of every row

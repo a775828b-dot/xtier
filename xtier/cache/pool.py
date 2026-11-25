@@ -49,6 +49,7 @@ import time
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 from xtier.arch import HW_FP4, e2m1_f16, e4m3_f32
 from xtier.backend.kernels import Pointer
@@ -179,10 +180,22 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
 
 
 @triton.jit
+def _mxfp8_tile(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.constexpr):
+    """One BF16 tile [BN, BK] of a pool slot stored as MXFP8 (float8_e4m3fn + UE8M0 / 32)."""
+    wb = tl.load(Q + slot * QE + rows[:, None] * QR + (k0 + tl.arange(0, BK))[None, :])
+    w = tl.where((wb & 0x7F) == 0x7F, 0.0, e4m3_f32(wb))
+    c = k0 // 32 + tl.arange(0, BK // 32)
+    sb = tl.load(S + slot * SE + rows[:, None] * SR + c[None, :])
+    sc = tl.where(sb == 0, 2.0 ** -127, tl.where(sb == 255, 0.0, (sb.to(tl.uint32) << 23).to(tl.float32, bitcast=True)))
+    sc = tl.reshape(tl.broadcast_to(sc[:, :, None], (BN, BK // 32, 32)), (BN, BK))
+    return (w * sc).to(tl.bfloat16)
+
+
+@triton.jit
 def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
              ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False,
-             TOK_MASK=None):
+             TOK_MASK=None, MXFP8: tl.constexpr = False, GATE_CAP: tl.constexpr = 0.0, UP_CAP: tl.constexpr = 0.0):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -202,21 +215,34 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
     accg = tl.zeros((16, BN), dtype=tl.float32)
     accu = tl.zeros((16, BN), dtype=tl.float32)
     for k0 in range(0, H, BK):
-        ke = k0 + 2 * tl.arange(0, BK // 2)
-        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX)
-        ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX)
-        accg = tl.dot(xe, tl.trans(gl), accg)
-        accg = tl.dot(xo, tl.trans(gh), accg)
-        accu = tl.dot(xe, tl.trans(ul), accu)
-        accu = tl.dot(xo, tl.trans(uh), accu)
+        if MXFP8:
+            kk = k0 + tl.arange(0, BK)
+            xv = tl.load(X + tok[:, None] * H + kk[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16)
+            gw = _mxfp8_tile(Q13, S13, slot, n, k0, 2 * I * H, H, 2 * I * (H // 32), H // 32, BN, BK)
+            uw = _mxfp8_tile(Q13, S13, slot, n + I, k0, 2 * I * H, H, 2 * I * (H // 32), H // 32, BN, BK)
+            accg = tl.dot(xv, tl.trans(gw), accg)
+            accu = tl.dot(xv, tl.trans(uw), accu)
+        else:
+            ke = k0 + 2 * tl.arange(0, BK // 2)
+            xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX)
+            ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX)
+            accg = tl.dot(xe, tl.trans(gl), accg)
+            accg = tl.dot(xo, tl.trans(gh), accg)
+            accu = tl.dot(xe, tl.trans(ul), accu)
+            accu = tl.dot(xo, tl.trans(uh), accu)
     g = accg * tl.load(G13 + e * 2)
     u = accu * tl.load(G13 + e * 2 + 1)
     if LIMIT > 0:
         u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
         g = tl.minimum(g, LIMIT)
-    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+    if GATE_CAP > 0.0 or UP_CAP > 0.0:   # Soft-capped SiTU (Inkling-2)
+        sig = 1.0 / (1.0 + tl.exp(-g))
+        gc = GATE_CAP * libdevice.tanh(g / GATE_CAP) if GATE_CAP > 0.0 else g
+        uc = UP_CAP * libdevice.tanh(u / UP_CAP) if UP_CAP > 0.0 else u
+        val = gc * sig * uc
+    elif ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
@@ -226,7 +252,7 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
 @triton.jit
 def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.constexpr,
           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-          STAGED: tl.constexpr = False, TOK_MASK=None):
+          STAGED: tl.constexpr = False, TOK_MASK=None, MXFP8: tl.constexpr = False):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -245,12 +271,18 @@ def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.
     h = tl.program_id(1) * BN + tl.arange(0, BN)
     acc = tl.zeros((16, BN), dtype=tl.float32)
     for k0 in range(0, I, BK):
-        ke = k0 + 2 * tl.arange(0, BK // 2)
-        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=sm, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=sm, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX)
-        acc = tl.dot(ae, tl.trans(wl), acc)
-        acc = tl.dot(ao, tl.trans(wh), acc)
+        if MXFP8:
+            kk = k0 + tl.arange(0, BK)
+            av = tl.load(MID + (row * BM + tok[:, None]) * I + kk[None, :], mask=sm, other=0.0).to(tl.bfloat16)
+            ww = _mxfp8_tile(Q2, S2, slot, h, k0, H * I, I, H * (I // 32), I // 32, BN, BK)
+            acc = tl.dot(av, tl.trans(ww), acc)
+        else:
+            ke = k0 + 2 * tl.arange(0, BK // 2)
+            ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=sm, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=sm, other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX)
+            acc = tl.dot(ae, tl.trans(wl), acc)
+            acc = tl.dot(ao, tl.trans(wh), acc)
     acc = acc * tl.load(G2 + e)
     tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=sm)
 
@@ -258,7 +290,8 @@ def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.
 @triton.jit
 def _gate_up_2x16(X, SLOT_LIST, SLOT_EXP, TOK_MASK, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
                   STRIDE_M: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-                  ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False):
+                  ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False,
+                  MXFP8: tl.constexpr = False, GATE_CAP: tl.constexpr = 0.0, UP_CAP: tl.constexpr = 0.0):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -284,23 +317,36 @@ def _gate_up_2x16(X, SLOT_LIST, SLOT_EXP, TOK_MASK, Q13, S13, G13, MID, M, H: tl
     G: tl.constexpr = 32 if MX else 16
     XDTYPE: tl.constexpr = tl.bfloat16 if MX else tl.float16
     for k0 in range(0, H, BK):
-        ke = k0 + 2 * tl.arange(0, BK // 2)
-        gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
-        ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
-        if has_lo:
-            xe0 = tl.load(X + tok0[:, None] * H + ke[None, :], mask=tok0[:, None] < M, other=0.0).to(XDTYPE)
-            xo0 = tl.load(X + tok0[:, None] * H + ke[None, :] + 1, mask=tok0[:, None] < M, other=0.0).to(XDTYPE)
-            accg0 = tl.dot(xe0, tl.trans(gl), accg0)
-            accg0 = tl.dot(xo0, tl.trans(gh), accg0)
-            accu0 = tl.dot(xe0, tl.trans(ul), accu0)
-            accu0 = tl.dot(xo0, tl.trans(uh), accu0)
-        if has_hi:
-            xe1 = tl.load(X + tok1[:, None] * H + ke[None, :], mask=tok1[:, None] < M, other=0.0).to(XDTYPE)
-            xo1 = tl.load(X + tok1[:, None] * H + ke[None, :] + 1, mask=tok1[:, None] < M, other=0.0).to(XDTYPE)
-            accg1 = tl.dot(xe1, tl.trans(gl), accg1)
-            accg1 = tl.dot(xo1, tl.trans(gh), accg1)
-            accu1 = tl.dot(xe1, tl.trans(ul), accu1)
-            accu1 = tl.dot(xo1, tl.trans(uh), accu1)
+        if MXFP8:
+            kk = k0 + tl.arange(0, BK)
+            gw = _mxfp8_tile(Q13, S13, slot, n, k0, 2 * I * H, H, 2 * I * (H // 32), H // 32, BN, BK)
+            uw = _mxfp8_tile(Q13, S13, slot, n + I, k0, 2 * I * H, H, 2 * I * (H // 32), H // 32, BN, BK)
+            if has_lo:
+                x0 = tl.load(X + tok0[:, None] * H + kk[None, :], mask=tok0[:, None] < M, other=0.0).to(tl.bfloat16)
+                accg0 = tl.dot(x0, tl.trans(gw), accg0)
+                accu0 = tl.dot(x0, tl.trans(uw), accu0)
+            if has_hi:
+                x1 = tl.load(X + tok1[:, None] * H + kk[None, :], mask=tok1[:, None] < M, other=0.0).to(tl.bfloat16)
+                accg1 = tl.dot(x1, tl.trans(gw), accg1)
+                accu1 = tl.dot(x1, tl.trans(uw), accu1)
+        else:
+            ke = k0 + 2 * tl.arange(0, BK // 2)
+            gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
+            ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
+            if has_lo:
+                xe0 = tl.load(X + tok0[:, None] * H + ke[None, :], mask=tok0[:, None] < M, other=0.0).to(XDTYPE)
+                xo0 = tl.load(X + tok0[:, None] * H + ke[None, :] + 1, mask=tok0[:, None] < M, other=0.0).to(XDTYPE)
+                accg0 = tl.dot(xe0, tl.trans(gl), accg0)
+                accg0 = tl.dot(xo0, tl.trans(gh), accg0)
+                accu0 = tl.dot(xe0, tl.trans(ul), accu0)
+                accu0 = tl.dot(xo0, tl.trans(uh), accu0)
+            if has_hi:
+                xe1 = tl.load(X + tok1[:, None] * H + ke[None, :], mask=tok1[:, None] < M, other=0.0).to(XDTYPE)
+                xo1 = tl.load(X + tok1[:, None] * H + ke[None, :] + 1, mask=tok1[:, None] < M, other=0.0).to(XDTYPE)
+                accg1 = tl.dot(xe1, tl.trans(gl), accg1)
+                accg1 = tl.dot(xo1, tl.trans(gh), accg1)
+                accu1 = tl.dot(xe1, tl.trans(ul), accu1)
+                accu1 = tl.dot(xo1, tl.trans(uh), accu1)
     gg = tl.load(G13 + e * 2)
     gu = tl.load(G13 + e * 2 + 1)
     if has_lo:
@@ -309,7 +355,15 @@ def _gate_up_2x16(X, SLOT_LIST, SLOT_EXP, TOK_MASK, Q13, S13, G13, MID, M, H: tl
         if LIMIT > 0:
             u0 = tl.minimum(tl.maximum(u0, -LIMIT), LIMIT)
             g0 = tl.minimum(g0, LIMIT)
-        val0 = (g0 / (1.0 + tl.exp(-ALPHA * g0)) * (u0 + BETA)) if (ALPHA != 1.0 or BETA != 0.0) else (g0 / (1.0 + tl.exp(-g0)) * u0)
+        if GATE_CAP > 0.0 or UP_CAP > 0.0:
+            sig0 = 1.0 / (1.0 + tl.exp(-g0))
+            gc0 = GATE_CAP * libdevice.tanh(g0 / GATE_CAP) if GATE_CAP > 0.0 else g0
+            uc0 = UP_CAP * libdevice.tanh(u0 / UP_CAP) if UP_CAP > 0.0 else u0
+            val0 = gc0 * sig0 * uc0
+        elif ALPHA != 1.0 or BETA != 0.0:
+            val0 = g0 / (1.0 + tl.exp(-ALPHA * g0)) * (u0 + BETA)
+        else:
+            val0 = g0 / (1.0 + tl.exp(-g0)) * u0
         tm0 = (tok0[:, None] < M) & (((mlo >> tok0[:, None]) & 1) != 0)
         tl.store(MID + (row * STRIDE_M + tok0[:, None]) * I + n[None, :], val0.to(tl.bfloat16), mask=tm0)
     if has_hi:
@@ -318,7 +372,15 @@ def _gate_up_2x16(X, SLOT_LIST, SLOT_EXP, TOK_MASK, Q13, S13, G13, MID, M, H: tl
         if LIMIT > 0:
             u1 = tl.minimum(tl.maximum(u1, -LIMIT), LIMIT)
             g1 = tl.minimum(g1, LIMIT)
-        val1 = (g1 / (1.0 + tl.exp(-ALPHA * g1)) * (u1 + BETA)) if (ALPHA != 1.0 or BETA != 0.0) else (g1 / (1.0 + tl.exp(-g1)) * u1)
+        if GATE_CAP > 0.0 or UP_CAP > 0.0:
+            sig1 = 1.0 / (1.0 + tl.exp(-g1))
+            gc1 = GATE_CAP * libdevice.tanh(g1 / GATE_CAP) if GATE_CAP > 0.0 else g1
+            uc1 = UP_CAP * libdevice.tanh(u1 / UP_CAP) if UP_CAP > 0.0 else u1
+            val1 = gc1 * sig1 * uc1
+        elif ALPHA != 1.0 or BETA != 0.0:
+            val1 = g1 / (1.0 + tl.exp(-ALPHA * g1)) * (u1 + BETA)
+        else:
+            val1 = g1 / (1.0 + tl.exp(-g1)) * u1
         tm1 = (tok1[:, None] < M) & (((mhi >> (tok1[:, None] - 16)) & 1) != 0)
         tl.store(MID + (row * STRIDE_M + tok1[:, None]) * I + n[None, :], val1.to(tl.bfloat16), mask=tm1)
 
@@ -326,7 +388,7 @@ def _gate_up_2x16(X, SLOT_LIST, SLOT_EXP, TOK_MASK, Q13, S13, G13, MID, M, H: tl
 @triton.jit
 def _down_2x16(MID, SLOT_LIST, SLOT_EXP, TOK_MASK, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.constexpr,
                STRIDE_M: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-               STAGED: tl.constexpr = False):
+               STAGED: tl.constexpr = False, MXFP8: tl.constexpr = False):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -352,18 +414,28 @@ def _down_2x16(MID, SLOT_LIST, SLOT_EXP, TOK_MASK, Q2, S2, G2, PART, M, H: tl.co
     G: tl.constexpr = 32 if MX else 16
     XDTYPE: tl.constexpr = tl.bfloat16 if MX else tl.float16
     for k0 in range(0, I, BK):
-        ke = k0 + 2 * tl.arange(0, BK // 2)
-        wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // G), I // G, BN, BK, MX)
-        if has_lo:
-            ae0 = tl.load(MID + (row * STRIDE_M + tok0[:, None]) * I + ke[None, :], mask=tm0, other=0.0).to(XDTYPE)
-            ao0 = tl.load(MID + (row * STRIDE_M + tok0[:, None]) * I + ke[None, :] + 1, mask=tm0, other=0.0).to(XDTYPE)
-            acc0 = tl.dot(ae0, tl.trans(wl), acc0)
-            acc0 = tl.dot(ao0, tl.trans(wh), acc0)
-        if has_hi:
-            ae1 = tl.load(MID + (row * STRIDE_M + tok1[:, None]) * I + ke[None, :], mask=tm1, other=0.0).to(XDTYPE)
-            ao1 = tl.load(MID + (row * STRIDE_M + tok1[:, None]) * I + ke[None, :] + 1, mask=tm1, other=0.0).to(XDTYPE)
-            acc1 = tl.dot(ae1, tl.trans(wl), acc1)
-            acc1 = tl.dot(ao1, tl.trans(wh), acc1)
+        if MXFP8:
+            kk = k0 + tl.arange(0, BK)
+            ww = _mxfp8_tile(Q2, S2, slot, h, k0, H * I, I, H * (I // 32), I // 32, BN, BK)
+            if has_lo:
+                a0 = tl.load(MID + (row * STRIDE_M + tok0[:, None]) * I + kk[None, :], mask=tm0, other=0.0).to(tl.bfloat16)
+                acc0 = tl.dot(a0, tl.trans(ww), acc0)
+            if has_hi:
+                a1 = tl.load(MID + (row * STRIDE_M + tok1[:, None]) * I + kk[None, :], mask=tm1, other=0.0).to(tl.bfloat16)
+                acc1 = tl.dot(a1, tl.trans(ww), acc1)
+        else:
+            ke = k0 + 2 * tl.arange(0, BK // 2)
+            wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // G), I // G, BN, BK, MX)
+            if has_lo:
+                ae0 = tl.load(MID + (row * STRIDE_M + tok0[:, None]) * I + ke[None, :], mask=tm0, other=0.0).to(XDTYPE)
+                ao0 = tl.load(MID + (row * STRIDE_M + tok0[:, None]) * I + ke[None, :] + 1, mask=tm0, other=0.0).to(XDTYPE)
+                acc0 = tl.dot(ae0, tl.trans(wl), acc0)
+                acc0 = tl.dot(ao0, tl.trans(wh), acc0)
+            if has_hi:
+                ae1 = tl.load(MID + (row * STRIDE_M + tok1[:, None]) * I + ke[None, :], mask=tm1, other=0.0).to(XDTYPE)
+                ao1 = tl.load(MID + (row * STRIDE_M + tok1[:, None]) * I + ke[None, :] + 1, mask=tm1, other=0.0).to(XDTYPE)
+                acc1 = tl.dot(ae1, tl.trans(wl), acc1)
+                acc1 = tl.dot(ao1, tl.trans(wh), acc1)
     sc = tl.load(G2 + e)
     if has_lo:
         tl.store(PART + (row * STRIDE_M + tok0[:, None]) * H + h[None, :], acc0 * sc, mask=tm0)
@@ -507,7 +579,7 @@ def _miss_stage(pool):
         cp = triton.next_power_of_2(cap)
         _miss.update(share=share, cap=cap, cp=cp, e=torch.full((cp,), -1, dtype=torch.int32, device=dev),
                      r=torch.full((cp,), -1, dtype=torch.int32, device=dev))
-    key = (pool.H, pool.I)
+    key = (pool.H, pool.I, prefill.scale_format)
     if key not in _miss:   # in the pool's slot layout: w13, w2, s13, s2 one after the other
         shapes = [(cap,) + tuple(s[1:]) for s in prefill.shapes[:4]]
         sizes = [math.prod(s) for s in shapes]
@@ -578,9 +650,14 @@ class LayerPool:
         H, I, E = prefill.hidden, prefill.inter, prefill.experts
         self.H, self.I, self.E, self.limit = H, I, E, float(prefill.swiglu_limit)
         self.alpha, self.beta = prefill.swiglu_alpha, prefill.swiglu_beta
+        self.mxfp8 = prefill.mxfp8
+        self.situ_gate_cap, self.situ_up_cap = prefill.situ_gate_cap, prefill.situ_up_cap
         self.full = self.S >= E
         self.S = min(self.S, E)
         self.bk_h, self.bk_i = _tile_k(H), _tile_k(I)   # gate/up reduce over H, down over I
+        if self.mxfp8:
+            self.bk_h = min(self.bk_h, 128)
+            self.bk_i = min(self.bk_i, 128)
         if not self.bk_h or not self.bk_i or I % CONFIG['gbn'] or H % CONFIG['dbn']:
             raise ValueError(f'xtier cache: unsupported shape H={H} I={I}')
         self.dbn = 128 if (H % 128 == 0 and H >= 256) else CONFIG['dbn']
@@ -677,20 +754,24 @@ class LayerPool:
             _gate_up[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], self.arena[0], self.arena[2], g13,
                                             sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
                                             MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
-                                            TOK_MASK=sc['tok_mask'], num_warps=cfg['gw'], num_stages=cfg['gs'])
+                                            TOK_MASK=sc['tok_mask'], MXFP8=self.mxfp8,
+                                            GATE_CAP=self.situ_gate_cap, UP_CAP=self.situ_up_cap,
+                                            num_warps=cfg['gw'], num_stages=cfg['gs'])
             _down[(nk, H // dbn)](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
                                   sc['part'], m, H, I, MAX_M, dbn, self.bk_i,
-                                  MX=self.prefill.mxfp4, TOK_MASK=sc['tok_mask'], num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                  MX=self.prefill.mxfp4, TOK_MASK=sc['tok_mask'], MXFP8=self.mxfp8,
+                                  num_warps=cfg['dw'], num_stages=cfg['ds'])
         else:
             _gate_up_2x16[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], sc['tok_mask'],
                                                  self.arena[0], self.arena[2], g13,
                                                  sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
                                                  MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
+                                                 MXFP8=self.mxfp8, GATE_CAP=self.situ_gate_cap, UP_CAP=self.situ_up_cap,
                                                  num_warps=cfg['gw'], num_stages=cfg['gs'])
             _down_2x16[(nk, H // dbn)](sc['mid'], sc['slot_list'], sc['slot_exp'], sc['tok_mask'],
                                        self.arena[1], self.arena[3], g2,
                                        sc['part'], m, H, I, MAX_M, dbn, self.bk_i,
-                                       MX=self.prefill.mxfp4, num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                       MX=self.prefill.mxfp4, MXFP8=self.mxfp8, num_warps=cfg['dw'], num_stages=cfg['ds'])
         if self.miss is not None:   # the missed experts _miss_select gave the GPU: into the staging slots, then as above
             mi, cap, stage = self.miss, _miss['cap'], self.miss['stage']
             _miss_copy[(cap * mi['n'], triton.cdiv(mi['words'], MISS_CHUNK))](
@@ -700,18 +781,20 @@ class LayerPool:
                 _gate_up[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], stage[0], stage[2], g13,
                                                  sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
                                                  MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, STAGED=True,
+                                                 MXFP8=self.mxfp8, GATE_CAP=self.situ_gate_cap, UP_CAP=self.situ_up_cap,
                                                  num_warps=cfg['gw'], num_stages=cfg['gs'])
                 _down[(cap, H // dbn)](sc['mid'], _miss['r'], _miss['e'], stage[1], stage[3], g2,
                                        sc['part'], m, H, I, MAX_M, dbn, self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
-                                       num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                       MXFP8=self.mxfp8, num_warps=cfg['dw'], num_stages=cfg['ds'])
             else:
                 _gate_up_2x16[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], sc['tok_mask'], stage[0], stage[2], g13,
                                                       sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
                                                       MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, STAGED=True,
+                                                      MXFP8=self.mxfp8, GATE_CAP=self.situ_gate_cap, UP_CAP=self.situ_up_cap,
                                                       num_warps=cfg['gw'], num_stages=cfg['gs'])
                 _down_2x16[(cap, H // dbn)](sc['mid'], _miss['r'], _miss['e'], sc['tok_mask'], stage[1], stage[3], g2,
                                             sc['part'], m, H, I, MAX_M, dbn, self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
-                                            num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                            MXFP8=self.mxfp8, num_warps=cfg['dw'], num_stages=cfg['ds'])
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout,
                                             H, k, MAX_M, 1024, SCALE=float(scale),
                                             OUT_BF16=out_bf16, HAS_SCALE=(scale != 1.0))

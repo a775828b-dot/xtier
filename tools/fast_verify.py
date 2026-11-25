@@ -47,11 +47,17 @@ FATAL_LOG_RE = re.compile(r'Traceback|OutOfMemoryError|CUDA out of memory|FATAL|
 
 # Tier 3 full release checklist covers the latest 3 flagship models; older/other models validate
 # through the Tier 2 fast channel (`--models fast-track`).
-TIER3_MODELS = ('hy4flash', 'ds41', 'qwen38')
-FAST_TRACK_MODELS = ('glm53',)
+TIER3_MODELS = ('inkling2', 'hy4flash', 'ds41')
+FAST_TRACK_MODELS = ('qwen38', 'glm53')
 
 # Model metadata for Tier 2 compact live probes (mapped by xtier/console model id).
 MODEL_META = {
+    'inkling2': {
+        'tokenizer': '/data/fast/cold1/models/Inkling-2-Small',
+        'copy_args': ['--reasoning-effort', 'low', '--temperature', '0.01'],
+        'chat_kwargs': {'reasoning_effort': 'low'},
+        'conc': 2,
+    },
     'hy4flash': {
         'tokenizer': '/data/fast/nvme1/models/huggingface/atakans/Hy4-flash-NVFP4',
         'copy_args': ['--reasoning-effort', 'no_think'],
@@ -126,6 +132,8 @@ def detect_scopes(files):
             scopes.add('console')
         if f.startswith('xtier/platform/'):
             scopes.add('platform')
+        if f.startswith(('xtier/packs/inkling2/', 'configs/inkling2-')):
+            scopes.add('inkling2')
         if f.startswith(('xtier/packs/hy4_flash/', 'configs/hy4-flash-')):
             scopes.add('hy4')
         if f.startswith(('xtier/packs/glm5_next/', 'configs/glm53-')):
@@ -159,6 +167,11 @@ def select_tier1_tests(scopes):
         for preset in ('glm53', 'ds41_1017', 'hy4flash'):
             add(f'cache_check:{preset}', [py, 'tests/cache_check.py', '--preset', preset], preset)
             add(f'mailbox_check:{preset}', [py, 'tests/mailbox_check.py', '--preset', preset], preset)
+    if 'inkling2' in sc:
+        add('inkling2_check', [py, 'tests/inkling2_check.py'])
+        add('fp8_weights_check', [py, 'tests/fp8_weights_check.py'])
+        add('fp4_decode_check', [py, 'tests/fp4_decode_check.py'])
+        add('fp8_decode_check', [py, 'tests/fp8_decode_check.py'])
     if 'hy4' in sc:
         add('hy4_flash_check', [py, 'tests/hy4_flash_check.py'])
         add('fp8_weights_check', [py, 'tests/fp8_weights_check.py'])
@@ -211,6 +224,8 @@ def select_tier2_models(scopes, explicit_models):
         return list(dict.fromkeys(out))
     sc = set(scopes)
     models = []
+    if 'inkling2' in sc:
+        models.append('inkling2')
     if 'hy4' in sc:
         models.append('hy4flash')
     if 'glm53' in sc:
@@ -455,6 +470,8 @@ def main():
     # --- Tier 0: Static & Contract Gate (<15 s) ---
     print('\n--- Tier 0: Static & Contract Gate ---', flush=True)
     hook_env = dict(env, XTIER='1', XTIER_HY4_HYBRID_SWA='1', XTIER_HY4_KV_FP4='1',
+                    XTIER_INKLING2_KV_FP4='1', XTIER_DSPARK_TRUNCATE='0.20',
+                    XTIER_DRAFT_LMHEAD_FP8='1', XTIER_INKLING2_MARKOV_PAD2='1',
                     XTIER_ENGRAM_ROWS='nvme', XTIER_FP8_WEIGHTS='1')
     tier0_steps = [
         ('repo_check', [py, 'tools/repo_check.py'], env),

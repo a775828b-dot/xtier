@@ -25,7 +25,7 @@ extern "C" {
 // 0 disables the clamp. create owns an explicitly NUMA-bound, sharded copy (overrides
 // inherited interleave policy for its own mappings only). The input buffers can be
 // released after create returns. experts=10..512; threads<=128, divisible by the node count.
-// scale_format: 0=NVFP4 (E4M3/16), 1=MXFP4 (UE8M0/32).
+// scale_format: 0=NVFP4 (E4M3/16), 1=MXFP4 (UE8M0/32), 2=MXFP8 (FP8 E4M3 weights, UE8M0/32).
 // MXFP4 globals must be arrays of 1. Shard scales retain compact 32-wide UE8M0
 // blocks; packed weights are unchanged. NVFP4 retains its original layout.
 void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int scale_format,
@@ -70,6 +70,9 @@ int xtier_slot_pieces(void *plan,int slot,int node,void **pointers,size_t *bytes
 // GPT-OSS SwiGLU (MiniMax M3): gate*sigmoid(alpha*gate)*(up+beta) after the clamp. The defaults 1 / 0 keep the
 // plain SiLU path; set before the first forward. 0 on success.
 int xtier_set_swiglu(void *plan, float alpha, float beta);
+// Soft-capped SiTU activation (Inkling-2): (gate_cap*tanh(gate/gate_cap))*sigmoid(gate)*(up_cap*tanh(up/up_cap));
+// 0 disables the corresponding cap (both 0 keeps SwiGLU). Before the first forward.
+int xtier_set_situ(void *plan, float gate_cap, float up_cap);
 // Four ints: hidden, inter, experts, largest decode batch per CUDA slot (8).
 int xtier_shape(void *plan, int *shape);
 

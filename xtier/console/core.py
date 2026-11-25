@@ -522,11 +522,12 @@ class Console:
         state = {'model': model, 'options': values, 'label': label, 'runner': self.runner, 'pid': proc.pid,
                  'pgid': proc.pid, 'port': m['port'], 'served': m['served'], 'log': str(log),
                  'started_at': time.time(), 'ready_at': None, 'stopped_at': None, 'error': ''}
-        if self.guard_gib:
+        guard_gib = m.get('guard_gib', self.guard_gib)
+        if guard_gib:
             with log.with_suffix('.guard.log').open('ab') as gfh:
                 guard = subprocess.Popen(
                     self._wrap(self.unit + '-guard', [str(REPO / 'tools/mem_guard.sh'), str(proc.pid),
-                                                      str(self.guard_gib), '1']),
+                                                      str(guard_gib), '1']),
                     stdin=subprocess.DEVNULL, stdout=gfh, stderr=subprocess.STDOUT, start_new_session=True)
             threading.Thread(target=guard.wait, name='xtier-guard-reaper', daemon=True).start()
             state['guard_pgid'] = guard.pid

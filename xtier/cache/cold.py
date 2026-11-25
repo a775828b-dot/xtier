@@ -53,7 +53,7 @@ from pathlib import Path
 import torch
 
 logger = logging.getLogger(__name__)
-_store = None
+_stores = {}
 _store_lock = threading.Lock()
 _staging = [None, None]   # the prefills' pinned stagings: layers alternate (a layer's reads run during the last one)
 _locked = [None, None]    # the page-locked (cudaHostRegister) start of each staging
@@ -238,11 +238,11 @@ def _reads_as_zeros(inputs, experts, nodes, I):
 
 
 def store(key):
-    global _store
     with _store_lock:
-        if _store is None:
-            _store = Store(key)
-        return _store
+        st = _stores.get(key)
+        if st is None:
+            st = _stores[key] = Store(key)
+        return st
 
 
 class LayerPlan:
@@ -340,7 +340,7 @@ def _pieces(inputs, e, node, nodes, H, I, group):
     parts = [w13[e, node * IN:(node + 1) * IN], w13[e, I + node * IN:I + (node + 1) * IN], s13[e, node * IN:(node + 1) * IN],
              s13[e, I + node * IN:I + (node + 1) * IN], w2[e, node * HN:(node + 1) * HN], s2[e, node * HN:(node + 1) * HN]]
     assert all(p.is_contiguous() for p in parts)
-    return [(p.data_ptr(), p.numel()) for p in parts]
+    return [(p.data_ptr(), p.numel() * p.element_size()) for p in parts]
 
 
 def _sample(inputs, e, nodes, H, I, group):
@@ -355,9 +355,10 @@ def _sample(inputs, e, nodes, H, I, group):
 
 def _layout(H, I, nodes, scale_format):
     """The six pieces of one node part of a record (xtier_slot_pieces order), the part's and the record's bytes."""
-    group = 32 if scale_format == 'mxfp4' else 16
+    group = 32 if scale_format in ('mxfp4', 'mxfp8') else 16
+    wdiv = 1 if scale_format == 'mxfp8' else 2
     IN, HN = I // nodes, H // nodes
-    sizes = [IN * H // 2, IN * H // 2, IN * H // group, IN * H // group, HN * I // 2, HN * I // group]
+    sizes = [IN * H // wdiv, IN * H // wdiv, IN * H // group, IN * H // group, HN * I // wdiv, HN * I // group]
     part = sum(sizes)
     if part % 512 or min(sizes) < 4096:
         raise RuntimeError(f'xtier cold: record pieces {sizes} are not whole 512-byte blocks')
@@ -454,7 +455,7 @@ def attach_loaded(plan, lp, scale_format):
 def attach(plan, lp, inputs, scale_format):
     """After the plan is created from lp.resident: the records of the layer's stored experts (written, or checked and
     reused), then the plan's forwards handle the cold experts (xtier_cold_attach). Returns the layer's PrefillCold."""
-    group = 32 if scale_format == 'mxfp4' else 16
+    group = 32 if scale_format in ('mxfp4', 'mxfp8') else 16
     nodes, H, I, E = plan.nodes(), plan.hidden, plan.inter, plan.experts
     sizes, _, record = _layout(H, I, nodes, scale_format)
     st = store(_key(E, H, I, scale_format, nodes))
@@ -558,7 +559,7 @@ def _attach(plan, lp, st, starts, where, sizes, units, nodes, record, how, t0):
     if _layers:
         _layers[-1][2].next = pc   # read ahead by the previous layer's calls (layers attach in model order)
     _layers.append((lp.layer_id, plan, pc, record))
-    _ranges[lp.layer_id] = (sizes, E, lp.reads)
+    _ranges[lp.layer_id] = (st, sizes, E, lp.reads)
     _start_reporter()
     logger.info('xtier cold: layer %d: %d of %d experts in RAM, %d records (%.1f GB) on %d drives %s in %.1f s',
                 lp.layer_id, plan.slots, E, len(lp.stored), len(lp.stored) * record / 1e9, len(st.paths), how,
@@ -567,6 +568,17 @@ def _attach(plan, lp, st, starts, where, sizes, units, nodes, record, how, t0):
 
 
 _layers = []         # (layer id, plan, PrefillCold, record bytes) of every layer with cold experts
+
+
+def relink():
+    """Sort cold layers into ascending model layer_id order so PrefillCold read-ahead chains and double-buffered
+    staging parity (index % 2) match forward execution order even when checkpoints stream shards alphabetically."""
+    if len(_layers) < 2:
+        return
+    _layers.sort(key=lambda item: item[0])
+    for i, (_, _, pc, _) in enumerate(_layers):
+        pc.index = i
+        pc.next = _layers[i + 1][2] if i + 1 < len(_layers) else None
 _ranges = {}         # layer id -> (piece bytes per node part, experts, LayerPlan.reads), until save_ranges
 _reporter = None
 
@@ -575,24 +587,28 @@ def save_ranges():
     """After loading: where this start's cold layers' expert tensors lie in the checkpoint files, next to the manifest
     (KEY.ranges, for tools/cold_punch.py), unless the checkpoint is already punched. A layer not all of whose tensors
     are bytes of the records in a file (with tensor parallelism, say) is left out: it stays in the checkpoint."""
-    if _store is None or not _ranges:
+    if not _stores or not _ranges:
         return
     try:
         if cold_only() is None:
             names = {str(p.resolve()): p.name for p in _model_dir().glob('*.safetensors')}
-            files, layers = {}, {}
-            for layer_id, (sizes, experts, reads) in _ranges.items():
-                if len(reads) == 6 * experts and all(r and r[5] is None and r[2] in names for r in reads):
-                    layers[str(layer_id)] = dict(sizes=sizes, reads=[
-                        (r[0], r[1], files.setdefault(names[r[2]], len(files)), r[3], r[4]) for r in reads])
-            path = _store.manifest_path.with_suffix('.ranges')
-            with open(f'{path}.tmp', 'w') as f:
-                f.write(json.dumps(dict(source=source(), files=list(files), layers=layers)))
-            os.replace(f'{path}.tmp', path)
-            logger.info('xtier cold: noted the expert tensors of %d of %d layers in %s', len(layers), len(_ranges), path)
+            by_store = {}
+            for layer_id, (st, sizes, experts, reads) in _ranges.items():
+                by_store.setdefault(st.key, (st, []))[1].append((layer_id, sizes, experts, reads))
+            for st, items in by_store.values():
+                files, layers = {}, {}
+                for layer_id, sizes, experts, reads in items:
+                    if len(reads) == 6 * experts and all(r and r[5] is None and r[2] in names for r in reads):
+                        layers[str(layer_id)] = dict(sizes=sizes, reads=[
+                            (r[0], r[1], files.setdefault(names[r[2]], len(files)), r[3], r[4]) for r in reads])
+                path = st.manifest_path.with_suffix('.ranges')
+                with open(f'{path}.tmp', 'w') as f:
+                    f.write(json.dumps(dict(source=source(), files=list(files), layers=layers)))
+                os.replace(f'{path}.tmp', path)
+                logger.info('xtier cold: noted the expert tensors of %d of %d layers in %s', len(layers), len(items), path)
     except OSError as e:   # only tools/cold_punch.py needs them
         logger.warning('xtier cold: where the expert tensors lie was not saved: %s', e)
-    for _, _, reads in _ranges.values():
+    for _, _, _, reads in _ranges.values():
         reads.clear()
     _ranges.clear()
 
@@ -606,21 +622,24 @@ def _start_reporter():
         return
 
     def run():
-        last = [0.0] * 8
+        last = [0.0] * 11
         while True:
             time.sleep(every)
             stats = [p.cold_stats() for _, p, _, _ in _layers]
+            recs = [rec for _, _, _, rec in _layers]
             now = [sum(s[i] for s in stats) for i in (1, 2, 3, 4, 5)]   # loads, s, small forwards, small loads, s
             now += [sum(pc.reads for _, _, pc, _ in _layers), sum(pc.read_s for _, _, pc, _ in _layers)]
             now += [sum(s[6] for s in stats)]   # experts not in RAM XTIER_TAIL_SKIP left out (reads saved)
+            now += [sum(s[1] * r for s, r in zip(stats, recs)),
+                    sum(s[4] * r for s, r in zip(stats, recs)),
+                    sum(pc.reads * r for (_, _, pc, _), r in zip(_layers, recs))]
             d = [a - b for a, b in zip(now, last)]
-            record = _layers[0][3] if _layers else 0
             if d[0] or d[5] or d[7]:
                 steps = d[2] / max(1, len(_layers))   # one CPU call per layer and decode step
                 logger.info('xtier cold: last %.0f s: decode %.0f steps read %d experts (%.1f per step, %.1f GB, '
                             '%.1f s), CPU prefill read %d (%.1f GB, %.1f s), GPU prefill %d (%.1f GB, uploads waited '
-                            '%.1f s)%s', every, steps, d[3], d[3] / steps if steps else 0, d[3] * record / 1e9, d[4],
-                            d[0] - d[3], (d[0] - d[3]) * record / 1e9, d[1] - d[4], d[5], d[5] * record / 1e9, d[6],
+                            '%.1f s)%s', every, steps, d[3], d[3] / steps if steps else 0, d[9] / 1e9, d[4],
+                            d[0] - d[3], (d[8] - d[9]) / 1e9, d[1] - d[4], d[5], d[10] / 1e9, d[6],
                             f', tail skip saved {d[7]:.0f} reads ({d[7] / steps:.1f} per step)' if d[7] and steps else '')
             last = now
 

@@ -160,6 +160,57 @@ inline void asfloat(__m512bh a,__m512 &lo,__m512 &hi) {
     lo=_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_castsi512_si256(z)),16));
     hi=_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(z,1)),16));
 }
+alignas(64) constexpr auto ue8m0_f32=[] {
+    std::array<float,256> t{};
+    for(int s=0;s<255;s++)t[s]=s?__builtin_bit_cast(float,uint32_t(s)<<23):pow2(-127);
+    return t;
+}();
+inline __m512 e4m3x16_to_f32(__m128i bytes) {
+    const __m512i u=_mm512_cvtepu8_epi32(bytes);
+    const __m512i sign=_mm512_slli_epi32(_mm512_and_si512(u,_mm512_set1_epi32(0x80)),24);
+    const __m512i mag=_mm512_and_si512(u,_mm512_set1_epi32(0x7F));
+    const __m512i norm=_mm512_add_epi32(_mm512_slli_epi32(mag,20),_mm512_set1_epi32(120<<23));
+    const __m512i sub_tbl=_mm512_setr_epi32(
+        0x00000000,0x3b000000,0x3b800000,0x3bc00000,
+        0x3c000000,0x3c200000,0x3c400000,0x3c600000,
+        0,0,0,0,0,0,0,0);
+    const __m512i sub=_mm512_permutexvar_epi32(mag,sub_tbl);
+    const __mmask16 is_sub=_mm512_cmplt_epu32_mask(mag,_mm512_set1_epi32(8));
+    const __mmask16 is_nan=_mm512_cmpeq_epi32_mask(mag,_mm512_set1_epi32(0x7F));
+    __m512i bits=_mm512_mask_mov_epi32(norm,is_sub,sub);
+    bits=_mm512_maskz_mov_epi32(~is_nan,_mm512_or_si512(sign,bits));
+    return _mm512_castsi512_ps(bits);
+}
+inline void unpack_mxfp8_f32(const uint8_t *p,const uint8_t *s,__m512 &lo,__m512 &hi) {
+    const __m512 sc=_mm512_set1_ps(ue8m0_f32[s[0]]);
+    lo=_mm512_mul_ps(e4m3x16_to_f32(_mm_loadu_si128((const __m128i*)p)),sc);
+    hi=_mm512_mul_ps(e4m3x16_to_f32(_mm_loadu_si128((const __m128i*)(p+16))),sc);
+}
+inline __m512bh unpack_mxfp8(const uint8_t *p,const uint8_t *s) {
+    const int sc=s[0];
+    if(__builtin_expect(sc>=10&&sc<=246,1)) {
+        // Exact 32-wide BF16 decode without vpermw: E4M3FN has <=3 mantissa bits (exact in BF16) and UE8M0 is a pure power of 2.
+        // For sc in [10..246], every E4M3 subnormal (exp>=118+sc-127>=1) and normal (exp<=135+sc-127<=254) stays normal BF16.
+        // Subnormal correction (mag=1..7): true_unbiased - (mag<<4) fits in signed int8 * 16: {-17,-10,-7,-4,-3,-2,-1}*16.
+        // Saturating +120 puts mag=0..7 at vpshufb indices 8..15 (bit7=0) and mag=8..127 at >=128 (bit7=1 -> 0).
+        const __m256i raw=_mm256_loadu_si256((const __m256i*)p);
+        const __m256i mask7f=_mm256_set1_epi8(0x7F);
+        const __m256i mag=_mm256_and_si256(raw,mask7f);
+        const __m256i idx=_mm256_adds_epu8(mag,_mm256_set1_epi8(120));
+        const __m256i delta_tbl=_mm256_setr_epi8(
+            0,0,0,0,0,0,0,0, 0,-17,-10,-7,-4,-3,-2,-1,
+            0,0,0,0,0,0,0,0, 0,-17,-10,-7,-4,-3,-2,-1);
+        const __m256i adj8=_mm256_add_epi8(mag,_mm256_shuffle_epi8(delta_tbl,idx));
+        const __mmask32 valid=_mm256_test_epi8_mask(mag,mag)&_mm256_cmpneq_epi8_mask(mag,mask7f);
+        const __mmask32 neg=_mm256_movepi8_mask(raw)&valid;
+        const __m512i shifted=_mm512_slli_epi16(_mm512_cvtepi8_epi16(adj8),4);
+        const __m512i val=_mm512_maskz_add_epi16(valid,shifted,_mm512_set1_epi16(int16_t((sc-7)<<7)));
+        return (__m512bh)_mm512_mask_add_epi16(val,neg,val,_mm512_set1_epi16(int16_t(0x8000)));
+    }
+    __m512 lo,hi;
+    unpack_mxfp8_f32(p,s,lo,hi);
+    return _mm512_cvtne2ps_pbh(hi,lo);
+}
 #else
 // AVX2: 32 weights (16 bytes, two E4M3 scales s[0], s[1]) -> FP32 weights 0..7, 8..15, 16..23,
 // 24..31 in w[0..3], the BF16 table values widened. Per scale, two vpshufb pick the low and high
@@ -197,6 +248,31 @@ inline float hsum(__m256 v) {
 }
 // BF16 rounding kept in FP32 (XTIER_DOWN_BF16 intermediate on AVX2).
 inline float round_bf16(float v) {return __builtin_bit_cast(float,uint32_t(tobf(v))<<16);}
+alignas(64) constexpr auto ue8m0_f32=[] {
+    std::array<float,256> t{};
+    for(int s=0;s<255;s++)t[s]=s?__builtin_bit_cast(float,uint32_t(s)<<23):pow2(-127);
+    return t;
+}();
+inline __m256 e4m3x8_to_f32(const uint8_t *p) {
+    const __m128i b=_mm_loadl_epi64((const __m128i*)p);
+    const __m256i u=_mm256_cvtepu8_epi32(b);
+    const __m256i sign=_mm256_slli_epi32(_mm256_and_si256(u,_mm256_set1_epi32(0x80)),24);
+    const __m256i mag=_mm256_and_si256(u,_mm256_set1_epi32(0x7F));
+    const __m256i norm=_mm256_add_epi32(_mm256_slli_epi32(mag,20),_mm256_set1_epi32(120<<23));
+    const __m256i sub_tbl=_mm256_setr_epi32(
+        0x00000000,0x3b000000,0x3b800000,0x3bc00000,
+        0x3c000000,0x3c200000,0x3c400000,0x3c600000);
+    const __m256i sub=_mm256_permutevar8x32_epi32(sub_tbl,mag);
+    const __m256i is_sub=_mm256_cmpgt_epi32(_mm256_set1_epi32(8),mag);
+    const __m256i is_nan=_mm256_cmpeq_epi32(mag,_mm256_set1_epi32(0x7F));
+    __m256i bits=_mm256_blendv_epi8(norm,sub,is_sub);
+    bits=_mm256_andnot_si256(is_nan,_mm256_or_si256(sign,bits));
+    return _mm256_castsi256_ps(bits);
+}
+inline void unpack32_mxfp8(const uint8_t *p,const uint8_t *s,__m256 w[4]) {
+    const __m256 sc=_mm256_set1_ps(ue8m0_f32[s[0]]);
+    for(int k=0;k<4;k++)w[k]=_mm256_mul_ps(e4m3x8_to_f32(p+8*k),sc);
+}
 #endif  // XTIER_AVX512
 
 // Worker nodes. Every expert's Gate/Up rows (I) and Down rows (H) are split evenly over the
@@ -584,6 +660,7 @@ struct PlanBase {
     virtual int node_count() const=0;
     virtual void shard(int,void**,size_t*) const=0;
     virtual void set_swiglu(float alpha,float beta)=0;
+    virtual void set_situ(float gate_cap,float up_cap)=0;
     virtual int place(int expert,int slot)=0;
     virtual int slot_table(int32_t *table)=0;
     virtual int slot_pieces(int slot,int node,void **pointers,size_t *bytes) const=0;
@@ -594,16 +671,28 @@ struct PlanBase {
     virtual void cold_stats(double *out)=0;
     virtual void tail_stats(double *out)=0;
 };
-template<bool MX> class Plan: public PlanBase {
-    static constexpr int scale_format=MX?1:0,scale_shift=MX?5:4;
+template<int FMT> class Plan: public PlanBase {
+    static constexpr int scale_format=FMT,scale_shift=(FMT==0)?4:5,weight_shift=(FMT==2)?0:1;
     const std::array<uint16_t,16>* bf_table=lut.data();
 #if XTIER_AVX512
     const std::array<float,16>* fp_table=flut.data();
-    __m512bh unpack(const uint8_t* p,const uint8_t* s) const {if constexpr(MX)return ::unpack(p,s,bf_table,true);else return ::unpack(p,s);}
-    void unpack_f32(const uint8_t* p,const uint8_t* s,__m512& a,__m512& b) const {if constexpr(MX)::unpack_f32(p,s,a,b,fp_table,true);else ::unpack_f32(p,s,a,b);}
+    __m512bh unpack(const uint8_t* p,const uint8_t* s) const {
+        if constexpr(FMT==2)return ::unpack_mxfp8(p,s);
+        else if constexpr(FMT==1)return ::unpack(p,s,bf_table,true);
+        else return ::unpack(p,s);
+    }
+    void unpack_f32(const uint8_t* p,const uint8_t* s,__m512& a,__m512& b) const {
+        if constexpr(FMT==2)::unpack_mxfp8_f32(p,s,a,b);
+        else if constexpr(FMT==1)::unpack_f32(p,s,a,b,fp_table,true);
+        else ::unpack_f32(p,s,a,b);
+    }
 #else
     const std::array<uint8_t,32>* byte_table=blut.data();
-    void unpack32(const uint8_t* p,const uint8_t* s,__m256 w[4]) const {if constexpr(MX)::unpack32(p,s,w,byte_table,true);else ::unpack32(p,s,w);}
+    void unpack32(const uint8_t* p,const uint8_t* s,__m256 w[4]) const {
+        if constexpr(FMT==2)::unpack32_mxfp8(p,s,w);
+        else if constexpr(FMT==1)::unpack32(p,s,w,byte_table,true);
+        else ::unpack32(p,s,w);
+    }
 #endif
     void copy_scales(uint8_t* dst,const uint8_t* src,size_t count) {
         std::memcpy(dst,src,count);
@@ -613,6 +702,9 @@ template<bool MX> class Plan: public PlanBase {
     // GPT-OSS SwiGLU (MiniMax M3): gate*sigmoid(alpha*gate)*(up+beta) after the clamp; 1 / 0 = the plain SiLU path
     float swiglu_alpha=1.f,swiglu_beta=0.f;
     void set_swiglu(float alpha,float beta) override {swiglu_alpha=alpha;swiglu_beta=beta;}
+    // Soft-capped SiTU (Inkling-2): (gcap*tanh(g/gcap))*sigmoid(g)*(ucap*tanh(u/ucap)); 0/0 disables
+    float situ_gate_cap=0.f,situ_up_cap=0.f;
+    void set_situ(float gcap,float ucap) override {situ_gate_cap=gcap;situ_up_cap=ucap;}
     std::shared_ptr<Executor> pool;
     std::vector<Shard> shards;  // one per worker node
     // RAM slots (xtier_create4, cold experts on NVMe): the shards hold `slots` experts' weights; slot_of[e] is expert
@@ -695,11 +787,11 @@ template<bool MX> class Plan: public PlanBase {
             const size_t e=size_t(expert_of[slot]),gi=slot*IN,di=slot*HN;
             size_t srcg=e*2*I+node*IN,srcu=srcg+I;
             size_t srcd=e*H+node*HN;
-            std::memcpy(s.gate.get()+gi*(H/2),source13+srcg*(H/2),IN*(H/2));
-            std::memcpy(s.up.get()+gi*(H/2),source13+srcu*(H/2),IN*(H/2));
+            std::memcpy(s.gate.get()+gi*(H>>weight_shift),source13+srcg*(H>>weight_shift),IN*(H>>weight_shift));
+            std::memcpy(s.up.get()+gi*(H>>weight_shift),source13+srcu*(H>>weight_shift),IN*(H>>weight_shift));
             copy_scales(s.sg.get()+gi*(H>>scale_shift),scale13+srcg*(H>>scale_shift),IN*(H>>scale_shift));
             copy_scales(s.su.get()+gi*(H>>scale_shift),scale13+srcu*(H>>scale_shift),IN*(H>>scale_shift));
-            std::memcpy(s.down.get()+di*(I/2),source2+srcd*(I/2),HN*(I/2));
+            std::memcpy(s.down.get()+di*(I>>weight_shift),source2+srcd*(I>>weight_shift),HN*(I>>weight_shift));
             copy_scales(s.sd.get()+di*(I>>scale_shift),scale2+srcd*(I>>scale_shift),HN*(I>>scale_shift));
         }
     }
@@ -712,6 +804,7 @@ template<bool MX> class Plan: public PlanBase {
         // Locals: stores into the intermediate must not force reloads of float members.
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;
         const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
+        const float gcap=situ_gate_cap,ucap=situ_up_cap;const bool situ=gcap>0.f||ucap>0.f;
         const float scale_gate=globals13[2*group_expert(g)],scale_up=globals13[2*group_expert(g)+1];
         const auto &s=shards[node];const auto &group=groups[g];const size_t slot=size_t(group.slot);
         const uint16_t *xs[M];for(int t=0;t<M;t++)xs[t]=input+size_t(group.token[t])*H;
@@ -725,8 +818,8 @@ template<bool MX> class Plan: public PlanBase {
                 __m512bh x[M];for(int t=0;t<M;t++)x[t]=(__m512bh)_mm512_loadu_si512(xs[t]+c);
                 for(int j=0;j<R;j++) {
                     size_t base=slot*IN+r+j;
-                    __m512bh a=unpack(s.gate.get()+base*(H/2)+c/2,s.sg.get()+base*(H>>scale_shift)+(c>>scale_shift));
-                    __m512bh b=unpack(s.up.get()+base*(H/2)+c/2,s.su.get()+base*(H>>scale_shift)+(c>>scale_shift));
+                    __m512bh a=unpack(s.gate.get()+base*(H>>weight_shift)+(c>>weight_shift),s.sg.get()+base*(H>>scale_shift)+(c>>scale_shift));
+                    __m512bh b=unpack(s.up.get()+base*(H>>weight_shift)+(c>>weight_shift),s.su.get()+base*(H>>scale_shift)+(c>>scale_shift));
                     for(int t=0;t<M;t++) {
                         ag[j][t]=_mm512_dpbf16_ps(ag[j][t],a,x[t]);au[j][t]=_mm512_dpbf16_ps(au[j][t],b,x[t]);
                     }
@@ -740,7 +833,15 @@ template<bool MX> class Plan: public PlanBase {
                     up=std::min(std::max(up,-limit),limit);
                     gate=std::min(gate,limit);
                 }
-                float value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
+                float value;
+                if(situ) {
+                    float sig=1.f/(1.f+std::exp(-gate));
+                    float gc=gcap>0.f?gcap*std::tanh(gate/gcap):gate;
+                    float uc=ucap>0.f?ucap*std::tanh(up/ucap):up;
+                    value=gc*sig*uc;
+                } else {
+                    value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
+                }
                 size_t at=(size_t(group.row)+t)*I+node*IN+r+j;
                 if(down_bf16)reinterpret_cast<uint16_t*>(out_mid)[at]=tobf(value);
                 else out_mid[at]=value;
@@ -762,7 +863,7 @@ template<bool MX> class Plan: public PlanBase {
                 for(int t=0;t<M;t++)x[t]=(__m512bh)_mm512_loadu_si512(in_mid+(size_t(group.row)+t)*I+c);
                 for(int j=0;j<R;j++) {
                     size_t base=slot*HN+r+j;
-                    __m512bh w=unpack(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift));
+                    __m512bh w=unpack(s.down.get()+base*(I>>weight_shift)+(c>>weight_shift),s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift));
                     for(int t=0;t<M;t++)acc[j][t]=_mm512_dpbf16_ps(acc[j][t],w,x[t]);
                 }
             }
@@ -792,9 +893,9 @@ template<bool MX> class Plan: public PlanBase {
                     size_t base=slot*HN+r+j;
                     __m512 lo,hi;
 #if XTIER_DOWN_F32_LUT
-                    unpack_f32(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift),lo,hi);
+                    unpack_f32(s.down.get()+base*(I>>weight_shift)+(c>>weight_shift),s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift),lo,hi);
 #else
-                    asfloat(unpack(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift)),lo,hi);
+                    asfloat(unpack(s.down.get()+base*(I>>weight_shift)+(c>>weight_shift),s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift)),lo,hi);
 #endif
                     for(int t=0;t<M;t++) {
                         acc[j][t]=_mm512_fmadd_ps(lo,xl[t],acc[j][t]);
@@ -819,6 +920,7 @@ template<bool MX> class Plan: public PlanBase {
         const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes;
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;const bool round=down_bf16;
         const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
+        const float gcap=situ_gate_cap,ucap=situ_up_cap;const bool situ=gcap>0.f||ucap>0.f;
         const float scale_gate=globals13[2*group_expert(g)],scale_up=globals13[2*group_expert(g)+1];
         const auto &s=shards[node];const auto &group=groups[g];const size_t slot=size_t(group.slot);
         const uint16_t *x1=input+size_t(group.token[t0])*H;
@@ -840,7 +942,7 @@ template<bool MX> class Plan: public PlanBase {
             const uint8_t *gw[R],*uw[R],*gs[R],*us[R];
             for(int j=0;j<R;j++) {
                 size_t base=slot*IN+r+j;
-                gw[j]=s.gate.get()+base*(H/2);uw[j]=s.up.get()+base*(H/2);
+                gw[j]=s.gate.get()+base*(H>>weight_shift);uw[j]=s.up.get()+base*(H>>weight_shift);
                 gs[j]=s.sg.get()+base*(H>>scale_shift);us[j]=s.su.get()+base*(H>>scale_shift);
             }
             for(int c=0;c<H;c+=32) {
@@ -849,7 +951,7 @@ template<bool MX> class Plan: public PlanBase {
                 for(int j=0;j<R;j++) {
                     // Per accumulator the FMAs run block by block, low then high eight weights.
                     __m256 w[4];
-                    unpack32(gw[j]+c/2,gs[j]+(c>>scale_shift),w);
+                    unpack32(gw[j]+(c>>weight_shift),gs[j]+(c>>scale_shift),w);
                     for(int t=0;t<MT;t++) {
                         __m256 *ga=ag+(j*MT+t)*S;
                         for(int k=0;k<4;k++) {
@@ -858,7 +960,7 @@ template<bool MX> class Plan: public PlanBase {
                             ga[(k&1)*(S-1)]=_mm256_fmadd_ps(w[k],xk,ga[(k&1)*(S-1)]);
                         }
                     }
-                    unpack32(uw[j]+c/2,us[j]+(c>>scale_shift),w);
+                    unpack32(uw[j]+(c>>weight_shift),us[j]+(c>>scale_shift),w);
                     for(int t=0;t<MT;t++) {
                         __m256 *ua=au+(j*MT+t)*S;
                         for(int k=0;k<4;k++) {
@@ -877,7 +979,15 @@ template<bool MX> class Plan: public PlanBase {
                     up=std::min(std::max(up,-limit),limit);
                     gate=std::min(gate,limit);
                 }
-                float value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
+                float value;
+                if(situ) {
+                    float sig=1.f/(1.f+std::exp(-gate));
+                    float gc=gcap>0.f?gcap*std::tanh(gate/gcap):gate;
+                    float uc=ucap>0.f?ucap*std::tanh(up/ucap):up;
+                    value=gc*sig*uc;
+                } else {
+                    value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
+                }
                 // The intermediate stays FP32 here; XTIER_DOWN_BF16 rounds its values only.
                 out_mid[(size_t(group.row)+t0+t)*I+node*IN+r+j]=round?round_bf16(value):value;
             }
@@ -897,10 +1007,10 @@ template<bool MX> class Plan: public PlanBase {
         for(int r=begin;r<end;r+=R) {
             __m256 acc[R*MT*S];for(int q=0;q<R*MT*S;q++)acc[q]=_mm256_setzero_ps();
             const uint8_t *dw[R],*ds[R];
-            for(int j=0;j<R;j++){size_t base=slot*HN+r+j;dw[j]=s.down.get()+base*(I/2);ds[j]=s.sd.get()+base*(I>>scale_shift);}
+            for(int j=0;j<R;j++){size_t base=slot*HN+r+j;dw[j]=s.down.get()+base*(I>>weight_shift);ds[j]=s.sd.get()+base*(I>>scale_shift);}
             for(int c=0;c<I;c+=32) {
                 for(int j=0;j<R;j++) {
-                    __m256 w[4];unpack32(dw[j]+c/2,ds[j]+(c>>scale_shift),w);
+                    __m256 w[4];unpack32(dw[j]+(c>>weight_shift),ds[j]+(c>>scale_shift),w);
                     for(int t=0;t<MT;t++) {
                         __m256 *a=acc+(j*MT+t)*S;
                         for(int k=0;k<4;k++)a[(k&1)*(S-1)]=_mm256_fmadd_ps(w[k],_mm256_loadu_ps(rows[t]+c+8*k),a[(k&1)*(S-1)]);
@@ -1077,12 +1187,12 @@ template<bool MX> class Plan: public PlanBase {
         for(int g=0;g<groups_n;g++) {
             size_t e=groups[g].slot;
             if(phase==1) {
-                stream(s.gate.get()+(e*rows+begin)*(H/2),(end-begin)*(H/2));
-                stream(s.up.get()+(e*rows+begin)*(H/2),(end-begin)*(H/2));
+                stream(s.gate.get()+(e*rows+begin)*(H>>weight_shift),(end-begin)*(H>>weight_shift));
+                stream(s.up.get()+(e*rows+begin)*(H>>weight_shift),(end-begin)*(H>>weight_shift));
                 stream(s.sg.get()+(e*rows+begin)*(H>>scale_shift),(end-begin)*(H>>scale_shift));
                 stream(s.su.get()+(e*rows+begin)*(H>>scale_shift),(end-begin)*(H>>scale_shift));
             } else {
-                stream(s.down.get()+(e*rows+begin)*(I/2),(end-begin)*(I/2));
+                stream(s.down.get()+(e*rows+begin)*(I>>weight_shift),(end-begin)*(I>>weight_shift));
                 stream(s.sd.get()+(e*rows+begin)*(I>>scale_shift),(end-begin)*(I>>scale_shift));
             }
         }
@@ -1099,6 +1209,7 @@ template<bool MX> class Plan: public PlanBase {
         else if(hidden==5120&&inter==2304)run<5120,2304>(node,lane,lanes); // DeepSeek V4.1 Flash
         else if(hidden==4096&&inter==2048)run<4096,2048>(node,lane,lanes); // GLM-5.3 Flash
         else if(hidden==1536&&inter==1536)run<1536,1536>(node,lane,lanes); // Hunyuan-4-Flash
+        else if(hidden==4608&&inter==2304)run<4608,2304>(node,lane,lanes); // Inkling-2-Small
         else run<0,0>(node,lane,lanes);
     }
 
@@ -1117,8 +1228,8 @@ public:
          const uint8_t *s2,const float *g13,const float *g2,int format=0,int slot_count=0,const int32_t *resident=nullptr)
         :hidden(h),inter(i),experts(e),swiglu_limit(limit),pool(get_executor(n)),globals13(g13,g13+e*2),
          globals2(g2,g2+e),source13(w13),source2(w2),scale13(s13),scale2(s2),groups(MAX_ROUTES) {
-        if(format<0||format>1)throw std::runtime_error("Unknown scale format");
-        if(format) {
+        if(format<0||format>2)throw std::runtime_error("Unknown scale format");
+        if(format==1) {
             bf_table=mx_tables().bf.data();
 #if XTIER_AVX512
             fp_table=mx_tables().fp.data();
@@ -1153,9 +1264,9 @@ public:
         const size_t IN=I/nodes,HN=H/nodes,S=slots;
         for(int node=0;node<nodes;node++) {
             auto &s=shards[node];const int mem=topology().memory[node];
-            s.gate=alloc(S*IN*(H/2),mem);s.up=alloc(S*IN*(H/2),mem);
+            s.gate=alloc(S*IN*(H>>weight_shift),mem);s.up=alloc(S*IN*(H>>weight_shift),mem);
             s.sg=alloc(S*IN*(H>>scale_shift),mem);s.su=alloc(S*IN*(H>>scale_shift),mem);
-            s.down=alloc(S*HN*(I/2),mem);s.sd=alloc(S*HN*(I>>scale_shift),mem);
+            s.down=alloc(S*HN*(I>>weight_shift),mem);s.sd=alloc(S*HN*(I>>scale_shift),mem);
         }
         if(const char *v=std::getenv("XTIER_DOWN_BF16"))down_bf16=std::string(v)=="1";
         if(const char *v=std::getenv("XTIER_DYNAMIC"))dynamic=std::stoi(v);
@@ -1368,7 +1479,7 @@ public:
             }
         }
         const size_t H=hidden,I=inter,IN=I/nodes,HN=H/nodes;
-        const size_t sizes[6]={IN*(H/2),IN*(H/2),IN*(H>>scale_shift),IN*(H>>scale_shift),HN*(I/2),HN*(I>>scale_shift)};
+        const size_t sizes[6]={IN*(H>>weight_shift),IN*(H>>weight_shift),IN*(H>>scale_shift),IN*(H>>scale_shift),HN*(I>>weight_shift),HN*(I>>scale_shift)};
         // a job per unit of a node part (cold.py _unit_pieces): one unit, the six pieces; three units of four pieces each,
         // the gate piece and the up piece each in four 512-byte aligned quarters, then the scales and the down piece
         const int U=cold_units,n=U==1?6:4;
@@ -1487,14 +1598,14 @@ public:
         if(slot<0||slot>=slots||node<0||node>=nodes)return -1;
         const size_t H=hidden,I=inter,IN=I/nodes,HN=H/nodes,S=size_t(slot);const auto &s=shards[node];
         uint8_t *base[6]={s.gate.get(),s.up.get(),s.sg.get(),s.su.get(),s.down.get(),s.sd.get()};
-        const size_t sizes[6]={IN*(H/2),IN*(H/2),IN*(H>>scale_shift),IN*(H>>scale_shift),HN*(I/2),HN*(I>>scale_shift)};
+        const size_t sizes[6]={IN*(H>>weight_shift),IN*(H>>weight_shift),IN*(H>>scale_shift),IN*(H>>scale_shift),HN*(I>>weight_shift),HN*(I>>scale_shift)};
         for(int j=0;j<6;j++){pointers[j]=base[j]+S*sizes[j];bytes[j]=sizes[j];}
         return 0;
     }
     void shard(int node,void **pointers,size_t *bytes) const {
         const size_t E=slots,H=hidden,I=inter,IN=I/nodes,HN=H/nodes;const auto &s=shards[node];
         const Bytes *all[6]={&s.gate,&s.up,&s.sg,&s.su,&s.down,&s.sd};
-        size_t sizes[6]={E*IN*(H/2),E*IN*(H/2),E*IN*(H>>scale_shift),E*IN*(H>>scale_shift),E*HN*(I/2),E*HN*(I>>scale_shift)};
+        size_t sizes[6]={E*IN*(H>>weight_shift),E*IN*(H>>weight_shift),E*IN*(H>>scale_shift),E*IN*(H>>scale_shift),E*HN*(I>>weight_shift),E*HN*(I>>scale_shift)};
         for(int j=0;j<6;j++){pointers[j]=all[j]->get();bytes[j]=sizes[j];}
     }
 };
@@ -1529,9 +1640,10 @@ void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,floa
         const bool empty=!w13&&!w2&&!s13&&!s2;   // all four null: shards allocated, not filled
         if(experts<10||experts>MAX_EXPERTS||threads<1||threads>128||(!empty&&(!w13||!w2||!s13||!s2))||!g13||!g2)
             throw std::runtime_error("Invalid create arguments");
-        if(scale_format==1)return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1)};
+        if(scale_format==2)return new Handle{std::make_shared<Plan<2>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,2)};
+        if(scale_format==1)return new Handle{std::make_shared<Plan<1>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1)};
         if(scale_format!=0)throw std::runtime_error("Unknown scale format");
-        return new Handle{std::make_shared<Plan<false>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0)};
+        return new Handle{std::make_shared<Plan<0>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0)};
     }catch(const std::exception &e){last_error=e.what();return nullptr;}
 }
 void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int threads,float swiglu_limit,int scale_format,
@@ -1549,12 +1661,15 @@ void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int th
         if(experts<10||experts>MAX_EXPERTS||slots<1||slots>experts||threads<1||threads>128
            ||(!empty&&(!w13||!w2||!s13||!s2))||!g13||!g2||!resident)
             throw std::runtime_error("Invalid create arguments");
-        if(scale_format==1)
-            return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1,
-                                                           slots,resident)};
-        if(scale_format!=0)throw std::runtime_error("Unknown scale format");
-        return new Handle{std::make_shared<Plan<false>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0,
+        if(scale_format==2)
+            return new Handle{std::make_shared<Plan<2>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,2,
                                                         slots,resident)};
+        if(scale_format==1)
+            return new Handle{std::make_shared<Plan<1>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1,
+                                                        slots,resident)};
+        if(scale_format!=0)throw std::runtime_error("Unknown scale format");
+        return new Handle{std::make_shared<Plan<0>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0,
+                                                    slots,resident)};
     }catch(const std::exception &e){last_error=e.what();return nullptr;}
 }
 int XTIER_API(xtier_cold_attach)(void *plan,void *store,void *io,const int32_t *files,const long long *offsets,
@@ -1588,6 +1703,12 @@ int XTIER_API(xtier_slot_pieces)(void *plan,int slot,int node,void **pointers,si
 int XTIER_API(xtier_set_swiglu)(void *plan,float alpha,float beta) {
     if(!plan||!(alpha>0.f)){last_error="Invalid SwiGLU parameters";return -1;}
     static_cast<Handle*>(plan)->plan->set_swiglu(alpha,beta);return 0;
+}
+int XTIER_API(xtier_set_situ)(void *plan,float gate_cap,float up_cap) {
+    if(!plan||!std::isfinite(gate_cap)||gate_cap<0.f||!std::isfinite(up_cap)||up_cap<0.f){
+        last_error="Invalid SiTU parameters";return -1;
+    }
+    static_cast<Handle*>(plan)->plan->set_situ(gate_cap,up_cap);return 0;
 }
 int XTIER_API(xtier_shape)(void *plan,int *out) {
     if(!plan||!out){last_error="Invalid shape query";return -1;}

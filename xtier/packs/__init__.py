@@ -8,7 +8,7 @@ resolved): ``install_serving``.
 import importlib
 import os
 
-PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4', 'minimax_m3', 'hy4_flash', 'speculative')
+PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4', 'minimax_m3', 'hy4_flash', 'inkling2', 'speculative')
 
 
 def selected() -> list[str]:

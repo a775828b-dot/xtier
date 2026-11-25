@@ -29,7 +29,7 @@ A = P.parse_args()
 
 order = []
 for line in open(A.log, errors='ignore'):
-    m = re.search(r'xtier: layer (\d+): \d+ experts', line)
+    m = re.search(r'xtier:(?: inkling2)? layer (\d+): \d+ (?:\w+ )?experts', line)
     if m:
         order.append(int(m.group(1)))
 model_layers = {}

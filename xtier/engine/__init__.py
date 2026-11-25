@@ -15,7 +15,7 @@ from pathlib import Path
 _P, _I = C.c_void_p, C.c_int
 _engine = None
 _mailbox = None
-SCALE_FORMATS = {'nvfp4': 0, 'mxfp4': 1}
+SCALE_FORMATS = {'nvfp4': 0, 'mxfp4': 1, 'mxfp8': 2}
 
 
 def lib_dir() -> Path:
@@ -31,6 +31,8 @@ def engine() -> C.CDLL:
         lib.xtier_create3.restype = _P
         lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
         lib.xtier_set_swiglu.restype = _I
+        lib.xtier_set_situ.argtypes = [_P, C.c_float, C.c_float]
+        lib.xtier_set_situ.restype = _I
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
         lib.xtier_forward.restype = _I
         lib.xtier_destroy.argtypes = [_P]
@@ -83,7 +85,7 @@ class CpuPlan:
     and left to the caller to fill (shards / slot_pieces) before the first forward."""
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
-                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None):
+                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, situ_gate_cap=0.0, situ_up_cap=0.0):
         if scale_format not in SCALE_FORMATS:
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
@@ -104,6 +106,10 @@ class CpuPlan:
         # GPT-OSS SwiGLU (MiniMax M3): gate * sigmoid(alpha * gate) * (up + beta); 1 / 0 keep the plain SiLU path
         if (swiglu_alpha, swiglu_beta) != (1.0, 0.0):
             if self.lib.xtier_set_swiglu(self.plan, swiglu_alpha, swiglu_beta):
+                raise RuntimeError(self.lib.xtier_last_error().decode())
+        self.situ_gate_cap, self.situ_up_cap = float(situ_gate_cap), float(situ_up_cap)
+        if (self.situ_gate_cap, self.situ_up_cap) != (0.0, 0.0):
+            if self.lib.xtier_set_situ(self.plan, self.situ_gate_cap, self.situ_up_cap):
                 raise RuntimeError(self.lib.xtier_last_error().decode())
         self._localized = False
 

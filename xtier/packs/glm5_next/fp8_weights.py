@@ -85,17 +85,18 @@ def _w8_fused(X, W, S, P, CNT, BIAS, Y, M, N, K, SPAN, NG, SLICES: tl.constexpr,
 @triton.jit
 def _w8_dequant(W, S, D, N, K, NG, BN: tl.constexpr, BK: tl.constexpr):
     rows = tl.program_id(0) * BN + tl.arange(0, BN)
+    rows64 = rows.to(tl.int64)
     ks = tl.program_id(1) * BK + tl.arange(0, BK)
     mask = (rows[:, None] < N) & (ks[None, :] < K)
-    w = tl.load(W + rows[:, None] * K + ks[None, :], mask=mask, other=0)
-    s = tl.load(S + rows * NG + (tl.program_id(1) * BK) // 128, mask=rows < N, other=0.0)
-    tl.store(D + rows[:, None] * K + ks[None, :], (e4m3_f32(w) * s[:, None]).to(tl.bfloat16), mask=mask)
+    w = tl.load(W + rows64[:, None] * K + ks[None, :], mask=mask, other=0)
+    s = tl.load(S + rows64 * NG + (tl.program_id(1) * BK) // 128, mask=rows < N, other=0.0)
+    tl.store(D + rows64[:, None] * K + ks[None, :], (e4m3_f32(w) * s[:, None]).to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
 def _act_quant_fp8(X, Q, S, M, K, NG, BK: tl.constexpr):
-    r = tl.program_id(0)
-    g = tl.program_id(1)
+    r = tl.program_id(0).to(tl.int64)
+    g = tl.program_id(1).to(tl.int64)
     ks = g * BK + tl.arange(0, BK)
     x = tl.load(X + r * K + ks, mask=ks < K, other=0.0).to(tl.float32)
     s = tl.maximum(tl.max(tl.abs(x), 0) / 448.0, 1e-12)
@@ -116,15 +117,17 @@ def _w8a8_gemm(A, SA, B, SB, C, M, N, K, NG, BM: tl.constexpr, BN: tl.constexpr,
     pn = (pid % (GROUP_M * num_n)) // gsize
     rm = pm * BM + tl.arange(0, BM)
     rn = pn * BN + tl.arange(0, BN)
+    rm64 = rm.to(tl.int64)
+    rn64 = rn.to(tl.int64)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for g in range(0, NG):
         ks = g * BK + tl.arange(0, BK)
-        a = tl.load(A + rm[:, None] * K + ks[None, :], mask=rm[:, None] < M, other=0.0)
-        b = tl.load(B + rn[:, None] * K + ks[None, :], mask=rn[:, None] < N, other=0.0)
-        sa = tl.load(SA + rm * NG + g, mask=rm < M, other=0.0)
-        sb = tl.load(SB + rn * NG + g, mask=rn < N, other=0.0)
+        a = tl.load(A + rm64[:, None] * K + ks[None, :], mask=rm[:, None] < M, other=0.0)
+        b = tl.load(B + rn64[:, None] * K + ks[None, :], mask=rn[:, None] < N, other=0.0)
+        sa = tl.load(SA + rm64 * NG + g, mask=rm < M, other=0.0)
+        sb = tl.load(SB + rn64 * NG + g, mask=rn < N, other=0.0)
         acc += tl.dot(a, tl.trans(b)) * (sa[:, None] * sb[None, :])
-    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=(rm[:, None] < M) & (rn[None, :] < N))
+    tl.store(C + rm64[:, None] * N + rn64[None, :], acc.to(tl.bfloat16), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
 def _split(n, k):

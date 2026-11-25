@@ -13,15 +13,17 @@ import os
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 from xtier.backend.prefill import _reduce
-from xtier.cache.pool import _halves, _tile_k
+from xtier.cache.pool import _halves, _mxfp8_tile, _tile_k
 
 
 @triton.jit
 def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13, MID, K: tl.constexpr, H: tl.constexpr,
                    I: tl.constexpr, LIMIT, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr,
-                   ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
+                   ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, MXFP8: tl.constexpr = False,
+                   GATE_CAP: tl.constexpr = 0.0, UP_CAP: tl.constexpr = 0.0):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)
     s = tl.load(TILE_S + tile).to(tl.int64)   # slot of the tile's expert (expert e for a fully cached layer)
@@ -33,21 +35,34 @@ def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13
     accg = tl.zeros((BM, BN), dtype=tl.float32)
     accu = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, H, BK):
-        ke = k0 + 2 * tl.arange(0, BK // 2)
-        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        gl, gh = _halves(Q13, S13, s, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
-        ul, uh = _halves(Q13, S13, s, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
-        accg = tl.dot(xe, tl.trans(gl), accg)
-        accg = tl.dot(xo, tl.trans(gh), accg)
-        accu = tl.dot(xe, tl.trans(ul), accu)
-        accu = tl.dot(xo, tl.trans(uh), accu)
+        if MXFP8:
+            kk = k0 + tl.arange(0, BK)
+            xv = tl.load(X + tok[:, None] * H + kk[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16)
+            gw = _mxfp8_tile(Q13, S13, s, n, k0, 2 * I * H, H, 2 * I * (H // 32), H // 32, BN, BK)
+            uw = _mxfp8_tile(Q13, S13, s, n + I, k0, 2 * I * H, H, 2 * I * (H // 32), H // 32, BN, BK)
+            accg = tl.dot(xv, tl.trans(gw), accg)
+            accu = tl.dot(xv, tl.trans(uw), accu)
+        else:
+            ke = k0 + 2 * tl.arange(0, BK // 2)
+            xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            gl, gh = _halves(Q13, S13, s, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
+            ul, uh = _halves(Q13, S13, s, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
+            accg = tl.dot(xe, tl.trans(gl), accg)
+            accg = tl.dot(xo, tl.trans(gh), accg)
+            accu = tl.dot(xe, tl.trans(ul), accu)
+            accu = tl.dot(xo, tl.trans(uh), accu)
     g = accg * tl.load(G13 + e * 2)
     u = accu * tl.load(G13 + e * 2 + 1)
     if LIMIT > 0:
         u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
         g = tl.minimum(g, LIMIT)
-    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+    if GATE_CAP > 0.0 or UP_CAP > 0.0:   # Soft-capped SiTU (Inkling-2)
+        sig = 1.0 / (1.0 + tl.exp(-g))
+        gc = GATE_CAP * libdevice.tanh(g / GATE_CAP) if GATE_CAP > 0.0 else g
+        uc = UP_CAP * libdevice.tanh(u / UP_CAP) if UP_CAP > 0.0 else u
+        val = gc * sig * uc
+    elif ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
@@ -56,7 +71,7 @@ def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13
 
 @triton.jit
 def _down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q2, S2, G2, ROUTES, H: tl.constexpr, I: tl.constexpr,
-                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr):
+                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr, MXFP8: tl.constexpr = False):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)
     s = tl.load(TILE_S + tile).to(tl.int64)   # slot of the tile's expert (expert e for a fully cached layer)
@@ -67,12 +82,18 @@ def _down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q2, S2, G2, RO
     G: tl.constexpr = 32 if MX else 16
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, I, BK):
-        ke = k0 + 2 * tl.arange(0, BK // 2)
-        ae = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        ao = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        wl, wh = _halves(Q2, S2, s, h, k0, H * (I // 2), I // 2, H * (I // G), I // G, BN, BK, MX)
-        acc = tl.dot(ae, tl.trans(wl), acc)
-        acc = tl.dot(ao, tl.trans(wh), acc)
+        if MXFP8:
+            kk = k0 + tl.arange(0, BK)
+            av = tl.load(MID + r[:, None].to(tl.int64) * I + kk[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16)
+            ww = _mxfp8_tile(Q2, S2, s, h, k0, H * I, I, H * (I // 32), I // 32, BN, BK)
+            acc = tl.dot(av, tl.trans(ww), acc)
+        else:
+            ke = k0 + 2 * tl.arange(0, BK // 2)
+            ae = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            ao = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
+            wl, wh = _halves(Q2, S2, s, h, k0, H * (I // 2), I // 2, H * (I // G), I // G, BN, BK, MX)
+            acc = tl.dot(ae, tl.trans(wl), acc)
+            acc = tl.dot(ao, tl.trans(wh), acc)
     acc = acc * tl.load(G2 + e)
     tl.store(ROUTES + route[:, None] * H + h[None, :], acc, mask=rm[:, None])
 
@@ -87,7 +108,8 @@ def resident_prefill(prefill, arena, x, ids, weights):
     H, I, E = prefill.hidden, prefill.inter, prefill.experts
     g13, g2 = prefill._globals()
     fixed_bm = _env_int('XTIER_CACHE_PREFILL_TILE_M', 0)
-    bkh, bki = _tile_k(H), _tile_k(I)
+    bkh = min(_tile_k(H), 128) if prefill.mxfp8 else _tile_k(H)
+    bki = min(_tile_k(I), 128) if prefill.mxfp8 else _tile_k(I)
     block = _env_int('XTIER_GPU_PREFILL_CHUNK', 8192)
     m, k = ids.shape
     out = torch.empty_like(x)
@@ -124,9 +146,10 @@ def resident_prefill(prefill, arena, x, ids, weights):
         _gate_up_tiles[(nt, I // gbn)](x[start:start + size], order, meta[0], meta[0], meta[1], meta[2], arena[0], arena[2], g13,
                                        mid, k, H, I, prefill.swiglu_limit, bm, gbn, bkh, MX=prefill.mxfp4,
                                        ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                       MXFP8=prefill.mxfp8, GATE_CAP=prefill.situ_gate_cap, UP_CAP=prefill.situ_up_cap,
                                        num_warps=gw, num_stages=gs)
         _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[0], meta[1], meta[2], arena[1], arena[3], g2, routes, H, I, bm,
-                                    dbn, bki, MX=prefill.mxfp4, num_warps=dw, num_stages=ds)
+                                    dbn, bki, MX=prefill.mxfp4, MXFP8=prefill.mxfp8, num_warps=dw, num_stages=ds)
         _reduce[(size, triton.cdiv(H, 256))](routes, weights[start:start + size], out[start:start + size], k, 256, H)
     return out
 
@@ -228,12 +251,16 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
                 mid = torch.empty((max(offset, 1), I), dtype=torch.bfloat16, device=x.device)
                 routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)   # CPU routes stay 0 for the sum
                 nt = len(tiles)
+                bkh = min(_tile_k(H), 128) if prefill.mxfp8 else _tile_k(H)
+                bki = min(_tile_k(I), 128) if prefill.mxfp8 else _tile_k(I)
                 _gate_up_tiles[(nt, I // gbn)](x, order, meta[0], meta[1], meta[2], meta[3], pool.arena[0], pool.arena[2], g13,
-                                               mid, k, H, I, prefill.swiglu_limit, bm, gbn, _tile_k(H), MX=prefill.mxfp4,
+                                               mid, k, H, I, prefill.swiglu_limit, bm, gbn, bkh, MX=prefill.mxfp4,
                                                ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                               MXFP8=prefill.mxfp8, GATE_CAP=prefill.situ_gate_cap, UP_CAP=prefill.situ_up_cap,
                                                num_warps=gw, num_stages=gs)
                 _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], meta[3], pool.arena[1], pool.arena[3], g2,
-                                            routes, H, I, bm, dbn, _tile_k(I), MX=prefill.mxfp4, num_warps=dw, num_stages=2)
+                                            routes, H, I, bm, dbn, bki, MX=prefill.mxfp4, MXFP8=prefill.mxfp8,
+                                            num_warps=dw, num_stages=2)
                 _reduce[(m, triton.cdiv(H, 256))](routes, torch.where(on_gpu, weights, 0.0), out_g, k, 256, H)
         finally:   # before the caller may run this layer again (elastic cache): the CPU plan takes one caller
             worker.join()
