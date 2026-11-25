@@ -11,7 +11,7 @@
 | **Tier 0（静态与契约门禁）** | **~10 s**（无 GPU） | 每次提交 / 推 `main` | `repo_check`、`planner_check`、`console_check --fast`（成对采样覆盖全部卡片，替代 280 万笛卡尔积）、`check_sglang --strict`（改核心/平台/钩子时同步跑 `--emulate sm86`） |
 | **Tier 1（差异感知单层 GPU 单测）** | **1–3 min** | 每次推 `main` / 小改动 | 根据 `git diff --name-only <base>` 自动匹配受影响模块的单测与代表 preset（`glm53` NVFP4 / `ds41_1017` MXFP4 / `hy4flash` NVFP4 top-16 / 各模型 pack 单测） |
 | **Tier 2（代表模型快检，单次启动）** | **5–7 min / 模型** | 常规推送 `main` / 候选版本 | 仅改单个模型 pack 时跑该模型；改核心层时跑代表锚点模型（覆盖 NVFP4 + MXFP4 + SWA/DSA + EAGLE/DSpark + Engram）。每个模型**只启动一次**，串行跑完 5 项门禁：启动与零致命日志扫描 → 4 块 2 并发照抄 → 2×4096 PPL → bs=1/并发 decode 速度 → 64K 大海捞针 + 零显存分配重试 |
-| **Tier 3（全量发布清单，见下 §1–§5）** | **1.5–3 h** | 大版本发版 / 跟进 SGLang 主线 | **仅校验最新 3 个主力模型**（当前：`hy4flash`、`ds41`、`qwen38`）的 520K/950K 长上下文、15 分钟 `dsh`、`abuse_test`、`2^31` 回绕、`SM86` 真机/模拟、干净 checkout 演练；**其余较早模型**（如 `glm53` 等）统一走 **Tier 2 快速校验通道** |
+| **Tier 3（全量发布清单，见下 §1–§5）** | **1.5–3 h** | 大版本发版 / 跟进 SGLang 主线 | **仅校验最新 3 个主力模型**（当前：`inkling2`、`hy4flash`、`ds41`）的 520K/950K 长上下文、15 分钟 `dsh`、`abuse_test`、`2^31` 回绕、`SM86` 真机/模拟、干净 checkout 演练；**其余较早模型**（如 `glm53` 等）统一走 **Tier 2 快速校验通道** |
 
 ```bash
 # 仅跑 Tier 0 + Tier 1（~1–3 min）

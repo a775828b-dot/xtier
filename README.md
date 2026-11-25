@@ -4,7 +4,7 @@
 
 XTier 是官方 [SGLang](https://github.com/sgl-project/sglang) 的插件（跟 main 分支），做 CPU/GPU 分层 MoE 推理：专家分布在显存和内存两层，按热度放置、按需调度；NVMe 只放大嵌入表的行（DeepSeek 的 Engram、Qwen 的 PLE）。内存放不下全部专家时，可选的冷专家池把少用的专家放到硬盘、用到时读回内存，池子大小和速度受限于硬盘速度和类型。
 
-**状态：早期开发**（[工作计划](docs/PLAN.md)）。Hunyuan-4-Flash NVFP4、DeepSeek V4.1 Flash 1017、Qwen3.8 Flash Next、GLM-5.3 Flash 跑在 SGLang main 上；MiniMax-M3.1-Flash 跑在 SGLang 的 M3.1 分支（PR #45925），已暂停开发（本机太慢、智力不强）。
+**状态：早期开发**（[工作计划](docs/PLAN.md)）。Inkling-2-Small、Hunyuan-4-Flash NVFP4、DeepSeek V4.1 Flash 1017、Qwen3.8 Flash Next、GLM-5.3 Flash 跑在 SGLang main 上；MiniMax-M3.1-Flash 跑在 SGLang 的 M3.1 分支（PR #45925），已暂停开发（本机太慢、智力不强）。
 
 - **不改 SGLang 源码**：只用官方插件框架的钩子（接在官方 KTransformers 混合推理的入口上），加载后自检是否接管成功。
 - **与模型无关**：混合推理包在官方 `FusedMoE` 的量化方法外面，用标准 MoE 层的模型装上就能跑（NVFP4、MXFP4 专家）。
@@ -20,7 +20,8 @@ xtier/
 │              冷专家池（可选，`XTIER_COLD=1`）：少用的专家放到硬盘（[设计](docs/design-cold-experts.md)）
 ├── planner/   规划器：本机探测的 GPU / CPU 耗时 + 路由档案 → 显存预算内每层的热专家槽数（按 CPU 和 GPU 同时算完分配），可在启动时自动算
 ├── engine/    CPU 引擎的 Python 绑定、绑核、锁页内存（C++ 源码在 csrc/）
-├── packs/     加速包：hy4_flash（混合 SWA+DSA 池、416 B/tok NVFP4 KV 与 L2 聚簇解包、FP8 IndexPool、Engram 放 NVMe、零补丁原生 5 层 DFly2 投机解码与置信度截断）、
+├── packs/     加速包：inkling2（40 NVFP4 + 8 MXFP8 MoE + SiTU、NVFP4 目标 KV 6.75 GiB/512K 与远区无掩码解码核、全局注意力 3 流切片投影、116 层 FP8/W8A8、无损 DSpark 在线截断与零内存全驻 GPU 层）、
+│              hy4_flash（混合 SWA+DSA 池、416 B/tok NVFP4 KV 与 L2 聚簇解包、FP8 IndexPool、Engram 放 NVMe、零补丁原生 5 层 DFly2 投机解码与置信度截断）、
 │              qwen4_exp（PLE 表、PLE 行放 NVMe、hc_mix 重叠内核、QSA 读 NVFP4 KV）、glm5_next（量化排除、DSA、NextN）、
 │              deepseek_v4（Engram 行放 NVMe 与跨块预热、SM120 mHC 精确核与 MXFP8 预填自调优、候选索引器、FP8 wo_a、分页索引器、DSpark 上下文草稿检索）、
 │              minimax_m3（SM120 通用栈、CUDA 上的 DSpark verify、草稿词表头 FP8、SM120 上读 NVFP4 KV）、
@@ -78,6 +79,7 @@ MoE 张量并行（`--tp-size` > 1）时每个 rank 只读自己那份（双 RTX
 
 | 模型 | 官方模块 | 状态 |
 |---|---|---|
+| Inkling-2-Small（594B / 17B active，多模态） | `inkling2` | 官方 main 上跑通（512K KV 池 / 2 并发，含零补丁 5 层 DSpark + 无损在线截断 0.20 + 23 层 ViT 多模态）：默认方案 A+（2% NVMe 冷尾 `376/384` 专家在内存，45 弹性热槽，64K 单块 prefill `3,835 tok/s`、`2.41×` 提速，短文 `bs=1 74.7` / `bs=2 78.4 tok/s`，512K NVFP4 KV 仅占 `6.75 GiB` 完整解锁 500K），另提供无冷专家方案 B2（仅 `L47` 全驻 GPU，48K 分块 `2,846 tok/s`）；13 段 PPL `ΔNLL +0.00423` / `KL 0.00938`，照抄 `0/8`，256K/500K 5 深度捞针全 `5/5` |
 | Hunyuan-4-Flash NVFP4 | `hy4_flash` | 官方 main 上跑通（1M KV 池 / 1M 上下文 / 4 并发，含零补丁原生 5 层 DFly2 投机解码 + 置信度截断）：混合 SWA+DSA NVFP4 KV（`7.95 GB`，较基线省 `24.37 GB`）、FP8 IndexPool、Engram（64.7 GB）放 NVMe、208 层 FP8/W8A8 与共享专家掩蔽，照抄 0 错、PPL 无损 |
 | Qwen3.8 Flash Next | `qwen4_exp` | 官方 main 上跑通：精度、照抄、512K 召回与生产一致；加速包比基线 冷 prefill 快 5% / 24%（64K / 512K）；KV 存 NVFP4（与生产同参，加速包让官方 QSA 能读），省下的显存用来多放常驻层，启动台默认由规划器自动布局；PLE 表（48 GiB）可放 NVMe，放傲腾时速度与锁页表持平 |
 | GLM-5.3 Flash | `glm5_next` | 官方 main 上跑通（含 EAGLE）：加速包（FP8 权重、热词表拒绝采样、截断验证、弹性热专家槽）比基线 长回复每步快 22%，PPL 3.987 → 3.998 |
@@ -144,6 +146,19 @@ XTIER_GPU2_SLOTS=auto CUDA_VISIBLE_DEVICES=快卡,慢卡 bash configs/qwen38-rtx
 用 [bench/agent_bench.py](bench/agent_bench.py) 模拟编码代理：5 个会话从 64K 到约 500K，铺满 512K KV 池，多步调用工具，同一次启动
 连跑两轮。冷 prefill = 会话第一个请求里未命中缓存的 token / 首字，decode 只算长回复（≥ 300 token）。基线 = 启动台「关加速包」：
 官方 SGLang main 加 XTier 的混合推理和跑起来必需的修正，不开提速项，**不是原版 SGLang**。配置、精度和原始数据见[测速细节](docs/benchmarks.md)。
+
+### Inkling-2-Small（594B / 17B active，多模态）
+
+RTX PRO 5000 72 GB · 512K 上下文 / 2 并发（40 NVFP4 + 8 MXFP8 MoE，40 SWA + 8 全局注意力，23 层 ViT 多模态，原生 5 层 DSpark）：
+
+| 模式 | 启动耗时 | 单路 decode（bs=1） | 2 并发合计（bs=2） | 64K 冷 prefill | 64K 缓存 decode | 256K 冷 prefill | 500K 冷 prefill | 500K 缓存 decode |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **XTier + 加速包（方案 A+，启动台默认：`cold=2%`, 45 槽, 64K）** | **126 s** | **74.7**（首轮 81.7） | **78.4** | **3,835**（17.1 s） | **52.6**（稳态峰 **66.7**，42.0 ms） | **2,464**（106.4 s） | **1,593**（313.9 s） | **43.7**（峰 47.0，53.8 ms） |
+| XTier + 加速包（方案 A 稳妥档：`cold=8%`, 44 槽, 64K） | 120 s | 71.1（峰 77.2） | 79.0–83.3 | 3,815（17.2 s） | 58.5（峰 63.5，45.1 ms） | 2,465（106.3 s） | 1,603（311.8 s） | **47.0**（峰 51.1，53.7 ms） |
+| XTier + 加速包（方案 B2 无冷专家：仅 `L47` 全驻, 35 槽, 48K） | 420 s | 82.9（首轮） | 72.6 | 2,846（23.1 s） | 56.8（峰 62.5，40.1 ms） | 2,215（118.3 s） | 1,512（330.7 s） | 40.1（峰 47.4，56.6 ms） |
+| **基线（关加速包，默认跑通：`W4A16/W8A16, BF16 KV, 16K, 27 槽`）** | ~390 s | 47.9 | ~43 | 1,591（41.3 s） | 43.4（82.3 ms） | 1,217（215.3 s） | OOM | OOM |
+
+加速包对基线：64K / 256K 冷 prefill 提速 **`2.41×` / `2.02×`**，短文单路 / 2 并发 decode 提速 **`+56%` / `+82%`**，512K Target NVFP4 KV（`6.75 GiB`，`3.56×` 压缩）配远区无掩码解码核彻底解锁 **500K 上下文**；完整两轮 `agent_bench`（64K→513K，91/91 请求命中缓存）长回复 **`66.2 tok/s`**（全部 33 可计时请求 **`66.3 tok/s`**，接受长度 **`4.02`**，`60.6 ms/步`）。默认方案 A+ 将 **376/384（97.9%）** 专家放内存（仅 2% 约 `7 GiB` 最冷尾放 4 盘 NVMe，Decode 读盘仅 `0.2–0.7` 专家/步、保留 `12–15 GiB` 系统可用内存、稳态显存 `70.65 / 73.4 GiB` 零 OOM 重试），`cold=off` 可切至纯内存+显存方案 B2（仅 `L47` 占 `11.75 GiB` 全驻 GPU 零内存）。精度全检通过：13 段 PPL/KL 对比基线 `ΔNLL +0.00423`、`KL 0.00938`，`copy_test` 照抄 `0/8`，256K / 500K 5 深度捞针全 `5/5`，思考 / 工具调用 / 视觉多模态均正常。
 
 ### Hunyuan-4-Flash NVFP4
 
@@ -262,6 +277,7 @@ SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速
 
 ## 版本更新
 
+- 2026-11-25（v0.1.10）：新增 **Thinking Machines Inkling-2-Small（594B / 17B active，多模态）** 完整零补丁加速包与启动台卡片，并打包合入 11-24 的 DeepSeek V4.1 全链路无损 9K+ 优化。Inkling-2 特性：①CPU 引擎与信箱新增 MXFP8 + SiTU（4.0/25.0）支持，零内存全驻 GPU 层路径（`XTIER_CACHE_FULL` 无冷专家时跳过 host 内存拷贝）；②Prefill 启用 NVFP4 `W4A4 4over6 MAE` + MXFP8 `W8A8` cuDNN、116 层全量 FP8/W8A8（修复 `fp8_weights` `tl.int64` 大矩阵溢出）与 Global Attention 3 流切片投影（减 `2.6×` 计算、省 `3.3 GiB` 显存）；③Target 48 层 NVFP4 KV（`72 B/head`，512K 仅 `6.75 GiB`）+ 远区无掩码解码核（500K 注意力 `14.70 → 11.31 ms`）+ FA4 `_shear_bias_workspace` 精准回收；④Hook `_mix_norm` 绕过上游 SGLang Triton `int32` 溢出解锁 **64K 单块 Prefill（`BATCH=65664`，`3,835 tok/s`）**，接入零补丁 DSpark `OnlineAcceptanceEstimator` 在线截断（`0.20`）与 Recall；⑤修复 `_copy_stream` 异步 DMA UAF 与 `cold.relink()` 字母序预读链（GPU Prefill NVMe 等待 `0.0 s`）；⑥启动台新增每模型 `guard_gib` 配置，默认 **方案 A+**（`cold=2%`, `376/384` 专家在内存, 45 弹性热槽, `12–15 GiB` 可用内存, `guard_gib=8`）与 `cold=off` **方案 B2**（仅 `L47` 全驻 GPU, 48K 分块, 35 热槽），13 段 PPL `ΔNLL +0.00423` / `KL 0.00938`、照抄 `0/8`、256K/500K 捞针 `5/5`、两轮 `agent_bench` `66.3 tok/s`（接受长度 `4.02`）。
 - 2026-11-24：DeepSeek V4.1 Flash 1017 与通用层新一轮 100% 无损提速。通用层：单槽扩至 `SLOT_TOKENS=24`（`DECODE_M=24`、`SLOT_ROUTES=144`），新增权重复用 `_gate_up_2x16` / `_down_2x16` 核（保留全部 `+26` 弹性槽，`M=18/24` 步快 11–22%）、`_down` `dbn=128 + TOK_MASK` 稀疏写回、256 路并行 `_commit`、常驻层单 CTA `_pack`、`_combine`/`_unpack` 融合 `BF16`+缩放写回、1-band `_reduce_band` 与 `hybrid_prefill` 异步 D2H 提前唤醒。DeepSeek 加速包：主模型 40 层 + 草稿 3 层共 43 层 `wo_a` 全量无损 FP8、SM120 Eager `mxfp8_quantize_sm100` + `b12x` 编译核缓存（阈值提至 `768`）+ `shared_experts` 预量化复用、单请求非末块在 `L20` 源 KV 写出后跳过 `L21..39` 尾循环。`agent_bench` 冷 prefill 64K 升至 `5,969 / 7,967`、500K 两轮双破九千达 `9,038 / 9,023 tok/s`，4 路同时新写升至 `268 tok/s`（每步 `51.0 ms`）、双路 `195.8 tok/s`（`37.4 ms`），160K 冷 prefill `20.43 → 17.86 s`（`7,833 → 8,961 tok/s`，+14.4%）、16.5K 首块预填 `−9.7%`、增量预填 `−2% ~ −5%`、单路 `recall` `212.0–212.5 tok/s`；TSan/ASan、逐位等价单测、1/2/4 并发照抄（`0/8`）、160K 三针跨块召回与 13 段 PPL 全部通过。
 - 2026-11-23（v0.1.9）：新增 **Hunyuan-4-Flash NVFP4** 完整加速包与启动台卡片（1M KV 池 / 1M 上下文 / 4 并发，全链路零 SGLang 源码补丁），并上线 **三层差异感知快速发版验证流程**（`tools/fast_verify.py`）。Hy4-Flash 特性：CPU 引擎与信箱扩展 `MAX_K=16` 与 `<1536,1536>` 特化；混合 SWA+DSA NVFP4 KV（`32.32 → 7.95 GB`）配 L2 聚簇解包走 FlashInfer；原生 FP8 Tensor Core IndexPool 变长 Top-K；64.7 GB Engram 行表放 NVMe（L1 优先直映）；208 层 FP8/W8A8 + 共享专家掩蔽 CPU 等待；零补丁原生 5 层 DFly2 投机解码（融合 FP8 草稿词表头 + 零分配 Triton 置信度截断 `XTIER_DSPARK_TRUNCATE=0.20`），`bs=1` 均速 92.1（稳态 124–152、照抄 306）tok/s、`bs=4` 186.8–190.4（稳态 226）tok/s、876K 缓存 decode 88–111 tok/s、照抄 0/4、PPL 无损。修复 `kv_fp4` 静态 gather 缓冲在短 prefill 扩容并触发弹性 `empty_cache()` 时的 CUDA 图悬垂指针隐患并补齐单测；`fp8_weights` 快核扩展至 `MAX_M=32`。社区贡献与兼容加固：合入 NVIDIA L20（SM89）16 组 FP8 GEMM 配置与 `2×L20 TP=2` DeepSeek 配置（#18）、SM86/89 软件 E4M3 位运算提速（#7）、SM89 block-FP8 钩子 `USE_INT64_OFFSETS` 签名守卫（#19）。发版验证：Tier 3 全量发布清单收敛为最新 3 个主力模型（`hy4flash`、`ds41`、`qwen38`），其余较早模型走 Tier 2 快速通道（`--models fast-track`）；本次 Tier 0（5/5）+ Tier 1（13/13）+ Tier 2（`hy4flash`、`glm53`、`ds41`）全绿通过。
 - 2026-11-22（v0.1.8）：跟进官方 SGLang main `4ce41378f9`（`084a5e9aae` 之后 672 个提交），并打包合入 11-19 的 **9,000+ 无损 prefill / 工具回传 1.1 s** 优化与 **通用层默认 CPU 多模态解码 + 核数限流**（`XTIER_CPU_IMAGE=1`、`XTIER_MM_CPU_WORKERS`，Tokenizer/API 进程 0 显存占用、避免默认 128 进程 fork 争抢 MoE 核）。依赖更新：`sglang-kernel 0.4.11`、`sgl-deep-gemm 0.2.9`、`sgl-fa3 0.1.0`、`tml-renderers 0.4.2`（torch 2.14.1+cu130 与 FlashInfer 0.7.4 不变）。移除上游已原生合入的 DS SM120 索引器与 EAGLE 热词表拒绝采样钩子（解锁上游 `use_fused_draft_sample`，GLM-5.3 每步 decode 快约 1–1.5 ms）。三个模型全量回归（含 DeepSeek 4 路高分多图 CPU 解码、固定验证、序号回绕与模拟 SM86）全部通过。[报告](docs/reports/2026-11-22-sglang-4ce4137.md)
