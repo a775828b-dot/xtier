@@ -23,7 +23,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 |---|---|
 | 从空机器到第一次请求：环境、模型准备、启动命令、测试请求 | [快速开始](quickstart.md)（[English](quickstart.en.md)） |
 | 已经有 SGLang 环境 | [快速上手](../README.md#快速上手) |
-| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v018-的测试环境)、[constraints.txt](../constraints.txt) |
+| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v0110-的测试环境)、[constraints.txt](../constraints.txt) |
 | 不加载模型，核对 SGLang 和 XTier 对得上 | `python tools/check_sglang.py --strict` |
 | 单卡 24 GB（RTX 4090 / 3090）和约 120 GB 内存，比如租用的云主机 | [Qwen3.8 配置](../configs/qwen38-rtx4090-3090/README.md) |
 | Zen2 + 双卡（已准备，还没有在这类机器上跑过） | [部署说明](deploy-zen2-dual-gpu.md) |
@@ -44,6 +44,8 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 目录 | 模型和硬件 | 说明 |
 |---|---|---|
+| [inkling2-small-pro5000-nps4](../configs/inkling2-small-pro5000-nps4/) | Inkling-2-Small，RTX PRO 5000 72GB + 2× EPYC 9334 | 默认方案 A+（2% 冷尾，64K 单块）与方案 B2（`cold=off`） |
+| [hy4-flash-pro5000-nps4](../configs/hy4-flash-pro5000-nps4/) | Hunyuan-4-Flash NVFP4，RTX PRO 5000 72GB + 2× EPYC 9334 | 1M 上下文 + 原生 DFly2 投机解码 |
 | [ds41-pro5000-nps4](../configs/ds41-pro5000-nps4/) | DeepSeek V4.1 Flash 1017，RTX PRO 5000 72GB + 2× EPYC 9334 | 测速用的配置 |
 | [ds41-mini-5090sim](../configs/ds41-mini-5090sim/) | 同上，模拟 32 GB 显存 + 128 GB 内存 | [最小化运行](../README.md#最小化运行32-gb-显存--128-gb-内存跑-deepseek-v41-flash-1017) |
 | [glm53-pro5000-nps4](../configs/glm53-pro5000-nps4/README.md) | GLM-5.3 Flash，RTX PRO 5000 | 测速用的配置 |
@@ -124,6 +126,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-25 Inkling-2-Small 支持、极限压榨与解码/预填剖析（v0.1.10）](reports/2026-11-25-inkling2-small.md) | 594B 多模态模型零补丁支持、方案 A+/B2 压榨实测、GPU Chrome Trace 解码 CPU/GPU 等待剖析与 64K→500K Prefill 拆解与优化路线 |
 | [2026-11-22 跟进 SGLang 4ce4137（v0.1.8）](reports/2026-11-22-sglang-4ce4137.md) | 依赖变化（sglang-kernel 0.4.11、sgl-deep-gemm 0.2.9、sgl-fa3 0.1.0 等）；移除上游已原生合入的 DS 索引器与 EAGLE 热词表拒绝采样钩子（GLM decode 每步快约 1–1.5 ms）；通用层默认开启 CPU 多模态图像/视频解码与核数预算限流；三模型全量回归与 SM86 模拟通过 |
 | [2026-11-19 全双工零同步预填突破 9,000 tok/s、SM120 mHC 精确核与工具回传提速](reports/2026-11-19-lossless-9k-prefill.md) | 不改 48K 默认分块、100% 无损：通用层（`_run_fp4` 预重排纯 DMA 24 槽、零同步位图/直方图、单遍 `_reduce_band`、全双工 `CPU_SHARE`、`engine.cpp` 动态窃取、并行 BPE 分词、`elastic` 2048 边界）与 DeepSeek 加速包（PTX `mhc.post` 消除 +22.5 GiB 尖峰、24-bit `bf16x3` mHC、`>=512` 行 CUTLASS MXFP8 自调优、分组 BF16 `wo_a`、中间块 SWA 剪枝、640 阈值）；实测排除 `SLOT_TOKENS=24`；500K 冷 prefill 升至 8,930–9,085 tok/s（458K 达 9,180 tok/s）、工具回传 2.07 → 1.12 s |
 | [2026-11-18 全链路无损预填、Engram 跨块预热与 DSpark 上下文检索（v0.1.7）](reports/2026-11-18-lossless-prefill-recall.md) | 通用层（1K–6K 绕过 `_split_prefill`、`_run_fp4` 单次量化融合、NVMe 行表 LBA 去重与预热、弹性缓存跨模态边界保护）与 DeepSeek 加速包（第 14 层后跨块预热 Engram 行、DSpark 上下文草稿检索 Recall、`wo_a` / `b12x` / `markov_w2`）；实测排除项；三个模型在 SGLang 084a5e9 下的回归、两轮 `agent_bench` 与各 15 分钟 dsh 真实任务 |
