@@ -34,6 +34,7 @@ import os
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                kv_offload_args, kv_offload_env, kv_offload_option, kv_offload_tags,
                                 share_env, share_option, share_tags)
 
 HERE = Path(__file__).resolve().parent
@@ -99,6 +100,7 @@ MODEL = {
                           '期间已就绪的请求一个 token 都发不出来——实测 6 路 × 100K 时最大 token 停顿 116 秒。'
                           '32：停顿降到 330 ms、8×4 agent 吞吐 +27%、TTFT 不变；'
                           '64 会让新请求的 TTFT p95 从 9 秒涨到 16 秒'),
+        kv_offload_option(),
     ],
     'notes': [],
 }
@@ -127,7 +129,8 @@ def build(o, port):
     model = os.environ.get('XTIER_MODEL_PATH') or os.environ.get('M')
     if model:   # run-ds-xtier.sh aborts on an unset M; forward the caller's choice
         env['M'] = model
-    return env, [str(RUN)]
+    env.update(kv_offload_env(o))
+    return env, [str(RUN), *kv_offload_args(o)]
 
 
 def tags(o):
@@ -139,4 +142,4 @@ def tags(o):
         if o['spec'] == 'on' and o['verify'] == 'compact':
             out.append('compact verify')
         out += share_tags(o)
-    return out + interleave_tags(o)
+    return out + interleave_tags(o) + kv_offload_tags(o)
