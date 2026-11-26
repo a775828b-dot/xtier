@@ -19,6 +19,7 @@ xtier/
 ├── planner/   Auto-layout planner from host probes & routing profiles (docs/planner.md)
 ├── engine/    CPU engine Python bindings & pinned memory (C++ sources in csrc/)
 ├── packs/     Model packs: inkling2 / hy4_flash / deepseek_v4 / qwen4_exp / glm5_next / minimax_m3 / speculative
+├── kvstore/   Generic multi-drive NVMe L2 KV offload (O_DIRECT + io_uring, off by default, model-agnostic)
 ├── tables/    NVMe-backed large embedding tables (Engram / PLE) with CUDA-graph row cache
 └── console/   Stdlib-only web console for model launch, tuning & live telemetry
 csrc/          AVX-512 / AVX2 CPU expert kernels, NUMA thread pool & mailbox
@@ -145,8 +146,18 @@ When host DRAM cannot fit all experts, `XTIER_COLD=1` offloads the coldest tail 
 - **4× PCIe 5.0 NVMe (DeepSeek 64K)**: 10% / 20% / 30% / 50% cold yields `135 (−5%)` / `124 (−13%)` / `112 (−21%)` / `80 (−44%) tok/s`; [report](reports/2026-11-01-cold-pcie5.md).
 - **Minimal run (32 GB VRAM + 128 GB RAM emulated, 70% cold)**: DeepSeek 32K–128K prefill `1,155–1,186 tok/s`, decode `28.1–32.7 tok/s`; [report](reports/2026-10-27-ds41-minimal.md).
 
+## NVMe L2 KV Cache Offload (Off by Default, Opt-in)
+
+When multi-session switching or concurrency overflows the GPU KV pool, XTier supports generic multi-drive NVMe L2 KV offloading (`XTIER_KV_OFFLOAD=1`), asynchronously writing evicted KV pages via `O_DIRECT + io_uring` (`libxtier_kvstore.so`, bypassing OS page cache) and reloading them directly on return without cold prefill. **Off by default** (`XTIER_KV_OFFLOAD=0`: zero hooks, zero overhead, no pool dependency); opt in via the web console (`100 GiB = 4×25 GiB` / `200 GiB = 4×50 GiB`) or env vars `XTIER_KV_OFFLOAD=1`, `XTIER_KV_PATHS=...`, `XTIER_KV_SIZE_GIB=<100|200>` (building `libxtier_kvstore.so` needs `liburing-dev`; `tools/build_engine.sh` skips it automatically if absent).
+
+- **Model-agnostic & zero SGLang patches**: attaches via upstream SGLang HiCache `buffer_only` dynamic storage backend; zero model-name branches in `csrc/kvstore/` and `xtier/kvstore/`.
+- **4× Samsung 9100 PRO PCIe 5.0 microbench (200 GiB ring)**: **28.19 GB/s** write, **40.28 GB/s** read, **35.79 GB/s** E2E NVMe→Pinned→GPU (`bounce=0`, `Dirty ≈ 0`).
+- **4-model E2E eviction→reload (`KV_POOL=64K`, `copy_test 0/8`)**: DS4.1 **99.2–99.4%** hit (**9.3–10.4×** TTFT), GLM-5.3 **99.5–99.6%** (**17–21×**), Hy4-Flash **99.8–99.9%** (**13–32×**, `11.37 GB/s` zero-copy), Qwen3.8 **99.9–100%** (**9.0–20.9×**, `11.39 GB/s` zero-copy).
+- **DS4.1 production `1M KV pool + 100 GiB NVMe` live `dsh` validation** (`5.20 GiB` pinned staging): 370K session evicted by 1.5M traffic reloaded in **`4.86s` vs `49.73s` cold** (`<0.9s` server TTFT, **364,032 tokens 100% from NVMe**, `99.94%` hit); native `read_image` multimodal + same-text different-image anti-collision (**99.6%** hit, zero cross-bleed) and real `dsh` auto-compaction (**98.2%** post-compaction NVMe reload) all passed with 0 errors (`puts=83,481 / hits=13,752 / misses=0`). [Report (ZH)](reports/2026-11-26-nvme-kv-offload.md).
+
 ## Recent changes
 
+- **2026-11-26 (v0.1.11)**: adds **generic multi-drive NVMe L2 KV cache offload** (`XTIER_KV_OFFLOAD=1`, **off by default**, opt-in `100 / 200 GiB` in console): `O_DIRECT + io_uring` (`28.19 GB/s` write / `40.28 GB/s` read / `35.79 GB/s` E2E on 4×9100 PRO), zero SGLang patches, model-agnostic across DS4.1 / GLM-5.3 / Hy4-Flash / Qwen3.8 (**99.2–100%** hit, **9–32×** TTFT) and verified with real `dsh` on DS4.1 1M pool (multi-session eviction, multimodal images + anti-collision, auto-compaction); also ships 11-25 lossless prefill speedups and PR #20 (`cuMemUnmap` device drain). [Report (ZH)](reports/2026-11-26-nvme-kv-offload.md)
 - **2026-11-25**: **100% lossless prefill speedups** — zero-patch fused `RelLogitsProj + ShearingBias` Triton kernel (bitwise `max_diff=0`, `-645 ms` and `-6.9 GiB` peak VRAM per 64K chunk), VRAM-aware 1-band `_reduce_band` (`B=512`), active-run `_mxfp8_reduce_runs`, vectorized `_act_quant_fp8` + SM120 `stages=4` W8A8, and exact-slab `cudaHostRegister` `_share_buffers` + cold-aware `CPU_SHARE`; Inkling-2 64K cold prefill `3,835 → 3,986 tok/s` (~4,250 steady-state chunk), 500K `1,593 → 1,627 tok/s` (`-6.6 s`), copy `0/4` (`c=1/2`), PPL `2.7172` (ΔNLL `+0.00005`). [Report](reports/2026-11-25-inkling2-small.md)
 - **2026-11-25 (v0.1.10)**: adds zero-patch **Inkling-2-Small (594B multimodal)** pack & console card (default Plan A+: `cold=2%`, 45 hot slots, 64K single-chunk 3,835 tok/s, NVFP4 KV unlocking 500K, 2-round agent 66.3 tok/s; `cold=off` Plan B2 with `L47` full-GPU), plus the 11-24 DeepSeek 9K+ lossless speedups. [Report](reports/2026-11-25-inkling2-small.md)
 - **2026-11-24**: 100% lossless DeepSeek V4.1 & core speedups (24-token weight reuse, 43-layer FP8 `wo_a`, fused writeback, SM120 eager MXFP8), pushing 500K cold prefill >9,000 tok/s and 4-way fresh decode to 268 tok/s.

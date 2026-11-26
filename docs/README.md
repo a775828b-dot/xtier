@@ -23,7 +23,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 |---|---|
 | 从空机器到第一次请求：环境、模型准备、启动命令、测试请求 | [快速开始](quickstart.md)（[English](quickstart.en.md)） |
 | 已经有 SGLang 环境 | [快速上手](../README.md#快速上手) |
-| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v0110-的测试环境)、[constraints.txt](../constraints.txt) |
+| 测试过的版本：SGLang、Python、PyTorch、驱动、模型 | [支持情况](support.md#v0111-的测试环境)、[constraints.txt](../constraints.txt) |
 | 不加载模型，核对 SGLang 和 XTier 对得上 | `python tools/check_sglang.py --strict` |
 | 单卡 24 GB（RTX 4090 / 3090）和约 120 GB 内存，比如租用的云主机 | [Qwen3.8 配置](../configs/qwen38-rtx4090-3090/README.md) |
 | Zen2 + 双卡（已准备，还没有在这类机器上跑过） | [部署说明](deploy-zen2-dual-gpu.md) |
@@ -86,6 +86,7 @@ English: [README](README.en.md) · [Quick start](quickstart.en.md)
 
 | 报告 | 内容 |
 |---|---|
+| [2026-11-26 通用多盘 NVMe KV 二级卸载与 dsh 实测](reports/2026-11-26-nvme-kv-offload.md) | 4×9100 PRO `O_DIRECT + io_uring` 100/200 GiB 环池（开源默认关闭、按需开启）、底层 `40.28 GB/s` 基准、四模型端到端挤出读回与 DS4.1 1M 池 `dsh` 多会话/图片/自动压缩全链路验收 |
 | [2026-11-11 DeepSeek 的 prefill 分块 22K → 48K](reports/2026-11-11-prefill-chunk.md) | 冷 prefill 快 28–35%、decode 不变的原因和各档实测；显存从热专家槽让、弹性槽补回；512K 不爆显存的验证；两个请求时的表现；CPU 分担 prefill（DeepSeek 默认开；GLM、Qwen 上更慢，不开）；GLM、Qwen 为什么不改 |
 | [2026-11-10 长 prefill 时让另一个请求继续 decode（v0.1.4）](reports/2026-11-10-prefill-interleave.md) | 启动台选项「Prefill 中穿插 decode」（默认开）三个模型各挡的实测、弹性热专家槽在分块之间不再加槽、只为长提示加预热不需要 |
 | [2026-11-10 稳定性审阅和修复（v0.1.3）](reports/2026-11-10-stability-fixes.md) | 别的程序抢 CPU、日志和指标文件写盘卡住解码、插件异常被吞、FP4 prefill 重跑、冷存储唯一副本、核心转储；修了什么、怎么验证的 |

@@ -61,6 +61,7 @@ MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 
 
 | 功能 | 验证过的范围 | 默认 |
 |---|---|---|
+| NVMe KV 二级卸载（`XTIER_KV_OFFLOAD`） | 4×9100 PRO（100 / 200 GiB 池）：DS4.1 / GLM-5.3 / Hy4-Flash / Qwen3.8 端到端挤出读回 + DS4.1 1M 池 `dsh` 多会话/图片/自动压缩实测（[报告](reports/2026-11-26-nvme-kv-offload.md)） | 关 |
 | 冷专家卸载 30% | 四个模型的整模型，加 15 分钟 dsh（PCIe 4.0 盘） | 关 |
 | 冷专家卸载 10–50% | DeepSeek 整模型（PCIe 5.0 盘，[报告](reports/2026-11-01-cold-pcie5.md)） | 关 |
 | 冷专家卸载 70% | DeepSeek，模拟 32 GB 显存 + 128 GB 内存（PCIe 4.0 盘） | 关 |
@@ -71,7 +72,7 @@ MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 
 | 未命中专家 GPU 代算 | 三个模型能跑；本机反而变慢，弱 CPU 只模拟过（8 线程 +6–7%） | 关 |
 | 投机解码 | DeepSeek DSpark、GLM EAGLE、Qwen MTP，都是整模型 | 启动台按模型 |
 
-## v0.1.10 的测试环境
+## v0.1.11 的测试环境
 
 SGLang 跟到 main `4ce41378f9`（sglang-kernel 0.4.11、sgl-deep-gemm 0.2.9、sgl-fa3 0.1.0；FlashInfer 0.7.4 与 torch 2.14.1+cu130 不变），详见[跟进记录](reports/2026-11-22-sglang-4ce4137.md)。
 

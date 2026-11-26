@@ -19,6 +19,7 @@ xtier/
 ├── planner/   规划器：结合本机探测耗时与路由档案自动分配每层热槽（docs/planner.md）
 ├── engine/    CPU 引擎 Python 绑定与锁页内存（C++ 源码在 csrc/）
 ├── packs/     模型加速包：inkling2 / hy4_flash / deepseek_v4 / qwen4_exp / glm5_next / minimax_m3 / speculative
+├── kvstore/   通用多盘 NVMe KV 二级卸载（O_DIRECT + io_uring，默认关闭，零模型分支）
 ├── tables/    大嵌入表放 NVMe（Engram / PLE），行缓存 + CUDA 图内查表
 └── console/   零依赖 Web 启动台：选模型、调参数、启停服务与实时遥测
 csrc/          AVX-512 / AVX2 CPU 专家内核、NUMA 线程池与信箱通信
@@ -149,8 +150,18 @@ SGLang M3.1 分支（PR #45925），64K 会话加速包对比官方代码 + 必�
 - **4 块 PCIe 5.0 实测（DeepSeek 64K）**：卸载 10% / 20% / 30% / 50% 对应 decode `135 (−5%)` / `124 (−13%)` / `112 (−21%)` / `80 (−44%) tok/s`，详见[报告](docs/reports/2026-11-01-cold-pcie5.md)。
 - **最小化运行（模拟 32 GB 显存 + 128 GB 内存，70% 冷卸载）**：DeepSeek 32K–128K prefill `1,155–1,186 tok/s`、decode `28.1–32.7 tok/s`，详见[报告](docs/reports/2026-10-27-ds41-minimal.md)。
 
+## NVMe KV 二级卸载（默认关闭，按需开启）
+
+多会话切换或并发超出 GPU KV 池时，可开启通用多盘 NVMe 二级 KV 卸载（`XTIER_KV_OFFLOAD=1`），将挤出的 KV 页经 `O_DIRECT + io_uring`（`libxtier_kvstore.so`，绕过 OS 页缓存）异步写入多块 NVMe 环形池，切回时直接从 NVMe 读回免冷 prefill。**开源默认关闭**（零钩子、零开销、无外部盘依赖），需要使用时在启动台选择 `100 GiB（4×25 GiB）` / `200 GiB（4×50 GiB）` 或通过环境变量 `XTIER_KV_OFFLOAD=1`、`XTIER_KV_PATHS=...`、`XTIER_KV_SIZE_GIB=<100|200>` 开启（编译需 `liburing-dev`，未安装时 `tools/build_engine.sh` 自动跳过）。
+
+- **与模型无关 & 零 SGLang 补丁**：挂载在官方 SGLang HiCache `buffer_only` 动态存储后端上，核心引擎 `csrc/kvstore/` 与 `xtier/kvstore/` 零模型分支，自动覆盖 MLA / MHA / SWA / DSA / NVFP4 KV 与草稿侧池。
+- **4× Samsung 9100 PRO PCIe 5.0 底层基准（200 GiB 环池）**：写入 **28.19 GB/s**、读回 **40.28 GB/s**、端到端 NVMe→Pinned→GPU **35.79 GB/s**（`bounce=0`，`Dirty ≈ 0`）。
+- **4 模型端到端挤出→读回（`KV_POOL=64K`，全员照抄 `0/8`）**：DS4.1 命中 **99.2–99.4%**（TTFT **9.3–10.4×**）、GLM-5.3 **99.5–99.6%**（**17–21×**）、Hy4-Flash **99.8–99.9%**（**13–32×**，零拷贝 `11.37 GB/s`）、Qwen3.8 **99.9–100%**（**9.0–20.9×**，零拷贝 `11.39 GB/s`）。
+- **DS4.1 生产 `1M KV 池 + 100 GiB NVMe` 真实 `dsh` 全链路实测**（锁页缓冲仅 `5.20 GiB`）：多会话 1.5M 流量挤出 1M 池后切回 370K 会话，`dsh` 耗时 **`49.73s → 4.86s`**（服务端 `<0.9s`，**364,032 token 100% 从 NVMe 读回**，命中 `99.94%`）；原生 `read_image` 图片输入 + 同文本不同图防碰撞（两路 **99.6%** 读回、零串味）与 `dsh` 自动压缩（压缩后 **98.2%** 读回）全程零报错（`puts=83,481 / hits=13,752 / misses=0`）。详见[报告](docs/reports/2026-11-26-nvme-kv-offload.md)。
+
 ## 版本更新
 
+- **2026-11-26（v0.1.11）**：新增**通用多盘 NVMe KV 二级卸载**（`XTIER_KV_OFFLOAD=1`，**默认关闭**，启动台可选 `100 GiB` / `200 GiB` 按需开启）：`O_DIRECT + io_uring`（4×9100 PRO 写入 `28.19 GB/s`、读回 `40.28 GB/s`、端到端 `35.79 GB/s`），零 SGLang 补丁、零模型分支，DS4.1 / GLM-5.3 / Hy4-Flash / Qwen3.8 四模型挤出读回命中 **99.2–100%**（TTFT **9–32×**），DS4.1 `1M 池 + 100 GiB` 真实 `dsh` 多会话/图片多模态/自动压缩全链路零报错通过；同时打包合入 11-25 Prefill 100% 无损提速与社区 PR #20（弹性缓存 `release()` 排空保护）。[报告](docs/reports/2026-11-26-nvme-kv-offload.md)
 - **2026-11-25**：**Prefill 100% 无损提速**——新增零补丁融合 `RelLogitsProj + ShearingBias` Triton 核（逐比特 `max_diff=0`，64K 省 645 ms 与 6.9 GiB 峰值显存）、显存感知 1-band `_reduce_band`（`B=512`）、`_mxfp8_reduce_runs` 活跃 run 归约、向量化 `_act_quant_fp8` + SM120 `stages=4` W8A8，以及精确 slab `cudaHostRegister` `_share_buffers` 与冷专家 `CPU_SHARE` 支持；Inkling-2 64K 冷 prefill `3,835 → 3,986 tok/s`（稳态块 ~4,250）、500K `1,593 → 1,627 tok/s`（`-6.6 s`），照抄 `0/4`（`c=1/2`）、PPL `2.7172`（ΔNLL `+0.00005`）零损。[报告](docs/reports/2026-11-25-inkling2-small.md)
 - **2026-11-25（v0.1.10）**：新增 **Inkling-2-Small（594B 多模态）** 零补丁加速包与启动台卡片（默认方案 A+：`cold=2%`、45 热槽、64K 单块 3,835 tok/s、NVFP4 KV 解锁 500K、两轮 agent 66.3 tok/s；`cold=off` 方案 B2 仅 `L47` 全驻），并打包合入 11-24 的 DeepSeek 无损 9K+ 优化。[报告](docs/reports/2026-11-25-inkling2-small.md)
 - **2026-11-24**：DeepSeek V4.1 与通用层新一轮 100% 无损提速（24-token 权重复用、43 层 FP8 `wo_a`、写回融合、SM120 Eager MXFP8 快分发），500K 冷 prefill 双破 9,000 tok/s，4 并发新写达 268 tok/s。
