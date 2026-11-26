@@ -214,10 +214,12 @@ def _decode_partials_nvfp4_kernel(
     EXTENT: tl.constexpr,
     WINDOW: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     """Split-KV paged decode/verify partials reading NVFP4 (72 B/head) K/V directly in registers."""
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     b = tl.program_id(0) // HEADS_K
     hk = tl.program_id(0) % HEADS_K
     split = tl.program_id(1)
@@ -387,6 +389,7 @@ def decode_partials_nvfp4(
     o = torch.empty((splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device)
     m = torch.empty((splits, tokens, 1, heads_q), dtype=torch.float32, device=q.device)
     l = torch.empty_like(m)
+    use_pdl = torch.cuda.get_device_capability(q.device) >= (9, 0)
     _decode_partials_nvfp4_kernel[(batch * heads_k, splits)](
         q,
         k_cache,
@@ -418,9 +421,10 @@ def decode_partials_nvfp4(
         rel_bias.shape[-1],
         -1 if window_size_left is None else window_size_left,
         block_n,
+        USE_PDL=use_pdl,
         num_warps=4,
         num_stages=2,
-        launch_pdl=True,
+        launch_pdl=use_pdl,
     )
     return o, m, l
 

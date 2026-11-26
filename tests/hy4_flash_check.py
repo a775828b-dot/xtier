@@ -144,7 +144,9 @@ def check_indexpool_fp8():
         diff = torch.where(both_inf, torch.zeros_like(ref), (ref - got).abs()).max().item()
         finite = ~both_inf
         rel = ((ref[finite] - got[finite]).norm() / ref[finite].norm().clamp(min=1e-6)).item() if finite.any() else 0.0
-        if diff > 5e-3 or rel > 2e-4:
+        # SM89/SM90 FP8 tensor cores accumulate with ~14-bit mantissa (~1.3e-4 rel on ~75-scale logits).
+        diff_tol = 2e-2 if torch.cuda.get_device_capability() < (10, 0) else 5e-3
+        if diff > diff_tol or rel > 2e-4:
             _fail(f'indexpool_fp8 rows={rows} max diff={diff:.3e} rel={rel:.3e}')
     # Verify length-aware decode path (WRITE_LENGTHS=True + top_k_ragged_transform) matches exact top-k
     import flashinfer

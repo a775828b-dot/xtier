@@ -69,8 +69,8 @@ def main():
     shutil.rmtree(root, ignore_errors=True)
     for d in ('model-A', 'model-B', 'd0', 'd1'):
         (root / d).mkdir(parents=True)
-    for d, tag in (('model-A', b'A'), ('model-B', b'B')):
-        (root / d / 'model-0.safetensors').write_bytes(tag * 4096)
+    for d, tag, nbytes in (('model-A', b'A', 4096), ('model-B', b'B', 8192)):
+        (root / d / 'model-0.safetensors').write_bytes(tag * nbytes)
         (root / d / 'config.json').write_text('{}')
     bad = 0
 
