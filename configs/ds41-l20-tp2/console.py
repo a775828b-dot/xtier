@@ -23,8 +23,14 @@ configs live in the pack (xtier/packs/deepseek_v4/fp8_configs, device_name=NVIDI
 and are tuned per M (decode's M is batch × top-k, 1..48).
 
 The measured numbers are from this box (docs/reports/2026-11-20-l20-tp2-tuning.md).
+
+Standalone `python -m xtier.console` auto-discovers every configs/*/console.py, so this
+2x-L20 TP=2 card also appears on single-GPU hosts. It needs both cards on separate NUMA
+nodes and M set to the checkpoint (from XTIER_MODEL_PATH or M); use `--configs` to
+allowlist the cards a host can actually run.
 """
 
+import os
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
@@ -99,9 +105,38 @@ MODEL = {
 
 
 def build(o, port):
-    """(environment additions, argv): this configuration, with the console's port."""
-    env = {'PORT': str(port), 'KV_POOL': str(POOL)}
-    env.update(share_env(o))
-    args = [str(RUN)]
-    args += interleave_args(o)
-    return env, args
+    """(environment additions, argv): every declared option wired into the launch script's env.
+
+    run-ds-xtier.sh unconditionally passes --prefill-decode-interval ${PDI:-32}, so the
+    interleave choice goes through PDI (0 = off) instead of a second, duplicate CLI flag.
+    """
+    base = o['packs'] == 'off'
+    spec = o['spec'] == 'on'
+    chunk = o['chunk']
+    env = {'PORT': str(port), 'KV_POOL': o['context'], 'XTIER_THREADS': o['threads'],
+           'DSPARK': '1' if spec else '0', 'XTIER_ENGRAM_CACHE_GIB': o['engram'],
+           'CHUNK': chunk, 'PREFILL_TOKENS': chunk, 'XTIER_CACHE_SLOTS': o['slots'],
+           'PDI': '0' if o['interleave'] == 'off' else o['interleave']}
+    if base:   # the README baseline: no elastic cache and no CPU-prefill pack
+        env.update(XTIER_CACHE_ELASTIC='0', XTIER_GPU_PREFILL_MIN='1024')
+    else:
+        env['XTIER_CACHE_ELASTIC'] = '1' if o['elastic'] == 'on' else '0'
+        env.update(share_env(o))
+        if spec and o['verify'] == 'compact':   # sps-table.json budgets compact verification
+            env.update(SGLANG_RAGGED_VERIFY_MODE='compact', SPS_TABLE=str(SPS_TABLE))
+    model = os.environ.get('XTIER_MODEL_PATH') or os.environ.get('M')
+    if model:   # run-ds-xtier.sh aborts on an unset M; forward the caller's choice
+        env['M'] = model
+    return env, [str(RUN)]
+
+
+def tags(o):
+    """Extra parts of the server's label, reflecting the active card options."""
+    out = []
+    if o['packs'] == 'on':
+        if o['elastic'] == 'on':
+            out.append('elastic')
+        if o['spec'] == 'on' and o['verify'] == 'compact':
+            out.append('compact verify')
+        out += share_tags(o)
+    return out + interleave_tags(o)
