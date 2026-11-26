@@ -104,6 +104,68 @@ def interleave_tags(o):
     return ['prefill 不穿插'] if o.get('interleave', 'off') == 'off' else []
 
 
+def kv_offload_option(default='off', hint='', off_when=()):
+    """Generic 4-drive NVMe L2 KV cache offload (XTIER_KV_OFFLOAD, xtier/kvstore): offloads evicted GPU KV pages to
+    the 4x9100 PRO ring pool (100 GiB = 4x25 GiB or 200 GiB = 4x50 GiB, O_DIRECT + io_uring) so concurrent and
+    multi-session prompts reload from NVMe instead of running cold prefill. Unavailable (and falls back to off) if
+    the pool directories or libxtier_kvstore.so are missing."""
+    from xtier import kvstore
+
+    ok, _ = kvstore.available()
+    eff_default = default if (default == 'off' or ok) else 'off'
+    labels = {
+        'off': '关',
+        '100': '100 GiB（4×25 GiB）' + (' · 默认' if eff_default == '100' else ''),
+        '200': '200 GiB（4×50 GiB）' + (' · 默认' if eff_default == '200' else ''),
+    }
+    order = {'100': ('100', '200', 'off'), '200': ('200', '100', 'off')}.get(eff_default, ('off', '100', '200'))
+
+    def _unavailable():
+        avail, reason = kvstore.available()
+        return {} if avail else {'100': reason, '200': reason}
+
+    opt = {
+        'key': 'kvoffload', 'label': 'NVMe KV 二级卸载', 'default': eff_default,
+        'choices': [[k, labels[k]] for k in order],
+        'hint': hint or (
+            'GPU KV 池挤出时将页卸载到 4 块 9100 PRO（可选 100 GiB = 4×25 GiB 或 200 GiB = 4×50 GiB，'
+            'O_DIRECT + io_uring 绕过页缓存），多并发/多会话切换时直接从 NVMe 读回免冷 prefill；'
+            '进程重启清空，仅占少量锁页中转缓冲'
+        ),
+        'unavailable': _unavailable,
+    }
+    if off_when:
+        opt['off_when'] = list(off_when)
+    return opt
+
+
+def kv_offload_env(o):
+    """The environment of the NVMe KV offload option."""
+    size = o.get('kvoffload', 'off')
+    if size in ('off', '', None):
+        return {}
+    if size == 'on':   # backwards-compatible with settings saved before 100/200 GiB sizing
+        size = '200'
+    return {'XTIER_KV_OFFLOAD': '1', 'XTIER_KV_SIZE_GIB': str(size)}
+
+
+def kv_offload_args(o):
+    """The SGLang HiCache arguments of the NVMe KV offload option."""
+    if o.get('kvoffload', 'off') in ('off', '', None):
+        return []
+    from xtier import kvstore
+
+    return kvstore.sglang_args()
+
+
+def kv_offload_tags(o):
+    """Its part of the server's label when NVMe KV offload is enabled."""
+    size = o.get('kvoffload', 'off')
+    if size in ('off', '', None):
+        return []
+    return [f'NVMe KV {size}G'] if str(size).isdigit() else ['NVMe KV 卸载']
+
+
 def load_models(names=None, configs=CONFIGS, ports=None):
     """{id: model} from configs/<name>/console.py (every one, or the directories in names) in MODEL['order'];
     ports overrides the listening port by model id."""

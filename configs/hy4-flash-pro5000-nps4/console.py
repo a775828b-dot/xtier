@@ -12,6 +12,7 @@ confidence-head verify truncation (lossless, skipping low-survival tail MoE rout
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                kv_offload_args, kv_offload_env, kv_offload_option, kv_offload_tags,
                                 miss_env, miss_option, share_env, share_option, share_tags)
 
 HERE = Path(__file__).resolve().parent
@@ -64,6 +65,7 @@ MODEL = {
         share_option('on', '读长提示时由 CPU 分担部分专家计算（默认开，长 prefill 稳定提速）'),
         interleave_option([['64', '64 步 / 块'], ['32', '32 步 / 块']], '64',
                           '一个请求在读长提示时，每读完一块先让其他并发请求 decode 这么多步'),
+        kv_offload_option(),
     ],
     'notes': [
         {'when': {'packs': 'off'}, 'text': '基线：BF16 稠密层、全量 1M FP8 KV（32.3 GB）、48 槽、16K 分块，仅保留 SM120 / ModelOpt / Engram 必需钩子'},
@@ -104,7 +106,8 @@ def build(o, port):
             env['XTIER_DSPARK_TRUNCATE'] = '0'
     env.update(miss_env(o))
     env.update(share_env(o))
-    return env, [str(HERE / 'run-hy4-xtier.sh'), *interleave_args(o)]
+    env.update(kv_offload_env(o))
+    return env, [str(HERE / 'run-hy4-xtier.sh'), *interleave_args(o), *kv_offload_args(o)]
 
 
 def tags(o):
@@ -120,4 +123,4 @@ def tags(o):
     if miss_env(o):
         out.append(f"未命中 {o['missgpu']}% GPU 代算")
     out += share_tags(o)
-    return out + interleave_tags(o)
+    return out + interleave_tags(o) + kv_offload_tags(o)

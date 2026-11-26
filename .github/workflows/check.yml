@@ -10,5 +10,5 @@ jobs:
           python-version: '3.12'
       - run: python tools/repo_check.py
       - run: pip install numpy
-      - run: python tests/console_check.py
+      - run: python tests/console_check.py --fast
       - run: python tests/planner_check.py

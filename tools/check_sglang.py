@@ -30,7 +30,7 @@ from importlib import metadata
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FEATURES = dict(XTIER='1', XTIER_ENGRAM_ROWS='nvme', XTIER_ENGRAM_PREFETCH='1', XTIER_DRAFT='1', XTIER_FP8_WEIGHTS='1',
-                XTIER_CACHE_ELASTIC='1', XTIER_FAST_LOAD='1')
+                XTIER_CACHE_ELASTIC='1', XTIER_FAST_LOAD='1', XTIER_KV_OFFLOAD='1')
 SOURCES = ROOT / 'tools' / 'hook_sources.json'
 _FB, _MOE = 'sglang.srt.model_executor.forward_batch_info.ForwardBatch', 'sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE'
 ATTRIBUTES = [   # (class, attribute, what XTier loses without it)
@@ -105,6 +105,7 @@ def hook_targets():
     from xtier import packs, platform
     from xtier.backend import hooks
     from xtier.cache import elastic
+    from xtier.kvstore import bridge as kv_bridge
 
     targets = {}
 
@@ -117,6 +118,7 @@ def hook_targets():
     targets[f'sglang.srt.managers.scheduler.{plugin.SCHEDULER_ENTRY}'] = 'xtier.plugin._in_scheduler'
     hooks.install(Recorder, HookType)
     elastic.install(Recorder, HookType)
+    kv_bridge.install(Recorder, HookType)
     packs.install(Recorder, HookType)
     packs.install_serving(Recorder, HookType)
     platform.install(Recorder, HookType)

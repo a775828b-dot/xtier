@@ -12,6 +12,7 @@ headroom >= 8 GiB, 2 min fast-load), 0.2-0.7 cold decode reads/step, and 41.5 Gi
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                kv_offload_args, kv_offload_env, kv_offload_option, kv_offload_tags,
                                 miss_env, miss_option, share_env, share_option, share_tags)
 
 HERE = Path(__file__).resolve().parent
@@ -62,11 +63,17 @@ MODEL = {
                      [{'packs': 'off'}]),
         interleave_option([['64', '64 步 / 块'], ['32', '32 步 / 块']], '64',
                           '一个请求在读长提示时，每读完一块先让其他并发请求 decode 这么多步'),
+        kv_offload_option(
+            hint='GPU KV 池挤出时卸载到 4 块 9100 PRO（可选 100 / 200 GiB 池）；Inkling-2 宿主机内存余量较紧（2% 冷专家仅余 ~12 GiB），开启建议配 8%/15% 冷专家预留中转锁页内存，默认关',
+        ),
     ],
     'notes': [
         {'when': {'packs': 'off'}, 'text': '基线：W4A16/W8A16 + BF16 KV + BF16 稠密层 + 16K 分块 + 关弹性槽/Recall/截断'},
         {'when': {'cold': 'off'},
          'text': '方案 B2：仅 L47 全驻 GPU（11.75 GiB 显存、0 内存占用）使剩余 47 层放入 384 GiB 内存（留 ~13 GiB），自动 48K 分块 + 35 弹性热槽'},
+        *[{'when': {'kvoffload': sz, 'cold': '02'}, 'warn': True,
+           'text': 'Inkling-2 在 2% 冷专家下内存仅余 ~12 GiB，开启 NVMe KV 卸载建议改选 8% 或 15% 冷专家以防触发内存保护'}
+          for sz in ('100', '200')],
     ],
 }
 
@@ -121,7 +128,8 @@ def build(o, port):
             XTIER_CACHE_FULL='47', XTIER_PREFILL_FP4_PRESWIZZLE='0',
         )
         env.update(miss_env(o))
-    return env, [str(HERE / 'run-inkling2-xtier.sh'), *interleave_args(o)]
+    env.update(kv_offload_env(o))
+    return env, [str(HERE / 'run-inkling2-xtier.sh'), *interleave_args(o), *kv_offload_args(o)]
 
 
 def tags(o):
@@ -138,4 +146,4 @@ def tags(o):
         out.append(f"在线截断 {o['truncate']}")
     if o['packs'] == 'on':
         out += share_tags(o)
-    return out + interleave_tags(o)
+    return out + interleave_tags(o) + kv_offload_tags(o)

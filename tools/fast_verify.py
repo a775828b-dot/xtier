@@ -128,6 +128,8 @@ def detect_scopes(files):
             scopes.add('core')
         if f.startswith('xtier/cache/cold') or f.startswith('tools/cold_'):
             scopes.add('cold')
+        if f.startswith(('xtier/kvstore/', 'csrc/kvstore/', 'csrc/include/xtier_kvstore.h')):
+            scopes.add('kvstore')
         if f.startswith(('xtier/console/', 'configs/')):
             scopes.add('console')
         if f.startswith('xtier/platform/'):
@@ -159,6 +161,9 @@ def select_tier1_tests(scopes):
         ordered.append((name, cmd, preset))
 
     sc = set(scopes)
+    if 'kvstore' in sc:
+        add('kvstore_check', [py, 'tests/kvstore_check.py'])
+        add('kvstore_bridge_check', [py, 'tests/kvstore_bridge_check.py'])
     if 'core' in sc:
         add('fp8_weights_check', [py, 'tests/fp8_weights_check.py'])
         add('elastic_check', [py, 'tests/elastic_check.py'])

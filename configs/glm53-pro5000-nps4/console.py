@@ -7,6 +7,7 @@ cold 255K-token prompt failed); the elastic cache gives decode the two slots bac
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                kv_offload_args, kv_offload_env, kv_offload_option, kv_offload_tags,
                                 miss_env, miss_option)
 
 HERE = Path(__file__).resolve().parent
@@ -42,6 +43,7 @@ MODEL = {
                            ['192', '192 步 / 块 · 估 decode 约 43 tok/s，长提示首字晚约 85%']], '64',
                           '一个请求在读长提示时，每读完一块（16K token，约 6.2 秒）先让另一个请求 decode 这么多步；'
                           '没有请求在 decode 时不生效。关：另一个请求要等整段读完（119K token 实测停 40 秒）'),
+        kv_offload_option(),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '基线：BF16 权重、55 槽、不开拒绝采样'}],
 }
@@ -57,10 +59,11 @@ def build(o, port):
     elif o['elastic'] == 'on':
         env['XTIER_CACHE_ELASTIC'] = '1'
     env.update(miss_env(o))
+    env.update(kv_offload_env(o))
     args = ['--context-length', ctx, '--chunked-prefill-size', o['chunk'], '--mamba-ssm-dtype', 'bfloat16',
             '--mem-fraction-static', '0.92', '--max-mamba-cache-size', '10', '--cuda-graph-max-bs-decode', '2',
             '--dsa-decode-backend', 'tilelang', '--dsa-prefill-backend', 'tilelang', '--kv-cache-dtype', 'fp8_e4m3',
-            *interleave_args(o)]
+            *interleave_args(o), *kv_offload_args(o)]
     if spec:
         env['XTIER_DRAFT'] = '1'
         args += ['--speculative-algorithm', 'EAGLE', '--speculative-num-steps', '3', '--speculative-eagle-topk', '1',
@@ -77,4 +80,4 @@ def tags(o):
     on = o['packs'] == 'on'
     return (['拒绝采样'] if on and o['spec'] == 'on' and o['rs'] == 'on' else []) + (
         ['弹性热专家'] if on and o['elastic'] == 'on' else []) + (
-        [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else []) + interleave_tags(o)
+        [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else []) + interleave_tags(o) + kv_offload_tags(o)

@@ -7,7 +7,8 @@ Option defaults = the measured configuration (results: docs/reports/2026-10-27-d
 
 from pathlib import Path
 
-from xtier.console.core import common_options, elastic_option
+from xtier.console.core import (common_options, elastic_option, kv_offload_args, kv_offload_env,
+                                kv_offload_option, kv_offload_tags)
 
 HERE = Path(__file__).resolve().parent
 # the cold-expert store of the DS card (XTIER_COLD): four PCIe 5.0 drives (the manifest is in the first)
@@ -28,6 +29,7 @@ MODEL = {
         {'key': 'slots', 'label': '常驻热专家槽 / 层', 'default': '4', 'choices': [['4', '4 · 实测']]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '8192', 'choices': [['8192', '8K · 实测'], ['4096', '4K']]},
         elastic_option('on', 'decode 时把 prefill 才用的显存借给热专家（32 GB 里常驻只放 4 槽），prefill 前还回'),
+        kv_offload_option(),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8'}],
 }
@@ -46,10 +48,11 @@ def build(o, port):
                    XTIER_DS_WO_A_PREFILL='0')
     elif o['elastic'] == 'on':
         env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='30')
-    return env, [str(HERE / 'run-ds-mini.sh')]
+    env.update(kv_offload_env(o))
+    return env, [str(HERE / 'run-ds-mini.sh'), *kv_offload_args(o)]
 
 
 def tags(o):
     """Extra parts of the server's label."""
     return ['128K', '模拟 5090 32G / 内存 128G', f"冷专家 {o['cold']}%"] + (
-        ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else [])
+        ['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []) + kv_offload_tags(o)

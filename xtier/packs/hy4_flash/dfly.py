@@ -1289,21 +1289,30 @@ def _register_dfly() -> bool:
 
 
 class _AllowDflyCfg:
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, allow_dfly: bool = False, allow_hicache: bool = False):
         self._cfg = cfg
+        self._allow_dfly = allow_dfly
+        self._allow_hicache = allow_hicache
 
     @property
     def speculative_algorithm(self):
-        return None
+        return None if self._allow_dfly else self._cfg.speculative_algorithm
+
+    @property
+    def enable_hierarchical_cache(self):
+        return False if self._allow_hicache else self._cfg.enable_hierarchical_cache
 
     def __getattr__(self, name):
         return getattr(self._cfg, name)
 
 
 def _reject_hyv4_hook(original, cfg):
+    import os
     algo = getattr(cfg, 'speculative_algorithm', None)
-    if isinstance(algo, str) and algo.upper() == 'DFLY':
-        return original(_AllowDflyCfg(cfg))
+    allow_dfly = isinstance(algo, str) and algo.upper() == 'DFLY'
+    allow_hicache = bool(getattr(cfg, 'enable_hierarchical_cache', False)) and os.environ.get('XTIER_KV_OFFLOAD') == '1'
+    if allow_dfly or allow_hicache:
+        return original(_AllowDflyCfg(cfg, allow_dfly=allow_dfly, allow_hicache=allow_hicache))
     return original(cfg)
 
 

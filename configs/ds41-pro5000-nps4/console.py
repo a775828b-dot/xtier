@@ -11,6 +11,7 @@ slots: CHUNK_SLOTS."""
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                kv_offload_args, kv_offload_env, kv_offload_option, kv_offload_tags,
                                 miss_env, miss_option, share_env, share_option, share_tags)
 
 HERE = Path(__file__).resolve().parent
@@ -96,6 +97,11 @@ MODEL = {
                           '一个请求在读长提示时，每读完一块（48K token，约 7.5 秒）先让另一个请求 decode 这么多步；'
                           '没有请求在 decode 时不生效。关：另一个请求要等整段读完（227K token 要 37 秒）。'
                           '步数按 48K 分块定的：分块调小时同样的步数给另一个请求的份额更大'),
+        kv_offload_option(
+            hint='GPU KV 池（1M token）挤出时将页卸载到 4 块 NVMe（可选 100 GiB = 4×25 GiB 或 200 GiB = 4×50 GiB，'
+                 'O_DIRECT + io_uring 绕过页缓存），多并发/多会话切回时直接从 NVMe 读回免冷 prefill；'
+                 'DS4.1 下 100 GiB 约装 6,300 万 token（约 118 个 512K 会话），仅占 ~5.2 GiB 锁页中转缓冲，默认关',
+        ),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8；22K 分块、50 槽'},
               *[{'when': {'packs': 'on', 'chunk': c, 'slots': s}, 'warn': True,
@@ -145,7 +151,8 @@ def build(o, port):
     else:   # neither on layers with cold experts
         env.update(miss_env(o))
         env.update(share_env(o))
-    return env, [str(HERE / 'run-ds-xtier.sh'), *interleave_args(o)]
+    env.update(kv_offload_env(o))
+    return env, [str(HERE / 'run-ds-xtier.sh'), *interleave_args(o), *kv_offload_args(o)]
 
 
 def tags(o):
@@ -161,4 +168,4 @@ def tags(o):
         out.append(f"未命中 {o['missgpu']}% GPU 代算")
     if o['cold'] == 'off':
         out += share_tags(o)
-    return out + interleave_tags(o)
+    return out + interleave_tags(o) + kv_offload_tags(o)

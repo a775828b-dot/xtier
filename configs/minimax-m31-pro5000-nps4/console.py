@@ -4,7 +4,8 @@ next to 8 hot slots per layer); option defaults = the measured configuration."""
 
 from pathlib import Path
 
-from xtier.console.core import common_options, elastic_option
+from xtier.console.core import (common_options, elastic_option, kv_offload_args, kv_offload_env,
+                                kv_offload_option, kv_offload_tags)
 
 HERE = Path(__file__).resolve().parent
 
@@ -23,6 +24,7 @@ MODEL = {
          'choices': [['5', '5 · 实测'], ['7', '7 · 检查点'], ['3', '3']]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '16384', 'choices': [['16384', '16K'], ['8192', '8K']]},
         elastic_option('off', '一档额外槽 1.69 GiB，decode 时空闲显存只够 +3 档：命中 0.245 → 0.285，agent 每步持平（10-26），默认关'),
+        kv_offload_option(),
     ],
     'notes': [{'when': {'packs': 'off'}, 'text': '基线：只保留在 SM120 上跑起来必需的修正，草稿长度用检查点的 7'}],
 }
@@ -30,7 +32,7 @@ MODEL = {
 
 def tags(o):
     """The fixed context in job labels (there is no context option)."""
-    return ['512K'] + (['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else [])
+    return ['512K'] + (['弹性热专家'] if o['packs'] == 'on' and o['elastic'] == 'on' else []) + kv_offload_tags(o)
 
 
 def build(o, port):
@@ -41,4 +43,5 @@ def build(o, port):
         env.update(XTIER_DRAFT_LMHEAD_FP8='0', XTIER_MXFP8_B12X_ROWS='', GAMMA='7', XTIER_DSPARK_TRUNCATE='0')
     elif o['elastic'] == 'on':
         env['XTIER_CACHE_ELASTIC'] = '1'
-    return env, [str(HERE / 'run-minimax-xtier.sh')]
+    env.update(kv_offload_env(o))
+    return env, [str(HERE / 'run-minimax-xtier.sh'), *kv_offload_args(o)]

@@ -102,10 +102,19 @@ for mid, m in models.items():
     total = 1
     for o in m['options']:
         total *= len(o['choices'])
+    unavail = {o['key']: console.unavailable(o) for o in m['options']}
+    for o in m['options']:
+        for bad_val in unavail[o['key']]:   # every unavailable choice is refused
+            try:
+                console.validate(mid, {**d, o['key']: bad_val})
+                raise AssertionError(f'accepted an unavailable value: {mid} {o["key"]}={bad_val}')
+            except ValueError:
+                pass
+    avail_choices = [[c[0] for c in o['choices'] if c[0] not in unavail[o['key']]] for o in m['options']]
     forms = (_sample_forms(m, d) if FAST and total > FAST_CAP
-             else (dict(zip(keys, v)) for v in itertools.product(*[[c[0] for c in o['choices']] for o in m['options']])))
+             else (dict(zip(keys, v)) for v in itertools.product(*avail_choices)))
     for form in forms:
-        if any(console.unavailable(o).get(form[o['key']]) for o in m['options']):   # not on this machine: refused
+        if any(unavail[k].get(form[k]) for k in keys):   # sampled unavailable boundary: refused
             try:
                 console.validate(mid, form)
                 raise AssertionError(f'accepted an unavailable value: {mid} {form}')
@@ -203,6 +212,23 @@ if not console.unavailable(cold):
     env, argv = console.build('ds41', console.validate('ds41', {'cold': '30'}))
     assert env['XTIER_COLD'] == '1' and env['XTIER_COLD_FRACTION'] == '0.30' and len(env['XTIER_COLD_PATHS'].split(':')) == 4
     assert console.describe('ds41', console.validate('ds41', {'cold': '30'})).endswith('冷专家 30%')
+# generic NVMe L2 KV offload: off by default on every model (zero hooks/flags), opt-in 100 / 200 GiB (4x25 / 4x50 GiB)
+for mid in models:
+    d_m = console.defaults(mid)
+    kv_opt = next(o for o in models[mid]['options'] if o['key'] == 'kvoffload')
+    kv_avail = not console.unavailable(kv_opt)
+    assert d_m['kvoffload'] == 'off', (mid, d_m['kvoffload'])
+    env_off, argv_off = console.build(mid, d_m)
+    assert 'XTIER_KV_OFFLOAD' not in env_off and 'XTIER_KV_SIZE_GIB' not in env_off, mid
+    assert '--enable-hierarchical-cache' not in argv_off and 'NVMe KV' not in console.describe(mid, d_m), mid
+    if kv_avail:
+        for sz in ('100', '200'):
+            on_form = console.validate(mid, {'kvoffload': sz})
+            env_on, argv_on = console.build(mid, on_form)
+            assert env_on['XTIER_KV_OFFLOAD'] == '1' and env_on['XTIER_KV_SIZE_GIB'] == sz, (mid, sz, env_on)
+            assert '--enable-hierarchical-cache' in argv_on and '--hicache-storage-backend' in argv_on, mid
+            assert 'interface_v1' in argv_on[argv_on.index('--hicache-storage-backend-extra-config') + 1], mid
+            assert f'NVMe KV {sz}G' in console.describe(mid, on_form), (mid, sz)
 
 # a choice unavailable on this machine: refused, a saved one falls back to the default of that option only, listed
 # for the page (greyed out there)

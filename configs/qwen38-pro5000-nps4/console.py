@@ -7,6 +7,7 @@ is GPU-bound (2026-10-26, two more resident layers with dynamic slots: decode st
 from pathlib import Path
 
 from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+                                kv_offload_args, kv_offload_env, kv_offload_option, kv_offload_tags,
                                 miss_env, miss_option)
 
 HERE = Path(__file__).resolve().parent
@@ -51,6 +52,7 @@ MODEL = {
                            ['288', '288 步 / 块 · 估 decode 约 83 tok/s，长提示首字晚约 83%']], '96',
                           '一个请求在读长提示时，每读完一块（24K token，约 4.6 秒）先让另一个请求 decode 这么多步；'
                           '没有请求在 decode 时不生效。关：另一个请求要等整段读完（211K token 实测停 37 秒）'),
+        kv_offload_option(),
     ],
     'notes': [
         {'when': {'packs': 'off'}, 'text': '基线：FP8 KV、16K 分块、不开 hc_mix / PLE / QSA 分段'},
@@ -78,11 +80,12 @@ def build(o, port):
     if not base and o['elastic'] == 'on':
         env['XTIER_CACHE_ELASTIC'] = '1'
     env.update(miss_env(o))
+    env.update(kv_offload_env(o))
     if o['ple'] == 'nvme':
         env.update(XTIER_PLE_ROWS='nvme', XTIER_PLE_MODEL=PLE_OPTANE)
     args = ['--context-length', ctx, '--max-total-tokens', ctx, '--kv-cache-dtype', kv, '--chunked-prefill-size', chunk,
             '--mem-fraction-static', '0.90', '--max-mamba-cache-size', '16', '--mamba-ssm-dtype', 'bfloat16',
-            '--json-model-override-args', YARN, *interleave_args(o)]
+            '--json-model-override-args', YARN, *interleave_args(o), *kv_offload_args(o)]
     if spec:
         return env, [str(HERE / 'run-qwen-mtp.sh'), *args, '--speculative-draft-kv-cache-dtype', 'fp8_e4m3']
     return env, [str(HERE / 'run-qwen-xtier.sh'), *args, '--cuda-graph-max-bs-decode', '2']
@@ -90,10 +93,11 @@ def build(o, port):
 
 def tags(o):
     """Extra parts of the server's label."""
+    tail = interleave_tags(o) + kv_offload_tags(o)
     if o['packs'] != 'on':
-        return interleave_tags(o)
+        return tail
     extra = (['弹性热专家'] if o['elastic'] == 'on' else []) + (
-        [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else []) + interleave_tags(o)
+        [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else []) + tail
     if o['kv'] != 'nvfp4':
         return ['FP8 KV'] + extra
     return (['NVFP4 KV', '自动布局'] if o['layout'] == 'auto' else ['NVFP4 KV']) + extra

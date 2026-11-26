@@ -103,6 +103,9 @@ def install() -> None:
     from xtier.cache import elastic
     if elastic.install(HookRegistry, HookType):
         logger.info('xtier: elastic expert cache on (XTIER_CACHE_ELASTIC=1)')
+    from xtier.kvstore import bridge as kv_bridge
+    if kv_bridge.install(HookRegistry, HookType):
+        logger.info('xtier: NVMe KV offload bridge on (XTIER_KV_OFFLOAD=1)')
     names = packs.install(HookRegistry, HookType)
     fixes = platform.install(HookRegistry, HookType)
     _installed.append(True)
