@@ -27,6 +27,8 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier.arch import HW_FP8, e4m3_bits, e4m3_f32
+
 logger = logging.getLogger(__name__)
 
 NVFP4_KV_DIM = 416
@@ -48,6 +50,14 @@ def triton_fp8_decode_enabled() -> bool:
 
 def triton_fp8_max_topk() -> int:
     return int(os.environ.get('XTIER_HY4_TRITON_MAX_TOPK', '512'))
+
+
+@triton.jit
+def _f32_to_e4m3_u8(x):
+    if HW_FP8:
+        return x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    else:
+        return e4m3_bits(x)
 
 
 @triton.jit
@@ -89,13 +99,13 @@ def _quant_store_nvfp4_mla_kernel(
     e = tl.arange(0, 16)[None, :]
     v_lo = tl.load(NOPE + row * stride_n + g16 * 16 + e).to(tl.float32)
     v_hi = tl.load(NOPE + row * stride_n + 256 + g16 * 16 + e).to(tl.float32)
-    s_lo = tl.maximum(tl.max(tl.abs(v_lo), axis=1) / 6.0, 1e-6).to(tl.float8e4nv)
-    s_hi = tl.maximum(tl.max(tl.abs(v_hi), axis=1) / 6.0, 1e-6).to(tl.float8e4nv)
-    c_lo = _quant_e2m1(v_lo / s_lo.to(tl.float32)[:, None])
-    c_hi = _quant_e2m1(v_hi / s_hi.to(tl.float32)[:, None])
+    s_lo_u8 = _f32_to_e4m3_u8(tl.maximum(tl.max(tl.abs(v_lo), axis=1) / 6.0, 1e-6))
+    s_hi_u8 = _f32_to_e4m3_u8(tl.maximum(tl.max(tl.abs(v_hi), axis=1) / 6.0, 1e-6))
+    c_lo = _quant_e2m1(v_lo / e4m3_f32(s_lo_u8)[:, None])
+    c_hi = _quant_e2m1(v_hi / e4m3_f32(s_hi_u8)[:, None])
     tl.store(DST + base + g16 * 16 + e, c_lo | (c_hi << 4))
-    tl.store(DST + base + 256 + tl.arange(0, 16), s_lo.to(tl.uint8, bitcast=True))
-    tl.store(DST + base + 272 + tl.arange(0, 16), s_hi.to(tl.uint8, bitcast=True))
+    tl.store(DST + base + 256 + tl.arange(0, 16), s_lo_u8)
+    tl.store(DST + base + 272 + tl.arange(0, 16), s_hi_u8)
 
     rd = tl.arange(0, 64)
     rope = tl.load(ROPE + row * stride_r + rd)
@@ -122,11 +132,11 @@ def _unpack_nvfp4_to_fp8_kernel(
         sc_off = (272 + (g - 2) * 8) if is_hi else (256 + g * 8)
         b = tl.load(SRC + sbase + byte_off + d128).to(tl.int32)
         nib = (b >> 4) if is_hi else (b & 15)
-        sc = tl.load(SRC + sbase + sc_off + (d128 // 16)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        sc = e4m3_f32(tl.load(SRC + sbase + sc_off + (d128 // 16)))
         val = _e2m1(nib) * sc
         amax = tl.max(tl.abs(val), axis=0)
         s128 = tl.maximum(amax / 448.0, 1e-12)
-        q8 = (val / s128).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        q8 = _f32_to_e4m3_u8(val / s128)
         tl.store(DST + dbase + g * 128 + d128, q8)
         tl.store(DST_F32 + (dbase + 512) // 4 + g, s128)
 
@@ -163,11 +173,11 @@ def _gather_unpack_nvfp4_to_fp8_kernel(
         sc_off = (272 + (g - 2) * 8) if is_hi else (256 + g * 8)
         b = tl.load(SRC + sbase + byte_off + d128).to(tl.int32)
         nib = (b >> 4) if is_hi else (b & 15)
-        sc = tl.load(SRC + sbase + sc_off + (d128 // 16)).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        sc = e4m3_f32(tl.load(SRC + sbase + sc_off + (d128 // 16)))
         val = _e2m1(nib) * sc
         amax = tl.max(tl.abs(val), axis=0)
         s128 = tl.maximum(amax / 448.0, 1e-12)
-        q8 = (val / s128).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        q8 = _f32_to_e4m3_u8(val / s128)
         tl.store(DST + dbase + g * 128 + d128, q8)
         tl.store(DST_F32 + (dbase + 512) // 4 + g, s128)
 
@@ -208,8 +218,8 @@ def _nvfp4_sparse_attend(
         base = tl.where(valid, idx, 0).to(tl.int64) * 416
 
         b = tl.load(C + base[:, None] + d256[None, :], mask=valid[:, None], other=0).to(tl.int32)
-        s_lo = tl.load(C + base[:, None] + 256 + (d256 // 16)[None, :], mask=valid[:, None], other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        s_hi = tl.load(C + base[:, None] + 272 + (d256 // 16)[None, :], mask=valid[:, None], other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        s_lo = e4m3_f32(tl.load(C + base[:, None] + 256 + (d256 // 16)[None, :], mask=valid[:, None], other=0))
+        s_hi = e4m3_f32(tl.load(C + base[:, None] + 272 + (d256 // 16)[None, :], mask=valid[:, None], other=0))
         k_lo = (_e2m1(b & 15) * s_lo).to(tl.bfloat16)
         k_hi = (_e2m1(b >> 4) * s_hi).to(tl.bfloat16)
         k_pe = tl.load(CB + (base[:, None] + 288) // 2 + d64[None, :], mask=valid[:, None], other=0.0)
@@ -275,11 +285,11 @@ def _fp8_sparse_attend(
         valid = idx >= 0
         base = tl.where(valid, idx, 0).to(tl.int64) * 656
 
-        k_lo_raw = tl.load(C + base[:, None] + d256[None, :], mask=valid[:, None], other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        k_lo_raw = e4m3_f32(tl.load(C + base[:, None] + d256[None, :], mask=valid[:, None], other=0))
         ks_lo = tl.load(CF32 + (base[:, None] + 512) // 4 + (d256 // 128)[None, :], mask=valid[:, None], other=0.0)
         k_lo = (k_lo_raw * ks_lo).to(tl.bfloat16)
 
-        k_hi_raw = tl.load(C + base[:, None] + 256 + d256[None, :], mask=valid[:, None], other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        k_hi_raw = e4m3_f32(tl.load(C + base[:, None] + 256 + d256[None, :], mask=valid[:, None], other=0))
         ks_hi = tl.load(CF32 + (base[:, None] + 512) // 4 + (2 + d256 // 128)[None, :], mask=valid[:, None], other=0.0)
         k_hi = (k_hi_raw * ks_hi).to(tl.bfloat16)
 

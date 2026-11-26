@@ -18,7 +18,8 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-H, I, E, FMT, THREADS, LAYER, KEY = 2048, 1024, 16, 'mxfp4', 16, 0, 'shared-store'
+H, I, E, FMT, LAYER, KEY = 2048, 1024, 16, 'mxfp4', 0, 'shared-store'
+THREADS = min(16, max(1, (os.cpu_count() or 2) // 2))
 
 
 def experts(zero):
@@ -39,7 +40,7 @@ def start(root, model, zero):
     drives = [root / 'd0', root / 'd1']
     os.environ.update(XTIER_COLD='1', XTIER_COLD_PATHS=':'.join(map(str, drives)), XTIER_COLD_KEY=KEY,
                       XTIER_COLD_SOURCE=str(root / model), XTIER_COLD_FRACTION='0.5', XTIER_COLD_LOG='0',
-                      XTIER_FAST_LOAD='1', XTIER_PROBE_DISPATCH_CPU='95')
+                      XTIER_COLD_UNITS='3', XTIER_FAST_LOAD='1')
     sys.path.insert(0, str(REPO))
     from xtier.cache import cold
     from xtier.engine import CpuPlan

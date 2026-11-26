@@ -18,7 +18,11 @@ def _fail(msg):
 
 
 def check_kv_fp4():
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    cap = torch.cuda.get_device_capability()
+    use_fi_sparse_mla = cap >= (10, 0)
+    trtllm_batch_decode_with_kv_cache_mla = None
+    if use_fi_sparse_mla:
+        from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     dev = 'cuda'
     torch.manual_seed(0)
@@ -39,9 +43,10 @@ def check_kv_fp4():
         if not torch.equal(rope_out, rope[:512]):
             _fail(f'unpack_nvfp4_to_fp8 RoPE drift for ps={ps}')
 
-    # Verify gather-unpack + FlashInfer vs Triton NVFP4 decode across M=1,4 and SWA/DSA topk with -1 padding
-    ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    # Verify gather-unpack + FlashInfer (SM100+) or FP32 reference vs Triton NVFP4 decode across M=1,4 and SWA/DSA topk
+    ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=dev) if use_fi_sparse_mla else None
     sm_scale = 1.0 / (192 ** 0.5)
+    kv_exact = torch.cat([nope, rope], dim=-1).float()
     for m, heads, topk, valid in [(1, 64, 512, 256), (4, 64, 512, 512), (1, 32, 2048, 1024), (4, 32, 2048, 2048)]:
         q = torch.randn(m, heads, 576, dtype=torch.bfloat16, device=dev)
         sink = torch.randn(heads, dtype=torch.float32, device=dev)
@@ -52,26 +57,39 @@ def check_kv_fp4():
         fp8_scratch, remapped = kv_fp4.gather_unpack_nvfp4_to_fp8(kv_buf, idx)
         if not torch.equal(remapped < 0, idx < 0):
             _fail(f'gather_unpack mask mismatch for m={m} topk={topk}')
-        got = trtllm_batch_decode_with_kv_cache_mla(
-            query=q.unsqueeze(1),
-            kv_cache=fp8_scratch,
-            workspace_buffer=ws,
-            qk_nope_head_dim=128,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            block_tables=remapped.unsqueeze(1),
-            seq_lens=seq_lens,
-            max_seq_len=topk,
-            sparse_mla_top_k=topk,
-            bmm1_scale=sm_scale,
-            bmm2_scale=1.0,
-            sinks=[sink],
-            kv_scale_format='arbitrary_fp32',
-        ).squeeze(1)
         ref = kv_fp4.triton_sparse_mla_decode(q, kv_buf, idx, sink, sm_scale, kv_fp4.NVFP4_KV_DIM)
-        rel = (got.float() - ref.float()).norm().item() / max(ref.float().norm().item(), 1e-6)
-        if not torch.isfinite(got).all() or rel > 0.06:
-            _fail(f'gather_unpack+FI vs Triton mismatch m={m} H={heads} topk={topk}: rel={rel:.4f}')
+        if use_fi_sparse_mla:
+            got = trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=fp8_scratch,
+                workspace_buffer=ws,
+                qk_nope_head_dim=128,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                block_tables=remapped.unsqueeze(1),
+                seq_lens=seq_lens,
+                max_seq_len=topk,
+                sparse_mla_top_k=topk,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                sinks=[sink],
+                kv_scale_format='arbitrary_fp32',
+            ).squeeze(1)
+            rel = (got.float() - ref.float()).norm().item() / max(ref.float().norm().item(), 1e-6)
+            if not torch.isfinite(got).all() or rel > 0.06:
+                _fail(f'gather_unpack+FI vs Triton mismatch m={m} H={heads} topk={topk}: rel={rel:.4f}')
+        else:
+            # Below SM100 FlashInfer routes to XQA MLA which lacks sparse_mla_top_k; verify Triton NVFP4 vs FP32 ref.
+            safe_idx = idx.clamp(min=0).long()
+            k_sel = kv_exact[safe_idx]  # [m, topk, 576]
+            scores = torch.einsum('mhd,mkd->mhk', q.float(), k_sel) * sm_scale
+            scores = scores.masked_fill((idx < 0)[:, None, :], float('-inf'))
+            scores_sink = torch.cat([scores, sink[None, :, None].expand(m, heads, 1)], dim=-1)
+            probs = torch.softmax(scores_sink, dim=-1)[..., :-1]
+            got = torch.einsum('mhk,mkd->mhd', probs, k_sel[..., :512])
+            rel = (got - ref.float()).norm().item() / max(got.norm().item(), 1e-6)
+            if not torch.isfinite(ref).all() or rel > 0.25:
+                _fail(f'Triton NVFP4 vs FP32 ref mismatch m={m} H={heads} topk={topk}: rel={rel:.4f}')
     # Regression: larger eager gather calls (e.g. short 31-token prefills) must never replace the
     # static scratch buffers already captured into CUDA graphs before torch.cuda.empty_cache().
     kv_fp4.ensure_gather_buffers(24 * 2176, torch.device(dev))
@@ -98,6 +116,9 @@ def check_kv_fp4():
 
 
 def check_indexpool_fp8():
+    if torch.cuda.get_device_capability() < (8, 9):
+        print('  indexpool_fp8: skipped (needs SM89+ HW_FP8)')
+        return
     from sglang.kernels.ops.attention.dsa.hy4_flash_indexpool import indexpool_logits
 
     dev = 'cuda'
@@ -269,8 +290,8 @@ def check_dfly():
 
 
 if __name__ == '__main__':
-    if not torch.cuda.is_available():
-        print('SKIP: CUDA required')
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        print('SKIP: SM80+ CUDA GPU required')
         sys.exit(0)
     check_kv_fp4()
     check_indexpool_fp8()

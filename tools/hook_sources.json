@@ -79,6 +79,7 @@
   "sglang.srt.managers.scheduler_components.batch_result_processor.SchedulerBatchResultProcessor.process_batch_result_decode": "be7732bfe3613ac3",
   "sglang.srt.managers.tokenizer_manager.TokenizerManager._tokenize_texts": "da25d20d35e7f614",
   "sglang.srt.managers.tokenizer_manager.TokenizerManager.init_tokenizer_and_processor": "c3d724b119f1575d",
+  "sglang.srt.mem_cache.host_memory._cgroup_memory_headroom": "1b7425ed3d850226",
   "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache": "7627669f429e016e",
   "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_kv_host_pool": "26e11f8f740f9dea",
   "sglang.srt.mem_cache.kv.router.KVLayer._write_loc": "30df0843f73630a0",

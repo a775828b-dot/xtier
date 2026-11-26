@@ -21,6 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
+    print('SKIP: NVFP4 KV cache quantize requires an SM90 or newer GPU')
+    sys.exit(0)
+
 from xtier.packs.minimax_m3 import kv_fp4
 
 torch.manual_seed(0)

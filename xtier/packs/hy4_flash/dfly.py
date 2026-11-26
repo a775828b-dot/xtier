@@ -32,6 +32,8 @@ from torch import nn
 import triton
 import triton.language as tl
 
+from xtier.arch import e4m3_f32
+
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_PREFIX = 'model.dfly_layers.'
@@ -393,9 +395,9 @@ def _fp8_lmhead_argmax_kernel(
     ng = K // 128
     for pg in range(0, ng):
         x = tl.load(X + rows_m[:, None] * K + (pg * 128 + d128)[None, :], mask=mmask[:, None], other=0.0)
-        w = tl.load(
+        w = e4m3_f32(tl.load(
             Q + rows_n[:, None] * K + (pg * 128 + d128)[None, :], mask=nmask[:, None], other=0
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        ))
         sc = tl.load(S + rows_n * ng + pg, mask=nmask, other=0.0)
         wb = (w * sc[:, None]).to(tl.bfloat16)
         acc = tl.dot(x, tl.trans(wb), acc)

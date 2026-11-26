@@ -85,6 +85,9 @@ def _make_weights(E, H, I, fmt, seed=0):
     return w13, w2, s13, s2, g13, g2
 
 
+_THREADS = min(16, max(1, (os.cpu_count() or 2) // 2))
+
+
 def test_cpu_and_dual_cold():
     print('[1/4] CPU engine (NVFP4 + MXFP8 + SiTU edge all-256-bytes) & dual cold store...')
     E, H, I, K = 16, 256, 128, 4
@@ -94,7 +97,7 @@ def test_cpu_and_dual_cold():
     # Put large scales (254, 247) on small-magnitude E4M3 blocks (0..63) and small scales on large blocks to avoid FP32 inf-inf
     s13[0, 0] = torch.tensor([254, 247, 246, 127, 10, 9, 1, 0], dtype=torch.uint8)
     ptrs = [t.data_ptr() for t in (w13, w2, s13, s2, g13, g2)]
-    plan = CpuPlan(E, 16, ptrs, hidden=H, inter=I, scale_format='mxfp8', situ_gate_cap=4.0, situ_up_cap=25.0)
+    plan = CpuPlan(E, _THREADS, ptrs, hidden=H, inter=I, scale_format='mxfp8', situ_gate_cap=4.0, situ_up_cap=25.0)
     plan.localize()
     x = (torch.randn(4, H) * 0.3).to(torch.bfloat16).contiguous()
     ids = torch.tensor([[0, 1, 2, 3], [0, 4, 5, 6], [7, 8, 9, 10], [0, 11, 12, 15]], dtype=torch.int32)
@@ -119,7 +122,7 @@ def test_cpu_and_dual_cold():
             for lid, fmt in [(0, 'nvfp4'), (40, 'mxfp8')]:
                 ws = _make_weights(E, 2048, 1024, fmt, seed=lid + 2)
                 lp = cold.LayerPlan(lid, E, gpu_slots=0)
-                pl = CpuPlan(E, 16, [t.data_ptr() for t in ws], hidden=2048, inter=1024,
+                pl = CpuPlan(E, _THREADS, [t.data_ptr() for t in ws], hidden=2048, inter=1024,
                              scale_format=fmt, resident=lp.resident, situ_gate_cap=4.0, situ_up_cap=25.0)
                 pl.localize()
                 cold.attach(pl, lp, ws[:4], fmt)
@@ -160,7 +163,7 @@ def test_gpu_pool_and_prefill():
         os.environ['XTIER_PREFILL_ROUTE_ACCUM'] = '1'
         os.environ['XTIER_PREFILL_EXPERT_CHUNK'] = '8'
         os.environ['XTIER_PREFILL_FP4'] = '0'
-        plan = CpuPlan(E, 16, ptrs, hidden=H, inter=I, scale_format=fmt, situ_gate_cap=4.0, situ_up_cap=25.0)
+        plan = CpuPlan(E, _THREADS, ptrs, hidden=H, inter=I, scale_format=fmt, situ_gate_cap=4.0, situ_up_cap=25.0)
         plan.localize()
         pf = Prefill(E, ptrs, native=plan, hidden=H, inter=I, situ_gate_cap=4.0, situ_up_cap=25.0)
         pf.ensure_registered()
@@ -250,15 +253,18 @@ def test_mtp_hooks():
     rel = (b_pad.float() - b_ref.float()).norm().item() / b_ref.float().norm().item()
     assert rel < 1e-3, f'Markov pad2 rel_l2={rel}'
 
-    # Test FP8 draft lm_head
-    head = types.SimpleNamespace(weight=torch.nn.Parameter((torch.randn(V, H, device='cuda', dtype=torch.bfloat16) * 0.02)))
-    mtp._quantize_lm_head(head)
-    x = (torch.randn(7, H, device='cuda', dtype=torch.bfloat16) * 0.5)
-    y_fp8 = mtp._draft_project(lambda h, l: torch.nn.functional.linear(h, l.weight), x, head)
-    y_bf16 = torch.nn.functional.linear(x, head.weight)
-    rel_lm = (y_fp8.float() - y_bf16.float()).norm().item() / y_bf16.float().norm().item()
-    assert rel_lm < 0.05, f'Draft LM head FP8 rel_l2={rel_lm}'
-    print(f'  PASS (markov pad2 rel={rel:.2e}, lm_head fp8 rel={rel_lm:.4f})')
+    # Test FP8 draft lm_head (torch._scaled_mm requires SM89+; mtp.py installs this hook on SM89+ only)
+    if torch.cuda.get_device_capability() >= (8, 9):
+        head = types.SimpleNamespace(weight=torch.nn.Parameter((torch.randn(V, H, device='cuda', dtype=torch.bfloat16) * 0.02)))
+        mtp._quantize_lm_head(head)
+        x = (torch.randn(7, H, device='cuda', dtype=torch.bfloat16) * 0.5)
+        y_fp8 = mtp._draft_project(lambda h, l: torch.nn.functional.linear(h, l.weight), x, head)
+        y_bf16 = torch.nn.functional.linear(x, head.weight)
+        rel_lm = (y_fp8.float() - y_bf16.float()).norm().item() / y_bf16.float().norm().item()
+        assert rel_lm < 0.05, f'Draft LM head FP8 rel_l2={rel_lm}'
+        print(f'  PASS (markov pad2 rel={rel:.2e}, lm_head fp8 rel={rel_lm:.4f})')
+    else:
+        print(f'  PASS (markov pad2 rel={rel:.2e}, lm_head fp8 skipped below SM89)')
 
 
 def test_pack_registration():

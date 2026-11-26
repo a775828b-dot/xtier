@@ -15,6 +15,10 @@ device KV pool properties and auto-retires (no-op) if upstream SGLang adds nativ
   4. Exact ``data_ptr()`` coverage verifier (``attach_hybrid_pool_to_unified_cache`` & ``register_hicache_draft_pools``):
      Verify every persistent device KV/indexer/scale/state/draft buffer is bound by a registered host pool; if any
      tensor is uncovered and ``XTIER_KV_STRICT_COVERAGE=1``, disable ``XTierNVMeStorage`` rather than corrupting KV.
+  5. Container cgroup headroom fallback (``host_memory._cgroup_memory_headroom``):
+     In nested-cgroup containers (e.g. Colab / Docker) where ``/proc/self/cgroup`` contains relative ``..`` segments,
+     SGLang's ``_cgroup_headroom`` raises ``ValueError`` which ``available_host_memory_bytes`` does not catch; catch
+     ``ValueError`` and return ``None`` so host memory sizing falls back cleanly to ``psutil.virtual_memory().available``.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ logger = logging.getLogger(__name__)
 _ASSEMBLER = 'sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler'
 _SPEC_BASE = 'sglang.srt.speculative.base_spec_worker'
 _KV_BUILDER = 'sglang.srt.mem_cache.kv_cache_builder'
+_HOST_MEM = 'sglang.srt.mem_cache.host_memory'
 
 
 # ----- Generic geometry & coverage inspection helpers -----------------------
@@ -688,8 +693,20 @@ def install(registry, hook_type) -> list[str]:
             _verify_coverage(tree_cache, pools, context='draft_sidecar')
         return result
 
+    def around_cgroup_memory_headroom(original_fn, *args, **kwargs):
+        try:
+            return original_fn(*args, **kwargs)
+        except ValueError as err:
+            logger.warning(
+                'xtier kvstore bridge: unresolvable container cgroup memory path (%s); '
+                'falling back to host available memory',
+                err,
+            )
+            return None
+
     registry.register(f'{_SPEC_BASE}.BaseSpecWorker._build_hicache_draft_plan', around_draft_plan, hook_type.AROUND)
     registry.register(f'{_ASSEMBLER}.build_kv_host_pool', around_build_kv_host_pool, hook_type.AROUND)
     registry.register(f'{_ASSEMBLER}.attach_hybrid_pool_to_unified_cache', after_attach_hybrid_pool, hook_type.AFTER)
     registry.register(f'{_KV_BUILDER}.maybe_register_hicache_draft', after_register_draft_pools, hook_type.AFTER)
+    registry.register(f'{_HOST_MEM}._cgroup_memory_headroom', around_cgroup_memory_headroom, hook_type.AROUND)
     return ['kvstore.bridge']

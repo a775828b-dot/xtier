@@ -1197,9 +1197,9 @@ template<int FMT> class Plan: public PlanBase {
             }
         }
 #if XTIER_AVX512
-        static volatile long long sink;sink=_mm512_reduce_add_epi64(acc);
+        long long v=_mm512_reduce_add_epi64(acc);asm volatile("" : : "r"(v) : "memory");
 #else
-        static volatile long long sink;sink=_mm256_extract_epi64(acc,0)+_mm256_extract_epi64(acc,3);
+        long long v=_mm256_extract_epi64(acc,0)+_mm256_extract_epi64(acc,3);asm volatile("" : : "r"(v) : "memory");
 #endif
     }
     void task(int node,int lane,int lanes) {

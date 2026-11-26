@@ -240,7 +240,8 @@ def main():
         print(f'=== Phase 0 Benchmark ({args.gib:.1f} GiB, page={args.page_kb} KiB, {len(paths)} drives) ===')
         print(f'  Write (O_DIRECT, QD=4)        : {write_gbs:6.2f} GB/s ({t_write:.3f} s)')
         print(f'  Read  (NVMe -> Pinned)        : {read_gbs:6.2f} GB/s ({t_read:.3f} s)')
-        print(f'  H2D   (Pinned -> RTX PRO 5000): {h2d_gbs:6.2f} GB/s ({t_h2d:.3f} s)')
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'GPU'
+        print(f'  H2D   (Pinned -> {gpu_name}): {h2d_gbs:6.2f} GB/s ({t_h2d:.3f} s)')
         print(f'  E2E   (NVMe->Pin->GPU seq)    : {e2e_seq_gbs:6.2f} GB/s ({t_e2e_seq:.3f} s)')
         print(f'  E2E   (NVMe->Pin->GPU pipe)   : {e2e_pipe_gbs:6.2f} GB/s ({t_e2e_pipe:.3f} s)')
         print(f'  IOs: direct={st.direct_ios}, bounce={st.bounce_ios}')

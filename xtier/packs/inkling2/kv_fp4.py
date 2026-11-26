@@ -30,6 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier.arch import HW_FP8, e4m3_bits, e4m3_f32
+
 logger = logging.getLogger(__name__)
 
 NVFP4_KV_DIM = 72
@@ -66,6 +68,14 @@ def _is_inkling2_model(model_config) -> bool:
     hf_cfg = getattr(model_config, 'hf_config', None)
     archs = getattr(hf_cfg, 'architectures', None) or ()
     return any('Inkling2' in str(a) for a in archs)
+
+
+@triton.jit
+def _f32_to_e4m3_u8(x):
+    if HW_FP8:
+        return x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    else:
+        return e4m3_bits(x)
 
 
 @triton.jit
@@ -128,27 +138,27 @@ def _quant_store_nvfp4_mha_kernel(
     k_in = K_SRC + row.to(tl.int64) * sk0 + h.to(tl.int64) * sk1
     k_lo = tl.load(k_in + off64).to(tl.float32)
     k_hi = tl.load(k_in + 64 + off64).to(tl.float32)
-    sk_lo = tl.maximum(tl.max(tl.abs(k_lo), axis=1) / 6.0, 1e-6).to(tl.float8e4nv)
-    sk_hi = tl.maximum(tl.max(tl.abs(k_hi), axis=1) / 6.0, 1e-6).to(tl.float8e4nv)
-    ck_lo = _quant_e2m1(k_lo / sk_lo.to(tl.float32)[:, None])
-    ck_hi = _quant_e2m1(k_hi / sk_hi.to(tl.float32)[:, None])
+    sk_lo_u8 = _f32_to_e4m3_u8(tl.maximum(tl.max(tl.abs(k_lo), axis=1) / 6.0, 1e-6))
+    sk_hi_u8 = _f32_to_e4m3_u8(tl.maximum(tl.max(tl.abs(k_hi), axis=1) / 6.0, 1e-6))
+    ck_lo = _quant_e2m1(k_lo / e4m3_f32(sk_lo_u8)[:, None])
+    ck_hi = _quant_e2m1(k_hi / e4m3_f32(sk_hi_u8)[:, None])
     k_out = K_DST + slot * dk0 + h.to(tl.int64) * dk1
     tl.store(k_out + off64, ck_lo | (ck_hi << 4))
-    tl.store(k_out + 64 + s4, sk_lo.to(tl.uint8, bitcast=True))
-    tl.store(k_out + 68 + s4, sk_hi.to(tl.uint8, bitcast=True))
+    tl.store(k_out + 64 + s4, sk_lo_u8)
+    tl.store(k_out + 68 + s4, sk_hi_u8)
 
     # Value
     v_in = V_SRC + row.to(tl.int64) * sv0 + h.to(tl.int64) * sv1
     v_lo = tl.load(v_in + off64).to(tl.float32)
     v_hi = tl.load(v_in + 64 + off64).to(tl.float32)
-    sv_lo = tl.maximum(tl.max(tl.abs(v_lo), axis=1) / 6.0, 1e-6).to(tl.float8e4nv)
-    sv_hi = tl.maximum(tl.max(tl.abs(v_hi), axis=1) / 6.0, 1e-6).to(tl.float8e4nv)
-    cv_lo = _quant_e2m1(v_lo / sv_lo.to(tl.float32)[:, None])
-    cv_hi = _quant_e2m1(v_hi / sv_hi.to(tl.float32)[:, None])
+    sv_lo_u8 = _f32_to_e4m3_u8(tl.maximum(tl.max(tl.abs(v_lo), axis=1) / 6.0, 1e-6))
+    sv_hi_u8 = _f32_to_e4m3_u8(tl.maximum(tl.max(tl.abs(v_hi), axis=1) / 6.0, 1e-6))
+    cv_lo = _quant_e2m1(v_lo / e4m3_f32(sv_lo_u8)[:, None])
+    cv_hi = _quant_e2m1(v_hi / e4m3_f32(sv_hi_u8)[:, None])
     v_out = V_DST + slot * dv0 + h.to(tl.int64) * dv1
     tl.store(v_out + off64, cv_lo | (cv_hi << 4))
-    tl.store(v_out + 64 + s4, sv_lo.to(tl.uint8, bitcast=True))
-    tl.store(v_out + 68 + s4, sv_hi.to(tl.uint8, bitcast=True))
+    tl.store(v_out + 64 + s4, sv_lo_u8)
+    tl.store(v_out + 68 + s4, sv_hi_u8)
 
 
 def write_nvfp4_mha(k_dst: torch.Tensor, v_dst: torch.Tensor, loc: torch.Tensor,
@@ -253,12 +263,12 @@ def _decode_partials_nvfp4_kernel(
         v_base = page * SV0 + slot[:, None] * SV1 + hk * SV2
 
         kb = tl.load(K + k_base + d64[None, :], eviction_policy='evict_first').to(tl.int32)
-        ks_lo = tl.load(
+        ks_lo = e4m3_f32(tl.load(
             K + k_base + (64 + g_idx)[None, :], eviction_policy='evict_first'
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        ks_hi = tl.load(
+        ))
+        ks_hi = e4m3_f32(tl.load(
             K + k_base + (68 + g_idx)[None, :], eviction_policy='evict_first'
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        ))
         k_lo = (_e2m1(kb & 15) * ks_lo).to(q_lo.dtype)
         k_hi = (_e2m1(kb >> 4) * ks_hi).to(q_hi.dtype)
 
@@ -269,12 +279,12 @@ def _decode_partials_nvfp4_kernel(
         l = l * alpha + tl.sum(p, 1)
 
         vb = tl.load(V + v_base + d64[None, :], eviction_policy='evict_first').to(tl.int32)
-        vs_lo = tl.load(
+        vs_lo = e4m3_f32(tl.load(
             V + v_base + (64 + g_idx)[None, :], eviction_policy='evict_first'
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        vs_hi = tl.load(
+        ))
+        vs_hi = e4m3_f32(tl.load(
             V + v_base + (68 + g_idx)[None, :], eviction_policy='evict_first'
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        ))
         v_lo = (_e2m1(vb & 15) * vs_lo).to(q_lo.dtype)
         v_hi = (_e2m1(vb >> 4) * vs_hi).to(q_hi.dtype)
         p_cast = p.to(q_lo.dtype)
@@ -297,12 +307,12 @@ def _decode_partials_nvfp4_kernel(
             v_base = page[:, None] * SV0 + slot[:, None] * SV1 + hk * SV2
 
         kb = tl.load(K + k_base + d64[None, :], valid[:, None], other=0).to(tl.int32)
-        ks_lo = tl.load(
+        ks_lo = e4m3_f32(tl.load(
             K + k_base + (64 + g_idx)[None, :], valid[:, None], other=0
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        ks_hi = tl.load(
+        ))
+        ks_hi = e4m3_f32(tl.load(
             K + k_base + (68 + g_idx)[None, :], valid[:, None], other=0
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        ))
         k_lo = (_e2m1(kb & 15) * ks_lo).to(q_lo.dtype)
         k_hi = (_e2m1(kb >> 4) * ks_hi).to(q_hi.dtype)
 
@@ -324,12 +334,12 @@ def _decode_partials_nvfp4_kernel(
         l = l * alpha + tl.sum(p, 1)
 
         vb = tl.load(V + v_base + d64[None, :], valid[:, None], other=0).to(tl.int32)
-        vs_lo = tl.load(
+        vs_lo = e4m3_f32(tl.load(
             V + v_base + (64 + g_idx)[None, :], valid[:, None], other=0
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        vs_hi = tl.load(
+        ))
+        vs_hi = e4m3_f32(tl.load(
             V + v_base + (68 + g_idx)[None, :], valid[:, None], other=0
-        ).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        ))
         v_lo = (_e2m1(vb & 15) * vs_lo).to(q_lo.dtype)
         v_hi = (_e2m1(vb >> 4) * vs_hi).to(q_hi.dtype)
         p_cast = p.to(q_lo.dtype)
@@ -433,16 +443,16 @@ def _unpack_pages_nvfp4_to_bf16_kernel(
 
     k_in = K_SRC + page * sk0 + slot * sk1 + h * sk2
     kb = tl.load(k_in + d64).to(tl.int32)
-    ks_lo = tl.load(k_in + 64 + g_idx).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    ks_hi = tl.load(k_in + 68 + g_idx).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    ks_lo = e4m3_f32(tl.load(k_in + 64 + g_idx))
+    ks_hi = e4m3_f32(tl.load(k_in + 68 + g_idx))
     k_out = K_DST + u * dk0 + slot * dk1 + h * dk2
     tl.store(k_out + d64, (_e2m1(kb & 15) * ks_lo).to(tl.bfloat16))
     tl.store(k_out + 64 + d64, (_e2m1(kb >> 4) * ks_hi).to(tl.bfloat16))
 
     v_in = V_SRC + page * sv0 + slot * sv1 + h * sv2
     vb = tl.load(v_in + d64).to(tl.int32)
-    vs_lo = tl.load(v_in + 64 + g_idx).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    vs_hi = tl.load(v_in + 68 + g_idx).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    vs_lo = e4m3_f32(tl.load(v_in + 64 + g_idx))
+    vs_hi = e4m3_f32(tl.load(v_in + 68 + g_idx))
     v_out = V_DST + u * dv0 + slot * dv1 + h * dv2
     tl.store(v_out + d64, (_e2m1(vb & 15) * vs_lo).to(tl.bfloat16))
     tl.store(v_out + 64 + d64, (_e2m1(vb >> 4) * vs_hi).to(tl.bfloat16))

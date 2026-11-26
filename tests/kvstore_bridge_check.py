@@ -36,9 +36,11 @@ def _check(cond: bool, msg: str) -> None:
 class _DummyRegistry:
     def __init__(self):
         self.items = []
+        self.fns = {}
 
     def register(self, target, fn, htype):
         self.items.append((target, htype))
+        self.fns[target] = fn
 
 
 class _DummyHookType:
@@ -89,11 +91,16 @@ def main():
         names0 = bridge.install(reg0, _DummyHookType)
         _check(names0 == [] and len(reg0.items) == 0, f'expected 0 hooks when OFF, got {reg0.items}')
 
-        # 2. ON -> 4 generic hooks
+        # 2. ON -> 5 generic hooks (incl. container cgroup ValueError fallback)
         os.environ['XTIER_KV_OFFLOAD'] = '1'
         reg1 = _DummyRegistry()
         names1 = bridge.install(reg1, _DummyHookType)
-        _check(names1 == ['kvstore.bridge'] and len(reg1.items) == 4, f'expected 4 hooks when ON, got {reg1.items}')
+        _check(names1 == ['kvstore.bridge'] and len(reg1.items) == 5, f'expected 5 hooks when ON, got {reg1.items}')
+        cg_hook = reg1.fns['sglang.srt.mem_cache.host_memory._cgroup_memory_headroom']
+        def _bad_cg():
+            raise ValueError('Cannot resolve cgroup memory path: /../../jupyter-children')
+        _check(cg_hook(_bad_cg) is None, 'cgroup hook must swallow relative-path ValueError and return None')
+        _check(cg_hook(lambda: 4096) == 4096, 'cgroup hook must pass through normal headroom')
 
         # 3. Packed sub-byte MHA normalization (e.g. NVFP4 uint8 [m, 2, 128] declaring head_dim=256)
         packed_tgt = _FakePool(dtype=torch.uint8, head_num=2, head_dim=256, storage_dim=128, with_scales=True)

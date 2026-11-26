@@ -97,9 +97,9 @@ for fd in fds:
 
 # the notes of a start
 st = cold.store(KEY)
-cold._ranges[0] = (sizes, E, reads[0])
-cold._ranges[1] = (sizes, E, reads[1])
-cold._ranges[2] = (sizes, E, reads[1][:5])   # incomplete: stays in the checkpoint
+cold._ranges[0] = (st, sizes, E, reads[0])
+cold._ranges[1] = (st, sizes, E, reads[1])
+cold._ranges[2] = (st, sizes, E, reads[1][:5])   # incomplete: stays in the checkpoint
 cold.save_ranges()
 noted = json.loads((DRIVES[0] / f'{KEY}.ranges').read_text())
 check('ranges: complete layers only, file names', sorted(noted['layers']) == ['0', '1'] and sorted(noted['files'])

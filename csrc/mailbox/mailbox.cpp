@@ -7,6 +7,7 @@
 #include <cuda.h>
 #include <immintrin.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <sched.h>
 #include "xtier_engine.h"
 #include "xtier_mailbox.h"
@@ -633,8 +634,24 @@ void CUDART_CB execute(void *p) noexcept {
 }
 
 Dispatcher::Dispatcher() {
-    int cpu=80;
-    if(const char *v=std::getenv("XTIER_PROBE_DISPATCH_CPU"))cpu=std::stoi(v);
+    int cpu=-1;
+    if(const char *v=std::getenv("XTIER_PROBE_DISPATCH_CPU")) {
+        cpu=std::stoi(v);
+    } else {
+        // Pick the highest CPU allowed by the current affinity mask so <=80-CPU hosts
+        // and restricted containers work out of the box without XTIER_PROBE_DISPATCH_CPU.
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if(sched_getaffinity(0,sizeof(allowed),&allowed)==0) {
+            for(int i=CPU_SETSIZE-1;i>=0;--i) {
+                if(CPU_ISSET(i,&allowed)){cpu=i;break;}
+            }
+        }
+        if(cpu<0) {
+            long n=sysconf(_SC_NPROCESSORS_ONLN);
+            cpu=n>0?static_cast<int>(n-1):0;
+        }
+    }
     // The caller's own mask may exclude this CPU (e.g. a pinned scheduler thread);
     // the dispatcher thread sets its affinity itself and reports rejection below.
     if(cpu<0||cpu>=CPU_SETSIZE)throw std::runtime_error("Dispatcher CPU unavailable");
