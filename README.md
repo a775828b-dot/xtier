@@ -161,6 +161,7 @@ SGLang M3.1 分支（PR #45925），64K 会话加速包对比官方代码 + 必�
 
 ## 版本更新
 
+- **2026-11-28（v0.1.13）**：新增三项零 SGLang 补丁稳定性与冷启动修复：① `XTIER_KV_OFFLOAD=1` 下的 HiCache 混合驻留/落盘前缀过度承诺修复（仅统计已驱逐节点，并在上游未合入前锁定 Python `TreeCore` 防止 Rust `full.rs` 绕过）；② `SWAComponent.prepare_for_caching_req` 完整 span Radix 插入修复（消除新会话部分命中旧 SWA-less 前缀后的缓存冻结死点）；③ `EagleDraftWorker._capture_cuda_graphs` 启动期 Eager 草稿核与 QSA 多步草稿图元数据预热（`XTIER_DRAFT_PREWARM=1` 默认开启，消除首步 ~500 ms `cuModuleLoadData` 卡顿与 TP>1 死锁，零修改 `eagle.py` 规避越界读）。
 - **2026-11-26（v0.1.12）**：修复一些 bug。
 - **2026-11-26（v0.1.11）**：新增**通用多盘 NVMe KV 二级卸载**（`XTIER_KV_OFFLOAD=1`，**默认关闭**，启动台可选 `100 GiB` / `200 GiB` 按需开启）：`O_DIRECT + io_uring`（4×9100 PRO 写入 `28.19 GB/s`、读回 `40.28 GB/s`、端到端 `35.79 GB/s`），零 SGLang 补丁、零模型分支，DS4.1 / GLM-5.3 / Hy4-Flash / Qwen3.8 四模型挤出读回命中 **99.2–100%**（TTFT **9–32×**），DS4.1 `1M 池 + 100 GiB` 真实 `dsh` 多会话/图片多模态/自动压缩全链路零报错通过；同时打包合入 11-25 Prefill 100% 无损提速与社区 PR #20（弹性缓存 `release()` 排空保护）。[报告](docs/reports/2026-11-26-nvme-kv-offload.md)
 - **2026-11-25**：**Prefill 100% 无损提速**——新增零补丁融合 `RelLogitsProj + ShearingBias` Triton 核（逐比特 `max_diff=0`，64K 省 645 ms 与 6.9 GiB 峰值显存）、显存感知 1-band `_reduce_band`（`B=512`）、`_mxfp8_reduce_runs` 活跃 run 归约、向量化 `_act_quant_fp8` + SM120 `stages=4` W8A8，以及精确 slab `cudaHostRegister` `_share_buffers` 与冷专家 `CPU_SHARE` 支持；Inkling-2 64K 冷 prefill `3,835 → 3,986 tok/s`（稳态块 ~4,250）、500K `1,593 → 1,627 tok/s`（`-6.6 s`），照抄 `0/4`（`c=1/2`）、PPL `2.7172`（ΔNLL `+0.00005`）零损。[报告](docs/reports/2026-11-25-inkling2-small.md)
