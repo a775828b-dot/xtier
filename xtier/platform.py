@@ -55,6 +55,17 @@
   configs carrying ``SWAP_AB`` or ``SPLIT_K > 1`` fall through to ``_w8a8_block_fp8_matmul`` and raise KeyError.
   Until upstream widens the gate to exact capability (8, 9), XTier dispatches those SM89 configs (non-deterministic
   mode) to ``_w8a8_block_fp8_matmul_hopper`` + ``_reduce_block_fp8_split_k`` without patching SGLang source.
+- SWA radix insert full span (``SWAComponent.prepare_for_caching_req``): when a conversation partially matches an
+  older SWA-less Full-KV prefix, SGLang returned ``effective_cache_len`` and truncated the radix insert at the matched
+  prefix, creating a fixed point so later turns never extended the tree (Lsglang #37). XTier keeps the
+  ``swa_branching_seqlen`` boundary metadata and returns ``None`` so the insert spans the full request.
+- Startup eager draft kernel & QSA draft-graph metadata prewarm (``EagleDraftWorker._capture_cuda_graphs``,
+  ``XTIER_DRAFT_PREWARM=1`` default): ``prepare_for_draft``, ``build_chain_tree``, ``prepare_draft_extend_*``,
+  ``prepare_verify_commit_outputs``, and QSA's multi-step draft-graph metadata run outside CUDA graphs and specialize
+  on batch size / mamba track interval; first served hit pays ~500 ms ``cuModuleLoadData`` and can wedge TP > 1 while
+  peer ranks wait in collectives (Lsglang 1.7.7). Prewarming at init with ``accept_lens = ones`` and
+  ``accept_index = zeros`` loads every specialization without touching ``eagle.py`` or triggering the ``accepted - 1``
+  unmapped-page read (``NVRM Xid 31``).
 """
 
 import ctypes
@@ -86,6 +97,8 @@ MM_PROC_WORKERS = (
 ACT_QUANT = 'sglang.kernels.ops.quantization.act_quant_triton.act_quant'
 JIT_DEPS = 'sglang.kernels.jit.utils.compile.cache._to_entries'
 BLOCK_FP8_TRITON = 'sglang.kernels.ops.gemm.fp8_kernel.w8a8_block_fp8_matmul_triton'
+SWA_PREPARE_CACHE = 'sglang.srt.mem_cache.unified_cache.components.swa.SWAComponent.prepare_for_caching_req'
+EAGLE_CAPTURE_GRAPHS = 'sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker._capture_cuda_graphs'
 MXFP8_LARGE_TILE, MXFP8_LARGE_ROWS = 4, 256   # SM120 CUTLASS MXFP8: tactic 4 = 128 x 128 x 128, no A/B swap
 _MADV_PAGEOUT = 21
 READ_AHEAD_FILES, READ_AHEAD_MAX = 2, 16 << 30
@@ -536,6 +549,233 @@ def _mm_auto_workers(original, self, *args, **kwargs):
     return min(n, budget)
 
 
+
+def _swa_prepare_for_caching_req(original, self, req, insert_params, token_ids_len, is_finished):
+    """Keep SWA branch boundary metadata without truncating radix insert keys (Lsglang #37)."""
+    ret = original(self, req, insert_params, token_ids_len, is_finished)
+    if ret is not None and getattr(insert_params, 'swa_branching_seqlen', None) is not None:
+        return None
+    return ret
+
+
+def _draft_prewarm_batch_sizes(max_running_requests) -> tuple[int, ...]:
+    """Batch sizes whose Triton specializations diverge (1, <=16 exhaustive for derived bs*width, then powers of 2)."""
+    cap = int(max_running_requests or 0)
+    if cap <= 0:
+        return (1,)
+    if cap <= 16:
+        return tuple(range(1, cap + 1))
+    return tuple(sorted(set(range(1, 17)) | {p for p in (32, 64, 128, 256) if p <= cap}))
+
+
+def _draft_track_intervals(page_size, server_args=None) -> tuple[int, ...]:
+    """Live ``mamba_track_interval`` constexpr values for ``prepare_verify_commit_outputs``."""
+    if not page_size:
+        return (0,)
+    intervals = {0}
+    try:
+        from sglang.srt.runtime_context import mamba_track_grid
+        grid_val = int(mamba_track_grid(int(page_size)))
+        if grid_val > 0:
+            intervals.add(grid_val)
+    except Exception:
+        try:
+            import math
+            from sglang.srt.runtime_context import get_server_args, mamba_cache_chunk_size
+            grid = math.lcm(int(mamba_cache_chunk_size()), int(page_size))
+            args = server_args if server_args is not None else get_server_args()
+            track = int(getattr(args, 'mamba_track_interval', 0) or 0)
+            val = int(math.lcm(grid, track)) if track > 0 else int(grid)
+            if val > 0:
+                intervals.add(val)
+        except Exception:
+            pass
+    return tuple(sorted(intervals))
+
+
+def _prewarm_eager_draft_kernels(
+    req_to_token,
+    *,
+    topk: int,
+    num_steps: int,
+    num_draft_tokens,
+    batch_sizes=(1,),
+    track_intervals=(0,),
+) -> int:
+    """Device-load eager draft-step Triton kernels before serving, using accept_lens=1 to avoid OOB column -1 reads."""
+    import torch
+    if topk != 1 or req_to_token is None or not req_to_token.is_cuda:
+        return 0
+    from sglang.kernels.ops.speculative.cache_locs import assign_draft_cache_locs_contiguous_func
+    from sglang.kernels.ops.speculative.eagle import (
+        build_chain_tree,
+        prepare_draft_extend_layout,
+        prepare_draft_extend_lengths,
+        prepare_verify_commit_outputs,
+    )
+
+    device = req_to_token.device
+    steps = int(num_steps)
+    width = int(num_draft_tokens) if num_draft_tokens else steps + 1
+    if steps <= 0 or width <= 0:
+        return 0
+    window_variants = sorted({steps, width})
+    launches = 0
+
+    for bs in sorted({max(1, int(b)) for b in batch_sizes}):
+        if req_to_token.shape[1] <= bs * max(window_variants) + 1:
+            continue
+        req_pool_indices = torch.zeros(bs, dtype=torch.int64, device=device)
+        seq_lens = torch.zeros(bs, dtype=torch.int64, device=device)
+
+        for window_cols in window_variants:
+            out_cache_loc = torch.empty((bs * topk * window_cols,), dtype=torch.int64, device=device)
+            positions = torch.empty((bs * topk,), dtype=torch.int64, device=device)
+            for mrope in (None, torch.zeros((3, bs), dtype=torch.int64, device=device)):
+                assign_draft_cache_locs_contiguous_func(
+                    req_pool_indices,
+                    req_to_token,
+                    seq_lens,
+                    out_cache_loc,
+                    topk,
+                    window_cols,
+                    positions=positions,
+                    mrope=mrope,
+                )
+                launches += 1
+
+        for bonus_dtype in (torch.int32, torch.int64):
+            for draft_dtype in (torch.int64, torch.int32):
+                for with_mrope in (True, False):
+                    build_chain_tree(
+                        torch.zeros((bs,), dtype=bonus_dtype, device=device),
+                        torch.zeros((bs, steps), dtype=draft_dtype, device=device),
+                        seq_lens,
+                        None,
+                        req_pool_indices=req_pool_indices,
+                        req_to_token=req_to_token,
+                        with_mrope=with_mrope,
+                    )
+                    launches += 1
+
+        prepare_draft_extend_lengths(seq_lens, width, 0)
+        launches += 1
+        for with_mrope in (True, False):
+            prepare_draft_extend_layout(seq_lens, width, with_mrope)
+            launches += 1
+
+        # accept_lens=ones (never zeros) keeps (accepted - 1) == 0 in-bounds under VMM page-aligned allocations,
+        # while compiling the identical Triton cubin as served steps (accept_lens is a tensor pointer, not constexpr).
+        predict = torch.zeros((bs * width,), dtype=torch.int32, device=device)
+        accept_index = torch.zeros((bs, width), dtype=torch.int32, device=device)
+        accept_lens = torch.ones((bs,), dtype=torch.int32, device=device)
+        for interval in track_intervals:
+            prepare_verify_commit_outputs(
+                predict,
+                accept_index,
+                accept_lens,
+                seq_lens,
+                num_draft_tokens=width,
+                mamba_track_interval=int(interval),
+            )
+            launches += 1
+
+    return launches
+
+
+def _prewarm_qsa_draft_graph_metadata(draft_attn_backend) -> int:
+    """Device-load QSA multi-step draft-graph metadata kernels on cloned buffers so live graph state stays intact."""
+    import torch
+    if draft_attn_backend is None or not hasattr(draft_attn_backend, '_draft_graph_metadata_args'):
+        return 0
+    attn_backends = getattr(draft_attn_backend, 'attn_backends', None)
+    if not attn_backends:
+        return 0
+    first = attn_backends[0]
+    req_to_token = getattr(first, 'req_to_token', None)
+    graph_meta = getattr(first, '_cuda_graph_metadata', None)
+    if req_to_token is None or not req_to_token.is_cuda or not graph_meta:
+        return 0
+
+    from sglang.srt.layers.attention.qsa.graph_metadata import (
+        launch_draft_graph_metadata,
+        prepare_draft_graph_metadata,
+    )
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    device = req_to_token.device
+    buckets = sorted(bs for mode, bs in graph_meta if mode == ForwardMode.DECODE)
+    launches = 0
+    for bs in buckets:
+        try:
+            metadata = tuple(b._cuda_graph_metadata[(ForwardMode.DECODE, bs)] for b in attn_backends)
+            args = prepare_draft_graph_metadata(
+                metadata,
+                first.req_to_token,
+                metadata[0].indexer_metadata.token_to_kv_pool,
+            )
+        except (KeyError, AttributeError):
+            continue
+        buffers, r2t, row_stride, max_pages, ratio, full_page = args
+        cloned = tuple(tuple(buf.clone() for buf in group) for group in buffers)
+        launch_draft_graph_metadata(
+            (cloned, r2t, row_stride, max_pages, ratio, full_page),
+            torch.zeros(bs, dtype=torch.int64, device=device),
+            torch.zeros(bs, dtype=torch.int64, device=device),
+            bs,
+            0,
+        )
+        launches += 1
+    return launches
+
+
+def _eagle_capture_cuda_graphs(original, self, *args, **kwargs):
+    import torch
+    if getattr(self, 'topk', 0) == 1 and torch.cuda.is_available():
+        try:
+            draft_runner = getattr(self, 'draft_runner', None)
+            target_worker = getattr(self, 'target_worker', None)
+            target_runner = getattr(target_worker, 'model_runner', None) if target_worker is not None else None
+            server_args = getattr(draft_runner, 'server_args', None)
+            alloc = getattr(target_runner, 'token_to_kv_pool_allocator', None)
+            page_size = getattr(alloc, 'page_size', None)
+            req_to_token = getattr(getattr(draft_runner, 'req_to_token_pool', None), 'req_to_token', None)
+            max_reqs = getattr(server_args, 'max_running_requests', None)
+            track_intervals = _draft_track_intervals(page_size, server_args=server_args)
+            launches = _prewarm_eager_draft_kernels(
+                req_to_token,
+                topk=int(self.topk),
+                num_steps=int(getattr(self, 'speculative_num_steps', 0)),
+                num_draft_tokens=getattr(self, 'speculative_num_draft_tokens', None),
+                batch_sizes=_draft_prewarm_batch_sizes(max_reqs),
+                track_intervals=track_intervals,
+            )
+            if launches:
+                logger.info(
+                    'xtier: prewarmed %d eager draft kernel launch(es) (steps=%s, draft_tokens=%s, '
+                    'max_reqs=%s, page_size=%s, track_intervals=%s)',
+                    launches,
+                    getattr(self, 'speculative_num_steps', None),
+                    getattr(self, 'speculative_num_draft_tokens', None),
+                    max_reqs,
+                    page_size,
+                    track_intervals,
+                )
+        except Exception as e:
+            logger.warning('xtier: eager draft kernel prewarm skipped: %s', e)
+
+    ret = original(self, *args, **kwargs)
+
+    if torch.cuda.is_available():
+        try:
+            qsa_launches = _prewarm_qsa_draft_graph_metadata(getattr(self, 'draft_attn_backend', None))
+            if qsa_launches:
+                logger.info('xtier: prewarmed %d QSA draft-graph metadata launch(es)', qsa_launches)
+        except Exception as e:
+            logger.warning('xtier: QSA draft-graph metadata prewarm skipped: %s', e)
+    return ret
+
+
 def install_serving(registry, hook_type) -> list[str]:
     """Fixes of the process that serves the API."""
     import importlib.util
@@ -583,4 +823,11 @@ def install(registry, hook_type) -> list[str]:
     if importlib.util.find_spec('sglang.kernels.ops.gemm.fp8_kernel') is not None:
         registry.register(BLOCK_FP8_TRITON, _w8a8_block_fp8_sm89, hook_type.AROUND)
         fixes.append('sm89-block-fp8-split-k')
+    if importlib.util.find_spec('sglang.srt.mem_cache.unified_cache.components.swa') is not None:
+        registry.register(SWA_PREPARE_CACHE, _swa_prepare_for_caching_req, hook_type.AROUND)
+        fixes.append('swa-radix-full-insert')
+    if (importlib.util.find_spec('sglang.srt.speculative.eagle_worker_v2') is not None
+            and os.environ.get('XTIER_DRAFT_PREWARM', '1') != '0'):
+        registry.register(EAGLE_CAPTURE_GRAPHS, _eagle_capture_cuda_graphs, hook_type.AROUND)
+        fixes.append('eagle-draft-prewarm')
     return fixes

@@ -132,7 +132,7 @@ def detect_scopes(files):
             scopes.add('kvstore')
         if f.startswith(('xtier/console/', 'configs/')):
             scopes.add('console')
-        if f.startswith('xtier/platform/'):
+        if f.startswith('xtier/platform'):
             scopes.add('platform')
         if f.startswith(('xtier/packs/inkling2/', 'configs/inkling2-')):
             scopes.add('inkling2')
@@ -208,6 +208,7 @@ def select_tier1_tests(scopes):
         add('fp8_encode_check', [py, 'tests/fp8_encode_check.py'])
         add('sm89_block_fp8_check', [py, 'tests/sm89_block_fp8_check.py'])
         add('cpu_image_check', [py, 'tests/cpu_image_check.py'])
+        add('radix_draft_fixes_check', [py, 'tests/radix_draft_fixes_check.py'])
     return ordered
 
 

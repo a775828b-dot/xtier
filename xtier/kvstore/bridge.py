@@ -19,11 +19,22 @@ device KV pool properties and auto-retires (no-op) if upstream SGLang adds nativ
      In nested-cgroup containers (e.g. Colab / Docker) where ``/proc/self/cgroup`` contains relative ``..`` segments,
      SGLang's ``_cgroup_headroom`` raises ``ValueError`` which ``available_host_memory_bytes`` does not catch; catch
      ``ValueError`` and return ``None`` so host memory sizing falls back cleanly to ``psutil.virtual_memory().available``.
+  6. Mixed device/host HiCache prefix promise fix (``FullComponent.finalize_match_result_in_tree_core``):
+     Under ``write_through``, a node still resident on GPU (``cd.value is not None``) can also carry ``cd.host_value``.
+     Counting such nodes in ``kv_host_hit`` over-promises H2D load-back tokens (``LOAD_BACK`` stops at the first
+     device-resident node) and aborts the request / crashes the scheduler (Lsglang #40). Count only evicted nodes
+     (``cd.value is None and cd.host_value is not None``).
+  7. Python ``TreeCore`` pin while unpatched Rust ``full.rs`` would bypass hook #6
+     (``tree_core_registry.resolve_tree_core_backend``):
+     When ``XTIER_KV_OFFLOAD=1`` and ``FullComponent`` still lacks the ``value is None`` guard, route ``rust`` to
+     ``python`` so environments with ``cargo``/prebuilt ``sglang_radix_tree`` cannot bypass hook #6 via ``full.rs``.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+import re
 from typing import Any
 
 import torch
@@ -36,6 +47,30 @@ _ASSEMBLER = 'sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler'
 _SPEC_BASE = 'sglang.srt.speculative.base_spec_worker'
 _KV_BUILDER = 'sglang.srt.mem_cache.kv_cache_builder'
 _HOST_MEM = 'sglang.srt.mem_cache.host_memory'
+_FULL_COMPONENT = 'sglang.srt.mem_cache.unified_cache.components.full'
+_TREE_CORE_REGISTRY = 'sglang.srt.mem_cache.unified_cache.tree_core_registry'
+
+
+def _source_needs_full_host_hit_fix(fn: Any) -> bool:
+    """Return True when FullComponent.finalize_match_result_in_tree_core omits the ``value is None`` guard."""
+    target = fn
+    seen: set[int] = set()
+    while hasattr(target, '__wrapped__') and id(target) not in seen:
+        seen.add(id(target))
+        target = target.__wrapped__
+    try:
+        fn_src = inspect.getsource(target)
+    except (OSError, TypeError):
+        return True
+    return re.search(r'\.value\s+is\s+None\b', fn_src) is None
+
+
+def _full_component_needs_host_hit_fix() -> bool:
+    try:
+        from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    except Exception:
+        return True
+    return _source_needs_full_host_hit_fix(FullComponent.finalize_match_result_in_tree_core)
 
 
 # ----- Generic geometry & coverage inspection helpers -----------------------
@@ -704,9 +739,47 @@ def install(registry, hook_type) -> list[str]:
             )
             return None
 
+    def around_full_finalize_match(original_fn, self, result, params, value_chunks, best_value_len):
+        if not _source_needs_full_host_hit_fix(original_fn):
+            return original_fn(self, result, params, value_chunks, best_value_len)
+        ct = self.component_type
+        kv_host_hit = 0
+        node = result.best_match_node
+        root_node = self.tree_core.root_node
+        while node is not result.last_device_node and node is not root_node:
+            cd = node.component_data[ct]
+            if cd.value is None and cd.host_value is not None:
+                kv_host_hit += len(cd.host_value)
+            node = node.parent
+        if kv_host_hit > 0:
+            return result._replace(
+                host_hit_length=max(result.host_hit_length, kv_host_hit)
+            )
+        return result
+
+    def around_resolve_tree_core_backend(original_fn, name, params):
+        backend = original_fn(name, params)
+        if backend == 'rust' and _full_component_needs_host_hit_fix():
+            logger.info(
+                'xtier kvstore bridge: pinning unified radix TreeCore to python so mixed '
+                'device/host HiCache prefix fix applies (bypassing unpatched Rust full.rs)'
+            )
+            return 'python'
+        return backend
+
     registry.register(f'{_SPEC_BASE}.BaseSpecWorker._build_hicache_draft_plan', around_draft_plan, hook_type.AROUND)
     registry.register(f'{_ASSEMBLER}.build_kv_host_pool', around_build_kv_host_pool, hook_type.AROUND)
     registry.register(f'{_ASSEMBLER}.attach_hybrid_pool_to_unified_cache', after_attach_hybrid_pool, hook_type.AFTER)
     registry.register(f'{_KV_BUILDER}.maybe_register_hicache_draft', after_register_draft_pools, hook_type.AFTER)
     registry.register(f'{_HOST_MEM}._cgroup_memory_headroom', around_cgroup_memory_headroom, hook_type.AROUND)
+    registry.register(
+        f'{_FULL_COMPONENT}.FullComponent.finalize_match_result_in_tree_core',
+        around_full_finalize_match,
+        hook_type.AROUND,
+    )
+    registry.register(
+        f'{_TREE_CORE_REGISTRY}.resolve_tree_core_backend',
+        around_resolve_tree_core_backend,
+        hook_type.AROUND,
+    )
     return ['kvstore.bridge']
