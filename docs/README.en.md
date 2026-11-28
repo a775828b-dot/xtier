@@ -86,10 +86,10 @@ Measured in `tok/s`. Baseline = console "packs off" (upstream SGLang + XTier hyb
 
 | Mode | Decode bs=1 | Decode bs=2 agg | 64K cold prefill | 256K cold prefill | 500K cold prefill | 500K cached decode |
 |---|---:|---:|---:|---:|---:|---:|
-| **XTier + packs (default)** | **74.7** (r0 81.7) | **78.4** | **3,986** | **2,497** | **1,627** | **46.0** (peak 55.1) |
+| **XTier + packs (default)** | **74.7** (r0 81.7) | **81.1** (steady 89.8) | **3,986** | **2,514** | **1,627** | **56.0** |
 | Baseline (packs off) | 47.9 | ~43 | 1,591 | 1,217 | OOM | OOM |
 
-Packs vs baseline: **2.41× / 2.02×** faster 64K / 256K prefill, **+56% / +82%** faster `bs=1` / `bs=2` decode, and NVFP4 KV (6.75 GiB) unlocks 500K. 2-round `agent_bench` (64K→513K): **66.2 tok/s** long replies (66.3 overall, accept 4.02). Accuracy: 13-seg `ΔNLL +0.00423` / `KL 0.00938`, copy `0/8`, 256K/500K needles `5/5`. Plan A+/B2 & trace anatomy: [report](reports/2026-11-25-inkling2-small.md) (ZH).
+Packs vs baseline: **2.41× / 2.07×** faster 64K / 256K prefill, **+56% / +89%** faster `bs=1` / `bs=2` decode, and NVFP4 KV (6.75 GiB) unlocks 500K. With Universal Recall enabled, warm round-2 `agent_bench` long replies reach **73.6 tok/s** (`54.0 ms/step`, accept 4.93 / `74.8 tok/s` at 384K, `3,793` Recall tokens landed; prior 2-round mean 66.2 tok/s). Accuracy: 13-seg `ΔNLL +0.00423` / `KL 0.00938`, copy `0/8`, 256K/500K needles `5/5`. Plan A+/B2 & trace anatomy: [report](reports/2026-11-25-inkling2-small.md) (ZH).
 
 ### Hunyuan-4-Flash NVFP4
 
@@ -97,23 +97,24 @@ Packs vs baseline: **2.41× / 2.02×** faster 64K / 256K prefill, **+56% / +82%*
 
 | Mode | Decode bs=1 | Decode bs=4 agg | 100K needle prefill | 4×128K prefill | 876K–950K prefill | Long cached decode |
 |---|---:|---:|---:|---:|---:|---:|
-| **XTier + packs + DFly2 (default)** | **92.1** (steady 124–152) | **186.8–190.4** (steady 209–226) | 3,630 (PASS) | 3,565 | 3,454 (876K) | **87.5–110.8** (876K) |
+| **XTier + packs + DFly2 (default)** | **94.0** (mean 89.8, steady 124–152) | **194.4** (steady 225.5) | 3,630 (PASS) | 3,565 | 3,454 (876K) | **87.5–110.8** (876K) |
 | Baseline (FP8 KV, BF16 dense) | 55–56 | 148–162 | 3,657 (PASS) | — | 3,084 (950K) | 43.8 (950K) |
 
-Copy `0/4` (299–306 tok/s at conc=2), 100% lossless PPL, 0 OOM retries at 876K.
+In-graph DFly2 Universal Recall (`908` tokens landed), copy `0/4` (299–306 tok/s at conc=2), 100% lossless PPL, 0 OOM retries at 876K.
 
 ### DeepSeek V4.1 Flash 1017
 
-2-round [agent_bench.py](../bench/agent_bench.py) 64K→500K coding agent (packs measured 2026-11-24 on SGLang `4ce41378f9`):
+2-round [agent_bench.py](../bench/agent_bench.py) 64K→500K coding agent (packs measured 2026-11-28 `v0.1.14` on SGLang `4ce41378f9`, `48K / 37 slots + in-place mHC + 1.6 GiB torch allocator guard + Universal Recall`):
 
 | DSpark | Round | Cold prefill 64K | Cold prefill 500K | Decode (long replies) | Acceptance | Per step |
 |---|:-:|---:|---:|---:|---:|---:|
-| **XTier + packs** | 1 | 5,969 | **9,038** | 156.6 | 4.64 | 29.6 ms |
-|  | 2 | **7,967** | **9,023** | 154.7 | 4.65 | 30.1 ms |
+| **XTier + packs** | 1 | 3,126* | **8,948** | 152.3 | 4.57 | 30.0 ms |
+|  | 2 | **8,024** | **9,103** | **158.0** | **4.65** | **29.4 ms** |
 | **XTier + packs, 4 concurrent agg** | — | — | — | **268** | 3.40 | 51.0 ms |
 | Baseline (packs off) | 1 | 3,318 | 3,627 | 65.5 | 3.25 | 50.9 ms |
 
-Packs vs baseline: **41%** faster per step, **+110% / +149%** faster 64K / 500K cold prefill (100% lossless PPL 1.2001 vs 1.1996, 0 body copy errors); all 127 requests 163.9 tok/s, 2-way 195.8 tok/s, 4-way rewrite/edit 332–382 tok/s. See [9K+ prefill report](reports/2026-11-19-lossless-9k-prefill.md) and [Recall report](reports/2026-11-18-lossless-prefill-recall.md).
+*\*Round 1 64K includes first-request JIT/CUTLASS compile (`--skip-server-warmup`); 256K–500K in R1 reach `8,889–8,973`, and warm R2 hits `8,024` at 64K and `9,082 / 9,096 / 9,103 tok/s` at 256K / 384K / 500K.*
+Packs vs baseline: **42%** faster per step, **+142% / +151%** faster warm 64K / 500K cold prefill (100% lossless PPL 3.6304, 0 body copy errors); all 169 requests jump to **174.0 tok/s** (accept 4.81, **27.6 ms/step**, up from 163.9 tok/s / 28.9 ms), peak VRAM across full 500K stays at **69.52 GiB** (`1.60 GiB` usable free, 0 allocator OOM warnings); 2-way 187.2–195.8 tok/s, 4-way rewrite/edit 332–382 tok/s. See [9K+ prefill report](reports/2026-11-19-lossless-9k-prefill.md) and [Recall report](reports/2026-11-18-lossless-prefill-recall.md).
 
 ### Qwen3.8 Flash Next
 
@@ -123,17 +124,17 @@ Packs vs baseline: **41%** faster per step, **+110% / +149%** faster 64K / 500K 
 |  | 2 | 5,610 | 5,150 | 207.2 | 2.68 | 13.0 ms |
 | Baseline (packs off) | 1 | 5,319 | 4,078 | 139.5 | 2.13 | 15.2 ms |
 
-Packs vs baseline: 11% faster per step, 6% / 27% faster cold prefill (NVFP4 KV + auto planner, 0 copy errors).
+Packs vs baseline: 11% faster per step, 6% / 27% faster cold prefill (NVFP4 KV + auto planner, 0 copy errors). With `v0.1.14` Universal Recall enabled, same-build A/B gains **+5.1–7.4%** and 2026-11-28 `agent_bench` round-1 long replies rise to **194.2 tok/s** (`13.1 ms/step`, 384K edit steps up to `213–242 tok/s`, `4,078` Recall tokens landed).
 
 ### GLM-5.3 Flash
 
 | EAGLE | Round | Cold prefill 64K | Cold prefill 500K | Decode (long replies) | Acceptance | Per step |
 |---|:-:|---:|---:|---:|---:|---:|
-| **XTier + packs** | 1 | 2,648 | 2,640 | 96.3 | 2.54 | 26.4 ms |
-|  | 2 | 2,715 | 2,635 | 98.2 | 2.66 | 27.1 ms |
+| **XTier + packs** | 1 | 2,416 | 2,505 | **96.9** | 2.52 | **26.0 ms** |
+|  | 2 | 2,533 | 2,507 | **102.9** | **2.91** | 28.3 ms |
 | Baseline (packs off) | 1 | 2,663 | 2,518 | 76.8 | 2.61 | 34.4 ms |
 
-Packs vs baseline: 22% faster per step, 1% / 5% faster cold prefill (FP8 dense + elastic slots, PPL 3.987 → 3.998, 0 copy errors).
+Packs vs baseline (2026-11-28 `v0.1.14` on SGLang `4ce41378f9`, Universal Recall + lossless EAGLE rejection sampling): 2-round long replies cross 100 tok/s at **101.0 tok/s** (accept `2.78`, **+31.5%** over baseline, 20–24% faster per step), all 116 requests **105.5 tok/s** (accept `2.94`, tool calls `149–241 tok/s`), FP8 dense + elastic slots, 0 copy errors.
 
 ### MiniMax-M3.1-Flash (paused)
 
@@ -157,6 +158,7 @@ When multi-session switching or concurrency overflows the GPU KV pool, XTier sup
 
 ## Recent changes
 
+- **2026-11-28 (v0.1.14)**: (1) **Universal Context Recall & zero-sync GPU `propose_after`** (`xtier/packs/speculative/recall/`): refactors Recall out of `deepseek_v4` into a shared subsystem serving all three speculative worker families (DSpark / EAGLE / in-graph DFly2), enabled by default (`XTIER_RECALL=1`) across Qwen3.8, GLM-5.3, Hy4-Flash, Inkling-2, MiniMax, and DS4.1 with 100% lossless target verification; (2) **DeepSeek V4.1 mHC prefill in-place writeback & dual VRAM guard**: adds fused Triton `mhc_post_combine_norm_prefill_inplace` (`XTIER_DS_MHC_INPLACE=1`, saving `1.56 GiB` live 48K peak), fixes `xtier/cache/elastic.py` monotonic predict lower-bound cliff, and adds a `0.009 ms` dynamic PyTorch allocator cap (`XTIER_CACHE_ELASTIC_TORCH_GUARD_GIB=1.6`, auto-relaxed on true OOM), raising DS4.1 defaults from `48K/35, 32K/43` to `48K/37, 32K/44` while keeping full-500K peak at `69.52 GiB` (`1.60 GiB` usable free, 0 OOM warnings); (3) **300W official benchmark refresh**: DS4.1 `agent_bench` all 169 requests `163.9 → 174.0 tok/s` (`27.6 ms/step`, R2 long `158.0`, 64K/500K prefill `8,024 / 9,103`), GLM-5.3 long replies `97.6 → 101.0 tok/s` (all `105.5`), Inkling-2 `bs=2` `78.4 → 81.1` (steady `89.8`) & warm agent `73.6 tok/s`, Hy4-Flash `bs=4` `186.8–190.4 → 194.4` (steady `225.5`).
 - **2026-11-28 (v0.1.13)**: adds three zero-patch SGLang stability & cold-start fixes: (1) HiCache mixed device/host prefix promise guard under `XTIER_KV_OFFLOAD=1` (counts only evicted nodes and pins Python `TreeCore` until upstream fixes Rust `full.rs`); (2) SWA radix full-span insert fix (`SWAComponent.prepare_for_caching_req`) preventing prefix-cache freeze after partial SWA-less matches; (3) startup eager draft-step kernel and cloned-buffer QSA draft-graph metadata prewarm (`XTIER_DRAFT_PREWARM=1` default, eliminating first-step ~500 ms `cuModuleLoadData` stalls and TP>1 deadlocks).
 - **2026-11-26 (v0.1.12)**: bug fixes.
 - **2026-11-26 (v0.1.11)**: adds **generic multi-drive NVMe L2 KV cache offload** (`XTIER_KV_OFFLOAD=1`, **off by default**, opt-in `100 / 200 GiB` in console): `O_DIRECT + io_uring` (`28.19 GB/s` write / `40.28 GB/s` read / `35.79 GB/s` E2E on 4×9100 PRO), zero SGLang patches, model-agnostic across DS4.1 / GLM-5.3 / Hy4-Flash / Qwen3.8 (**99.2–100%** hit, **9–32×** TTFT) and verified with real `dsh` on DS4.1 1M pool (multi-session eviction, multimodal images + anti-collision, auto-compaction); also ships 11-25 lossless prefill speedups and PR #20 (`cuMemUnmap` device drain). [Report (ZH)](reports/2026-11-26-nvme-kv-offload.md)
