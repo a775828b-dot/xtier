@@ -36,8 +36,13 @@ def _alloc_memory_pool(original, self, *args, **kwargs):
 
 
 def _verify(original, self, batch, *args, **kwargs):
-    from xtier.packs.speculative import truncate
-    truncated = truncate.apply(batch, self.topk, TRUNCATE_Q)
+    from xtier.packs.speculative import recall, truncate
+    recall.on_eagle_verify(self, batch)
+    truncated = (
+        truncate.apply(batch, self.topk, TRUNCATE_Q)
+        if os.environ.get('XTIER_SPEC_HOT_RS', '1') != '0' and TRUNCATE_Q > 0
+        else False
+    )
     try:
         return original(self, batch, *args, **kwargs)
     finally:
@@ -70,13 +75,14 @@ def _renorm(original, next_token_logits, sampling_info, use_rejection_sampling, 
 
 
 def install(registry, hook_type):
-    from xtier.packs.speculative import dspark_truncate
+    from xtier.packs.speculative import dspark_truncate, recall
 
     dspark_truncate.install(registry, hook_type)
-    if os.environ.get('XTIER_SPEC_HOT_RS', '1') == '0':
-        return
-    registry.register(f'{WORKER}.alloc_memory_pool', _alloc_memory_pool, hook_type.AROUND)
-    registry.register(PROPOSAL, _proposal, hook_type.AROUND)
-    registry.register(RENORM, _renorm, hook_type.AROUND)
-    if TRUNCATE_Q > 0:
+    recall.install(registry, hook_type)
+    hot_rs = os.environ.get('XTIER_SPEC_HOT_RS', '1') != '0'
+    if hot_rs:
+        registry.register(f'{WORKER}.alloc_memory_pool', _alloc_memory_pool, hook_type.AROUND)
+        registry.register(PROPOSAL, _proposal, hook_type.AROUND)
+        registry.register(RENORM, _renorm, hook_type.AROUND)
+    if (hot_rs and TRUNCATE_Q > 0) or recall.enabled():
         registry.register(f'{SPEC_WORKER}.verify', _verify, hook_type.AROUND)

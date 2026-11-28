@@ -149,6 +149,8 @@ class Governor:
         self.row = [sum(a[0].numel() for a in p.arena) for p in pools]   # bytes of one slot per layer
         self.level = sum(self.row)   # bytes of one extra slot in every layer
         self.reserve = _env('XTIER_CACHE_ELASTIC_RESERVE_GIB', 2.0) * GIB
+        self.torch_guard = max(0.0, _env('XTIER_CACHE_ELASTIC_TORCH_GUARD_GIB', 0.0)) * GIB
+        self._guard_frac = 1.0
         self.critical = _env('XTIER_CACHE_ELASTIC_CRITICAL_GIB', 1.0) * GIB
         self.margin = _env('XTIER_CACHE_ELASTIC_MARGIN', 1.25)
         self.idle = int(_env('XTIER_CACHE_ELASTIC_IDLE', 32))
@@ -181,14 +183,17 @@ class Governor:
         if ctx is None or tokens < 1:
             return None
         best = None
+        floor = 0
         hm = 0 if draft else max(config.hybrid_prefill_max(), config.gpu_prefill_min())
         for (t, c), n in self.seen.get(draft, {}).items():
             if hm > 0 and (t < hm <= tokens or t < 2048 <= tokens):   # staging regime changes at hm and 2048
                 continue
+            if t <= tokens and c <= ctx and n > floor:
+                floor = n
             f = max(1.0, tokens / t) * max(1.0, ctx / c)
             if f <= self.extrapolate and (best is None or n * f < best):
                 best = n * f
-        return None if best is None else best * self.margin
+        return None if best is None else max(best, floor) * self.margin
 
     @staticmethod
     def _grid(x):
@@ -207,7 +212,10 @@ class Governor:
             return
         seen = self.seen.setdefault(draft, {})
         key = (self._grid(tokens), self._grid(ctx))
-        seen[key] = max(need, seen.pop(key, 0))   # re-inserted: the most recent last
+        # A warm caching allocator on chunk 2+ can report a lower delta than chunk 1's cold reservation;
+        # enforce monotonicity in (tokens, ctx) so a warm later chunk never undercuts an earlier cold peak.
+        lb = max((n for (t, c), n in seen.items() if t <= key[0] and c <= key[1]), default=0)
+        seen[key] = max(need, seen.pop(key, 0), lb)   # re-inserted: the most recent last
         if len(seen) > 1024:   # the oldest goes: a bound lost only makes the predictions more careful
             del seen[next(iter(seen))]
 
@@ -364,6 +372,32 @@ class Governor:
 
     # --- forward hooks ---
 
+    def _device_index(self):
+        return self.device.index if isinstance(self.device, torch.device) else self.device
+
+    def apply_torch_guard(self):
+        """Cap PyTorch's caching allocator so expandable_segments reclaims idle cached segments before
+        consuming the last `torch_guard` bytes of free device memory (protecting non-PyTorch allocations
+        such as Triton JIT, FlashInfer workspaces, and the CUDA driver)."""
+        if self.torch_guard <= 0:
+            return
+        dev = self._device_index()
+        free_now, total_now = torch.cuda.mem_get_info(dev)
+        if total_now <= 0:
+            return
+        reserved_now = torch.cuda.memory_reserved(dev)
+        non_torch_base = max(0, (total_now - free_now) - reserved_now - self.bytes(0, self.extra))
+        budget = total_now - non_torch_base - self.torch_guard
+        if budget <= reserved_now + 2 * GIB:
+            return
+        frac = min(1.0, max(0.1, budget / total_now))
+        if abs(frac - self._guard_frac) >= 0.002:
+            torch.cuda.set_per_process_memory_fraction(frac, dev)
+            self._guard_frac = frac
+            if self.debug:
+                logger.info('xtier elastic cache: torch allocator cap %.3f (%.2f GiB, guard %.2f GiB, non-torch %.2f GiB)',
+                            frac, budget / GIB, self.torch_guard / GIB, non_torch_base / GIB)
+
     def before_alloc(self, tokens, draft, ctx, full=False):
         """A forward that allocates: release what its predicted need and the reserve do not leave free. full: it
         fills its prefill chunk (the prompt goes on in another forward)."""
@@ -371,22 +405,22 @@ class Governor:
         if not draft:
             self.chunking = full
         self._stop_growth()   # before the free memory is read
-        if self.extra <= 0:
-            return
-        what = (f'a forward of {tokens} tokens{" (draft)" if draft else ""} at '
-                f'{"an unknown context" if ctx is None else f"a {ctx}-token context"}')
-        need = self.predict(tokens, draft, ctx)
-        if self.debug:
-            logger.info('xtier elastic cache: %s predicts %s, %.1f GiB free, +%d extra', what,
-                        'nothing' if need is None else f'{need / GIB:.2f} GiB', self.free_bytes() / GIB, self.extra)
-        if need is None:
-            self.release(0, f'{what}, no need seen bounds it')
-            return
-        deficit = need + self.reserve - self.free_bytes()
-        if deficit > 0:
-            deficit = need + self.reserve - self.free_bytes(empty=True)
-        if deficit > 0:
-            self.release(self.keep(deficit), f'{what} (needs {need / GIB:.1f} GiB)')
+        if self.extra > 0:
+            what = (f'a forward of {tokens} tokens{" (draft)" if draft else ""} at '
+                    f'{"an unknown context" if ctx is None else f"a {ctx}-token context"}')
+            need = self.predict(tokens, draft, ctx)
+            if self.debug:
+                logger.info('xtier elastic cache: %s predicts %s, %.1f GiB free, +%d extra', what,
+                            'nothing' if need is None else f'{need / GIB:.2f} GiB', self.free_bytes() / GIB, self.extra)
+            if need is None:
+                self.release(0, f'{what}, no need seen bounds it')
+            else:
+                deficit = need + self.reserve - self.free_bytes()
+                if deficit > 0:
+                    deficit = need + self.reserve - self.free_bytes(empty=True)
+                if deficit > 0:
+                    self.release(self.keep(deficit), f'{what} (needs {need / GIB:.1f} GiB)')
+        self.apply_torch_guard()
 
     def after_decode(self):
         self.since += 1
@@ -498,13 +532,19 @@ def _forward(original, runner, forward_batch, *args, **kwargs):
     retry = False
     try:
         out = original(runner, forward_batch, *args, **kwargs)
-    except Exception as e:   # noqa: BLE001 - only out of memory with extra slots held is handled
-        if not _oom(e) or g.extra <= 0:
+    except Exception as e:   # noqa: BLE001 - only out of memory with extra slots held or guard active is handled
+        if not _oom(e) or (g.extra <= 0 and g._guard_frac >= 1.0):
             raise
         retry = True
     if retry:   # out of the except block: the failed attempt's frames and their tensors are released by now
-        _guarded(g, g.emergency, f'out of memory in a forward of {tokens} tokens', True)
-        g.off = True
+        if g._guard_frac < 1.0:
+            g.torch_guard = 0.0
+            g._guard_frac = 1.0
+            torch.cuda.set_per_process_memory_fraction(1.0, g._device_index())
+            logger.warning('xtier elastic cache: lifted torch allocator cap after OOM in %d-token forward', tokens)
+        if g.extra > 0:
+            _guarded(g, g.emergency, f'out of memory in a forward of {tokens} tokens', True)
+            g.off = True
         torch.cuda.empty_cache()
         out = original(runner, forward_batch, *args, **kwargs)
         logger.error('xtier elastic cache: a forward of %d tokens ran twice: that request\'s results may be off, the '

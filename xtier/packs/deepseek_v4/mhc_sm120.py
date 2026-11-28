@@ -21,6 +21,9 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 MHC_POST = 'sglang.srt.models.deepseek_v4_mhc.post'
+MHC_POST_COMBINE_NORM_PREFILL = (
+    'sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill.mhc_post_combine_norm_prefill'
+)
 MHC_MIX_STATS = 'sglang.srt.models.deepseek_v4_mhc._mix_stats_impl'
 REFRESH_MHC = 'sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayerBase.refresh_mhc_norm_weight_cache'
 AUTOTUNE_PREFILL = 'sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.autotune_prefill_kernels'
@@ -89,14 +92,219 @@ def _mhc_post_exact_kernel(
         tl.store(OUT + (rows64[:, None] * 4 + i) * H + cols[None, :], u, mask=mask)
 
 
-def mhc_post_exact(x: torch.Tensor, residual: torch.Tensor, post_mix: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+def _inplace_enabled() -> bool:
+    return os.environ.get('XTIER_DS_MHC_INPLACE', '1') != '0'
+
+
+def mhc_post_exact(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb: torch.Tensor,
+    *,
+    inplace: bool = False,
+) -> torch.Tensor:
     m, h = x.shape
-    out = torch.empty_like(residual)
+    out = residual if inplace else torch.empty_like(residual)
     bm, bh = 32, 128
     _mhc_post_exact_kernel[(triton.cdiv(m, bm), triton.cdiv(h, bh))](
         x, residual, post_mix, comb, out, m, H=h, BM=bm, BH=bh, num_warps=4, num_stages=2
     )
     return out
+
+
+@triton.jit
+def _post_fma_exact(p, x, c0, r0, c1, r1, c2, r2, c3, r3):
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .f32 acc;
+            mul.rn.f32 acc, $3, $4;
+            fma.rn.f32 acc, $1, $2, acc;
+            fma.rn.f32 acc, $5, $6, acc;
+            fma.rn.f32 acc, $7, $8, acc;
+            fma.rn.f32 $0, $9, $10, acc;
+        }
+        """,
+        constraints='=f,f,f,f,f,f,f,f,f,f,f',
+        args=[p, x, c0, r0, c1, r1, c2, r2, c3, r3],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _comb4_fma_exact(p0, u0, p1, u1, p2, u2, p3, u3):
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .f32 acc;
+            mul.rn.f32 acc, $1, $2;
+            fma.rn.f32 acc, $3, $4, acc;
+            fma.rn.f32 acc, $5, $6, acc;
+            fma.rn.f32 $0, $7, $8, acc;
+        }
+        """,
+        constraints='=f,f,f,f,f,f,f,f,f',
+        args=[p0, u0, p1, u1, p2, u2, p3, u3],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _norm_mul_exact(cf, inv_rms, wf):
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .f32 t;
+            mul.rn.f32 t, $1, $2;
+            mul.rn.f32 $0, t, $3;
+        }
+        """,
+        constraints='=f,f,f,f',
+        args=[cf, inv_rms, wf],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mhc_post_combine_norm_inplace_kernel(
+    X,
+    RES,
+    POST,
+    COMB,
+    PRE,
+    WEIGHT,
+    OUT,
+    M,
+    eps,
+    H: tl.constexpr,
+    BH: tl.constexpr,
+):
+    """Tile-safe in-place prefill mHC post + combine + RMSNorm (saves [M, 4, H] BF16 copy = 1.88 GiB at 48K)."""
+    row = tl.program_id(0).to(tl.int64)
+    if row >= M:
+        return
+    p0 = tl.load(POST + row * 4 + 0)
+    p1 = tl.load(POST + row * 4 + 1)
+    p2 = tl.load(POST + row * 4 + 2)
+    p3 = tl.load(POST + row * 4 + 3)
+    pre0 = tl.load(PRE + row * 4 + 0)
+    pre1 = tl.load(PRE + row * 4 + 1)
+    pre2 = tl.load(PRE + row * 4 + 2)
+    pre3 = tl.load(PRE + row * 4 + 3)
+    c00 = tl.load(COMB + row * 16 + 0)
+    c10 = tl.load(COMB + row * 16 + 4)
+    c20 = tl.load(COMB + row * 16 + 8)
+    c30 = tl.load(COMB + row * 16 + 12)
+    c01 = tl.load(COMB + row * 16 + 1)
+    c11 = tl.load(COMB + row * 16 + 5)
+    c21 = tl.load(COMB + row * 16 + 9)
+    c31 = tl.load(COMB + row * 16 + 13)
+    c02 = tl.load(COMB + row * 16 + 2)
+    c12 = tl.load(COMB + row * 16 + 6)
+    c22 = tl.load(COMB + row * 16 + 10)
+    c32 = tl.load(COMB + row * 16 + 14)
+    c03 = tl.load(COMB + row * 16 + 3)
+    c13 = tl.load(COMB + row * 16 + 7)
+    c23 = tl.load(COMB + row * 16 + 11)
+    c33 = tl.load(COMB + row * 16 + 15)
+
+    x_base = X + row * H
+    r_base = RES + row * 4 * H
+    o_base = OUT + row * H
+
+    sqr_sum = tl.zeros([BH], dtype=tl.float32)
+    for start in tl.static_range(0, H, BH):
+        cols = start + tl.arange(0, BH)
+        xv = tl.load(x_base + cols).to(tl.float32)
+        r0 = tl.load(r_base + 0 * H + cols).to(tl.float32)
+        r1 = tl.load(r_base + 1 * H + cols).to(tl.float32)
+        r2 = tl.load(r_base + 2 * H + cols).to(tl.float32)
+        r3 = tl.load(r_base + 3 * H + cols).to(tl.float32)
+
+        u0_bf = _post_fma_exact(p0, xv, c00, r0, c10, r1, c20, r2, c30, r3).to(tl.bfloat16)
+        u1_bf = _post_fma_exact(p1, xv, c01, r0, c11, r1, c21, r2, c31, r3).to(tl.bfloat16)
+        u2_bf = _post_fma_exact(p2, xv, c02, r0, c12, r1, c22, r2, c32, r3).to(tl.bfloat16)
+        u3_bf = _post_fma_exact(p3, xv, c03, r0, c13, r1, c23, r2, c33, r3).to(tl.bfloat16)
+
+        tl.store(r_base + 0 * H + cols, u0_bf)
+        tl.store(r_base + 1 * H + cols, u1_bf)
+        tl.store(r_base + 2 * H + cols, u2_bf)
+        tl.store(r_base + 3 * H + cols, u3_bf)
+
+        comb_f = _comb4_fma_exact(
+            pre0, u0_bf.to(tl.float32),
+            pre1, u1_bf.to(tl.float32),
+            pre2, u2_bf.to(tl.float32),
+            pre3, u3_bf.to(tl.float32),
+        ).to(tl.bfloat16)
+        tl.store(o_base + cols, comb_f)
+        cf = comb_f.to(tl.float32)
+        sqr_sum += cf * cf
+
+    mean = tl.sum(sqr_sum, axis=0) / float(H)
+    inv_rms = tl.rsqrt(mean + eps)
+
+    for start in tl.static_range(0, H, BH):
+        cols = start + tl.arange(0, BH)
+        cf = tl.load(o_base + cols).to(tl.float32)
+        wf = tl.load(WEIGHT + cols).to(tl.float32)
+        tl.store(o_base + cols, _norm_mul_exact(cf, inv_rms, wf).to(tl.bfloat16))
+
+
+def mhc_post_combine_norm_prefill_inplace(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    pre: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+):
+    m, h = x.shape
+    out = torch.empty_like(x)
+    _mhc_post_combine_norm_inplace_kernel[(m,)](
+        x, residual, post, comb, pre, weight, out, m, float(eps), H=h, BH=1024, num_warps=8
+    )
+    return residual, out
+
+
+def _post_combine_norm_prefill_hook(original, x, residual, post, comb, pre, weight, eps):
+    if (
+        _inplace_enabled()
+        and torch.version.hip is None
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+        and x.dim() == 2
+        and 4096 <= x.shape[0] <= 65536
+        and x.shape[1] == 5120
+        and x.dtype == torch.bfloat16
+        and residual.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and post.dtype == torch.float32
+        and comb.dtype == torch.float32
+        and pre.dtype == torch.float32
+        and residual.shape == (x.shape[0], 4, 5120)
+        and post.shape == (x.shape[0], 4)
+        and pre.shape == (x.shape[0], 4)
+        and comb.shape == (x.shape[0], 4, 4)
+        and weight.shape == (5120,)
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and post.is_contiguous()
+        and comb.is_contiguous()
+        and pre.is_contiguous()
+        and weight.is_contiguous()
+        and residual.data_ptr() != x.data_ptr()
+    ):
+        return mhc_post_combine_norm_prefill_inplace(x, residual, post, comb, pre, weight, eps)
+    return original(x, residual, post, comb, pre, weight, eps)
 
 
 def _post_hook(original, cfg, x, residual, post_mix, comb):
@@ -119,7 +327,8 @@ def _post_hook(original, cfg, x, residual, post_mix, comb):
         and post_mix.is_contiguous()
         and comb.is_contiguous()
     ):
-        return mhc_post_exact(x, residual, post_mix, comb)
+        inplace = _inplace_enabled() and not torch.cuda.is_current_stream_capturing()
+        return mhc_post_exact(x, residual, post_mix, comb, inplace=inplace)
     return original(cfg, x, residual, post_mix, comb)
 
 
@@ -219,6 +428,8 @@ def install(registry, hook_type):
     cap = torch.cuda.get_device_capability()
     if os.environ.get('XTIER_DS_MHC_POST_TRITON', '1') != '0' and cap[0] >= 8:
         registry.register(MHC_POST, _post_hook, hook_type.AROUND)
+    if _inplace_enabled() and cap[0] >= 10:
+        registry.register(MHC_POST_COMBINE_NORM_PREFILL, _post_combine_norm_prefill_hook, hook_type.AROUND)
     if os.environ.get('XTIER_DS_MHC_BF16X3', '1') != '0' and cap == (12, 0):
         registry.register(REFRESH_MHC, _refresh_mhc_hook, hook_type.AROUND)
         registry.register(MHC_MIX_STATS, _mix_stats_hook, hook_type.AROUND)

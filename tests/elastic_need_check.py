@@ -48,4 +48,45 @@ rng = random.Random(0)
 for _ in range(5000):
     g.learn(rng.randint(1, 16384), True, GIB, rng.randint(1, 524288))
 assert len(g.seen[True]) == 1024
+# warm-allocator chunk 2 must not undercut cold-allocator chunk 1
+g2 = object.__new__(elastic.Governor)
+g2.seen, g2.recent, g2.small, g2.margin, g2.extrapolate, g2.debug = {}, [], 4096, 1.25, 2.0, False
+g2.learn(49152, False, 16.92 * GIB, 49152)
+g2.learn(49152, False, 10.29 * GIB, 98304)
+g2.learn(43444, False, 9.04 * GIB, 141748)   # warm tail chunk smaller in tokens must not undercut cold 48K
+assert g2.predict(49152, False, 49152) >= 16.92 * GIB * 1.25 - 1
+assert g2.predict(49152, False, 98304) >= 16.92 * GIB * 1.25 - 1
+
+# torch_guard: compute cap = (total - non_torch_base - guard) / total, skip when disabled or too tight
+import torch
+_orig_info = torch.cuda.mem_get_info
+_orig_res = torch.cuda.memory_reserved
+_orig_set = torch.cuda.set_per_process_memory_fraction
+try:
+    calls = []
+    torch.cuda.mem_get_info = lambda dev=0: (20 * GIB, 71 * GIB)
+    torch.cuda.memory_reserved = lambda dev=0: 18 * GIB
+    torch.cuda.set_per_process_memory_fraction = lambda f, d=0: calls.append((f, d))
+    g2 = elastic.Governor.__new__(elastic.Governor)
+    g2.device = 0
+    g2.extra = 0
+    g2.pools = []
+    g2.row = []
+    g2.torch_guard = 0.0
+    g2._guard_frac = 1.0
+    g2.debug = False
+    g2.apply_torch_guard()
+    assert calls == [], f'guard disabled should not set fraction: {calls}'
+    g2.torch_guard = 1.6 * GIB
+    g2.apply_torch_guard()
+    # non_torch_base = (71 - 20) - 18 = 33 GiB; budget = 71 - 33 - 1.6 = 36.4 GiB -> frac = 36.4 / 71
+    assert len(calls) == 1 and abs(calls[0][0] - 36.4 / 71.0) < 1e-6, calls
+    # Calling again with same state is a no-op (<0.002 hysteresis)
+    g2.apply_torch_guard()
+    assert len(calls) == 1
+finally:
+    torch.cuda.mem_get_info = _orig_info
+    torch.cuda.memory_reserved = _orig_res
+    torch.cuda.set_per_process_memory_fraction = _orig_set
+
 print('elastic needs ok: tightest bound from the needs seen, short prompts unaffected by a long session')

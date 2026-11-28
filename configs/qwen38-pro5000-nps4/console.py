@@ -29,6 +29,10 @@ MODEL = {
     'bench': {'kind': 'agent', 'dec': '192.8', 'pre': '5663 / 5160',
               'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token），prefill = 64K / 500K 会话的冷 prefill'},
     'options': common_options('MTP') + [
+        {'key': 'recall', 'label': '上下文草稿检索', 'default': 'on', 'switch': True,
+         'choices': [['on', '开 · 上下文记忆草稿'], ['off', '关']],
+         'hint': '在内存中索引本会话与近期回复的后缀，并与 MTP 草稿尾部串接续写；主模型验证 100% 无损，改代码/照抄显著提速',
+         'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
         {'key': 'kv', 'label': 'KV 缓存', 'default': 'nvfp4', 'choices': [['nvfp4', 'NVFP4 · 与生产同参'], ['fp8', 'FP8']],
          'off_when': [{'packs': 'off'}]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '24576',
@@ -74,11 +78,14 @@ def build(o, port):
     env.update(LAYOUT='auto' if layout == 'auto' else 'prod', SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN='1',
                XTIER_CACHE_SLOTS='155', XTIER_CACHE_FULL=LAYOUTS[layout])
     if base:   # README "基线": no pack kernels; SGLang's QSA cannot read NVFP4
-        env.update(XTIER_HC_MIX_OVERLAP='0', XTIER_PLE_BLOCK='0', XTIER_QSA_KEYS_PER_CTA='0', XTIER_QSA_FP4='0')
+        env.update(XTIER_HC_MIX_OVERLAP='0', XTIER_PLE_BLOCK='0', XTIER_QSA_KEYS_PER_CTA='0', XTIER_QSA_FP4='0',
+                   XTIER_RECALL='0')
     elif kv == 'fp8_e4m3' and chunk == '32768':
         chunk = '24576'   # 32K chunks need the memory NVFP4 KV frees
     if not base and o['elastic'] == 'on':
         env['XTIER_CACHE_ELASTIC'] = '1'
+    if not base and spec:
+        env['XTIER_RECALL'] = '1' if o.get('recall', 'on') == 'on' else '0'
     env.update(miss_env(o))
     env.update(kv_offload_env(o))
     if o['ple'] == 'nvme':
@@ -96,7 +103,8 @@ def tags(o):
     tail = interleave_tags(o) + kv_offload_tags(o)
     if o['packs'] != 'on':
         return tail
-    extra = (['弹性热专家'] if o['elastic'] == 'on' else []) + (
+    extra = (['Recall'] if o['spec'] == 'on' and o.get('recall', 'on') == 'on' else []) + (
+        ['弹性热专家'] if o['elastic'] == 'on' else []) + (
         [f"未命中 {o['missgpu']}% GPU 代算"] if miss_env(o) else []) + tail
     if o['kv'] != 'nvfp4':
         return ['FP8 KV'] + extra

@@ -163,13 +163,14 @@ assert '--speculative-use-rejection-sampling' not in argv and env['XTIER_FP8_WEI
 assert 'XTIER_CACHE_ELASTIC' not in env
 env, argv = console.build('ds41', console.defaults('ds41'))
 assert env['DSPARK'] == '1' and env['BATCH'] == '49152' and env['XTIER_ENGRAM_CACHE_GIB'] == '4'
-assert env['XTIER_CACHE_SLOTS'] == '35'   # 48K chunks leave the memory of 35 slots; the elastic cache adds up to 68
+assert env['XTIER_CACHE_SLOTS'] == '37'   # 48K chunks + in-place mHC + torch guard leave the memory of 37 slots with >=1.6 GiB usable free up to 400K; elastic adds up to 68
+assert env['XTIER_CACHE_ELASTIC_TORCH_GUARD_GIB'] == '1.6'
 # a chunk size bounds the slots (more would run a long prompt out of GPU memory); the baseline is production's layout
 ds = console.defaults('ds41')
-assert console.build('ds41', {**ds, 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '35'
-assert console.build('ds41', {**ds, 'chunk': '32768', 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '43'
+assert console.build('ds41', {**ds, 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '37'
+assert console.build('ds41', {**ds, 'chunk': '32768', 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '44'
 assert console.build('ds41', {**ds, 'chunk': '22528', 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '50'
-assert console.build('ds41', {**ds, 'chunk': '22528'})[0]['XTIER_CACHE_SLOTS'] == '35'
+assert console.build('ds41', {**ds, 'chunk': '22528'})[0]['XTIER_CACHE_SLOTS'] == '37'
 env0 = console.build('ds41', {**ds, 'packs': 'off'})[0]
 assert env0['BATCH'] == '22528' and env0['XTIER_CACHE_SLOTS'] == '50'
 assert env['XTIER_CACHE_ELASTIC'] == '1' and env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '68'

@@ -1,4 +1,4 @@
-"""Lossless Recall copy-draft acceleration for SGLang DSpark (integrated from Yee-4.1 for XTier)."""
-from .dspark import enabled, install
+"""Backward-compatible shim: universal Recall now lives in xtier.packs.speculative.recall."""
+from xtier.packs.speculative.recall import enabled, install
 
 __all__ = ["enabled", "install"]

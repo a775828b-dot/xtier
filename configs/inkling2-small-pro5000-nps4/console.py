@@ -35,10 +35,10 @@ MODEL = {
     'name': 'Inkling-2 Small', 'code': 'INKLING2-S', 'port': 18195, 'served': 'Inkling-2-Small',
     'spec': 'DSpark', 'arch': '48 层（40 SWA + 8 全局）· 384 专家 top-8 · 40 NVFP4 + 8 MXFP8 · 多模态',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 3600, 'guard_gib': 8,
-    'bench': {'kind': 'agent', 'dec': '66.2', 'pre': '3986 / 1627',
-              'title': '方案 A+（2% 冷专家，45 热槽，12 GiB 可用内存）：64K/500K 文本冷 prefill 3986 / 1627 tok/s，'
-                       '短测速 1 路 74.7 / 2 路 78.4，64K 稳态 decode 66.7（42.0 ms/step）；'
-                       'agent_bench 两轮 64K–500K 长回复 66.2 tok/s（全部 66.3，接受长度 4.02）'},
+    'bench': {'kind': 'agent', 'dec': '73.6', 'pre': '3986 / 1627',
+              'title': '方案 A+（2% 冷专家，45 热槽，开启 Recall）：64K/256K/500K 冷 prefill 3986 / 2514 / 1627 tok/s，'
+                       '短测速 1 路 74.7 / 2 路 81.1（稳态 89.8），500K 缓存 decode 56.0；'
+                       'agent_bench 热态长回复 73.6 tok/s（54.0 ms/step，384K 接受长度 4.93）'},
     'options': _common() + [
         {'key': 'multimodal', 'label': '多模态视觉塔', 'default': 'on', 'switch': True,
          'choices': [['on', '开 · 文本 + 图像'], ['off', '关 · 纯文本']]},
@@ -59,6 +59,10 @@ MODEL = {
          'hint': '通过 OnlineAcceptanceEstimator 按接受概率跳过低收益草稿验证（仅加速不改采样分布，照抄与 PPL/KL 全项无损）',
          'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
         miss_option([{'cold': c} for c in ('02', '08', '15')]),
+        {'key': 'recall', 'label': '上下文草稿检索', 'default': 'on', 'switch': True,
+         'choices': [['on', '开 · 上下文记忆草稿'], ['off', '关']],
+         'hint': '在内存中索引本会话与近期回复的后缀，并与 DSpark MTP 草稿尾部串接续写；主模型验证 100% 无损',
+         'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
         share_option('off', '读长提示时由 CPU 分担路由较少的内存常驻专家块（Inkling-2 MoE 已贴近 PCIe 5.0 线速，默认关以避免内存带宽争用）',
                      [{'packs': 'off'}]),
         interleave_option([['64', '64 步 / 块'], ['32', '32 步 / 块']], '64',
@@ -114,6 +118,7 @@ def build(o, port):
             XTIER_CACHE_ELASTIC_CRITICAL_GIB='0.5',
             XTIER_CACHE_ELASTIC_IDLE_CHUNK='1024' if interleaving else '4',
             XTIER_DSPARK_TRUNCATE=o['truncate'] if o['spec'] == 'on' else '0',
+            XTIER_RECALL=('1' if o.get('recall', 'on') == 'on' else '0') if o['spec'] == 'on' else '0',
         )
         env.update(share_env(o))
     if not plan_b:
@@ -144,6 +149,8 @@ def tags(o):
         out.append('弹性热专家')
     if o['packs'] == 'on' and o['spec'] == 'on' and o['truncate'] != '0':
         out.append(f"在线截断 {o['truncate']}")
+    if o['packs'] == 'on' and o['spec'] == 'on' and o.get('recall', 'on') == 'on':
+        out.append('Recall')
     if o['packs'] == 'on':
         out += share_tags(o)
     return out + interleave_tags(o) + kv_offload_tags(o)

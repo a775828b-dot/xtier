@@ -39,15 +39,19 @@ MODEL = {
     'spec': 'DFly2',
     'arch': '42 层 · 512 专家 top-16 · 5 层原生 DFly2 · 1M 混合 NVFP4 KV (7.95 GB) · Engram 64 GB NVMe · 4 并发',
     'hardware': 'RTX PRO 5000 · 2×EPYC 9334 NPS4', 'ready_timeout': 2400,
-    'bench': {'kind': 'text', 'dec': '92–152 / 225.8 (4并发)', 'pre': '3630 / 3565 / 3454',
-              'title': '1M KV 池 / 4 并发实测（原生 5 层 DFly2 投机 + 置信度截断 0.20 + NVFP4 混合 KV + 234 层 FP8/W8A8 + 48K 分块）：'
-                       'decode = bs=1 实测区间（decode_speed 92.1 / 代码散文稳态 124–152 / 照抄 306 tok/s，876K 缓存 decode 88–111 tok/s）'
-                       '/ bs=4 稳态 225.8（decode_speed 186.8–190.4）；prefill = 100K / 4×128K / 950K'},
+    'bench': {'kind': 'text', 'dec': '94–152 / 225.5 (4并发)', 'pre': '3630 / 3565 / 3454',
+              'title': '1M KV 池 / 4 并发实测（原生 5 层 DFly2 + 图内 Recall + 置信度截断 0.20 + NVFP4 混合 KV + 234 层 FP8/W8A8 + 48K 分块）：'
+                       'decode = bs=1 实测区间（decode_speed 94.0 / 代码散文稳态 124–152 / 照抄 306 tok/s，876K 缓存 decode 88–111 tok/s）'
+                       '/ bs=4 decode_speed 194.4（稳态 225.5）；prefill = 100K / 4×128K / 950K'},
     'options': _common() + [
         {'key': 'truncate', 'label': 'DFly2 置信度截断', 'default': 'on', 'switch': True,
          'choices': [['on', '开 · 阈值 0.20（推荐，无损）'], ['off', '关 · 全量 6 行验证']],
          'hint': '用 DFly2 内置 confidence_head 跳过低存活率尾部草稿的 MoE 专家计算并封顶验证长度（照抄 0 错、PPL 一致）；'
                  'bs=1 步时降 ~14%，bs=4 提速 +23–26%，高置信照抄自动保持满长 6 行（306 tok/s）',
+         'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
+        {'key': 'recall', 'label': '上下文草稿检索', 'default': 'on', 'switch': True,
+         'choices': [['on', '开 · 上下文记忆草稿'], ['off', '关']],
+         'hint': '在内存中索引本会话与近期回复的后缀，并在 DFly2 CUDA 图内与草稿尾部零同步串接续写；主模型验证 100% 无损',
          'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
         {'key': 'kv', 'label': 'KV 缓存精度', 'default': 'nvfp4',
          'choices': [['nvfp4', 'NVFP4 · 7.95 GB（推荐，至多 288 槽）'], ['fp8', 'FP8 · 11.64 GB（至多 256 槽）']],
@@ -93,7 +97,7 @@ def build(o, port):
         env.update(XTIER_HY4_HYBRID_SWA='0', XTIER_HY4_INDEXPOOL_FP8='0',
                    XTIER_FP8_WEIGHTS='0', XTIER_ENGRAM_PREFETCH='0',
                    XTIER_CACHE_ELASTIC='0', XTIER_DRAFT_LMHEAD_FP8='0',
-                   XTIER_DSPARK_TRUNCATE='0')
+                   XTIER_DSPARK_TRUNCATE='0', XTIER_RECALL='0')
     else:
         if o['elastic'] == 'on':
             env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS=ELASTIC_MAX[kv])
@@ -102,6 +106,7 @@ def build(o, port):
         if spec:
             env['XTIER_DRAFT_LMHEAD_FP8'] = '1'
             env['XTIER_DSPARK_TRUNCATE'] = '0.20' if o.get('truncate', 'on') == 'on' else '0'
+            env['XTIER_RECALL'] = '1' if o.get('recall', 'on') == 'on' else '0'
         else:
             env['XTIER_DSPARK_TRUNCATE'] = '0'
     env.update(miss_env(o))
@@ -116,6 +121,8 @@ def tags(o):
         out.append('DFly2')
         if o['packs'] == 'on' and o.get('truncate', 'on') == 'on':
             out.append('置信度截断')
+        if o['packs'] == 'on' and o.get('recall', 'on') == 'on':
+            out.append('Recall')
     if o['packs'] == 'on':
         out.append('NVFP4 KV' if o['kv'] == 'nvfp4' else 'FP8 KV')
         if o['elastic'] == 'on':

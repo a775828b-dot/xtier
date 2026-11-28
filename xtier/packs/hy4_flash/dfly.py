@@ -526,6 +526,8 @@ class HYV4FlashDFly(nn.Module):
             self._conf_probs = None
         for i, layer in enumerate(self.layers):
             layer.indexer.rows = draft_rows[i]
+        from xtier.packs.speculative import recall
+        recall.bind_dfly_buffers(self)
 
     def draft_into_verify(self, input_ids: torch.Tensor, positions: torch.Tensor, forward_batch) -> None:
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -557,6 +559,8 @@ class HYV4FlashDFly(nn.Module):
         finally:
             backend.forward_metadata = metadata
         block_ids[:, 1:] = drafts
+        from xtier.packs.speculative import recall
+        recall.merge_dfly_graph(self, block_ids, positions, bs, width)
         self.candidates_out[:num_rows].copy_(input_ids)
         if self._truncate_threshold > 0 and self.verify_caps is not None and self._conf_probs is not None:
             flags_arg = self.active_flags if self.active_flags is not None else self.verify_caps
@@ -1031,6 +1035,8 @@ def _build_dfly_worker_class():
             width = self.block_size
             prefix_lens = batch.seq_lens
             verify_forward_batch = self._prepare_verify(batch, draft_input)
+            from xtier.packs.speculative import recall
+            recall.prepare_dfly_step(self.dfly, batch, width - 1)
             try:
                 target_out = self.target_worker.forward_batch_generation(
                     batch=None, forward_batch=verify_forward_batch, is_verify=True

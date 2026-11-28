@@ -134,6 +134,8 @@ def detect_scopes(files):
             scopes.add('console')
         if f.startswith('xtier/platform'):
             scopes.add('platform')
+        if f.startswith('xtier/packs/speculative/'):
+            scopes.add('speculative')
         if f.startswith(('xtier/packs/inkling2/', 'configs/inkling2-')):
             scopes.add('inkling2')
         if f.startswith(('xtier/packs/hy4_flash/', 'configs/hy4-flash-')):
@@ -187,8 +189,13 @@ def select_tier1_tests(scopes):
         add('glm_indexer_torch_check', [py, 'tests/glm_indexer_torch_check.py'])
         add('spec_truncate_check', [py, 'tests/spec_truncate_check.py'])
         add('cache_check:glm53', [py, 'tests/cache_check.py', '--preset', 'glm53'], 'glm53')
+    if sc & {'core', 'hooks', 'speculative', 'ds41', 'qwen38', 'glm53', 'hy4', 'inkling2'}:
+        add('recall_universal_check', [py, 'tests/recall_universal_check.py'])
+    if 'speculative' in sc:
+        add('spec_truncate_check', [py, 'tests/spec_truncate_check.py'])
     if 'ds41' in sc:
         add('ds_sparse_mla_check', [py, 'tests/ds_sparse_mla_check.py'])
+        add('ds_mhc_inplace_check', [py, 'tests/ds_mhc_inplace_check.py'])
         add('ds_mxfp8_rows_check', [py, 'tests/ds_mxfp8_rows_check.py'])
         add('ds_wo_a_check', [py, 'tests/ds_wo_a_check.py'])
         add('ds_w8a16_check', [py, 'tests/ds_w8a16_check.py'])

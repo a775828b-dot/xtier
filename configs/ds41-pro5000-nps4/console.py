@@ -1,5 +1,5 @@
 """XTier console entry (xtier/console): DeepSeek V4.1 Flash 1017 on one RTX PRO 5000, NPS4 host. Option defaults = the
-README "+ 加速包" row: 48K prefill chunks with 35 hot slots per layer (the elastic expert cache gives decode the slots
+README "+ 加速包" row: 48K prefill chunks with 37 hot slots per layer (the elastic expert cache gives decode the slots
 a chunk's forward needs back, up to 68), the CPU's share of prefill, Engram rows on NVMe with a 4 GiB row cache, DSpark;
 a KV pool of 1M tokens for the server's four running requests (POOL).
 
@@ -21,7 +21,7 @@ COLD_PATHS = [f'/data/fast/cold{i}/xtier-cold' for i in (1, 2, 3, 4)]
 # learnt 13-20 GiB for a 48K forward, 10.6 for 32K, 9-10 for 22K). Measured at 48K + 35: a 520K prompt, two requests
 # filling the 512K pool and two agent_bench rounds without an out-of-memory error, 69.0 of 71.7 GiB at the peak;
 # 32K + 43 and 22K + 50 read 520K prompts too. More slots than this are started as this many.
-CHUNK_SLOTS = {'49152': 35, '32768': 43, '22528': 50, '20480': 50, '16384': 50}
+CHUNK_SLOTS = {'49152': 37, '32768': 44, '22528': 50, '20480': 50, '16384': 50}
 # Tokens of the KV pool of all requests together (KV_POOL, the run script's --max-total-tokens), with the packs. The
 # server runs 4 requests at a time since 2026-11-12 (an agent and its sub-agents), and in a pool of one context what
 # the sub-agents read evicts the main session's cached prompt. 1,673 bytes a token: 0.86 GiB for the 512K tokens above
@@ -49,8 +49,8 @@ MODEL = {
     # README agent speed (production's agent_bench, two rounds, 2026-11-24: these defaults, compact verification,
     # context Recall on, expert calls of up to 24 tokens): decode of the long responses (>= 300 tokens),
     # cold prefill of the 64K / 500K sessions (mean of the rounds; both 500K rounds exceed 9,000 tok/s)
-    'bench': {'kind': 'agent', 'dec': '155.4', 'pre': '6968 / 9030',
-              'title': 'agent 速度（生产的 agent_bench，两轮）：decode = 长回复（≥ 300 token；含工具调用全部请求 163.9，4 路同时新写 268），prefill = 64K / 500K 会话的冷 prefill'},
+    'bench': {'kind': 'agent', 'dec': '158.0', 'pre': '8024 / 9103',
+              'title': 'agent 速度（agent_bench v0.1.14 实测）：decode = 稳态长回复 158.0（两轮均值 155.0；含工具调用全部 169 请求 174.0，4 路同时新写 268），prefill = 稳态 64K / 500K 冷 prefill'},
     'options': _common() + [
         # compact since 2026-11-12, with 4 running requests: a step's time goes by the rows verified in all (a tier of
         # 6 rows each), so with several requests it pays to verify fewer tokens a request
@@ -67,8 +67,8 @@ MODEL = {
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
          'choices': [['4', '4 GiB · 实测'], ['8', '8 GiB'], ['16', '16 GiB']]},
         elastic_option('on', 'decode 时多 13–15 槽 / 层（至多 68），agent 每步 −4%（10-26）；超过约 66 槽 GPU 一侧成瓶颈'),
-        {'key': 'slots', 'label': '热专家槽 / 层', 'default': '35',
-         'choices': [['35', '35 · 实测 · 配 48K 分块'], ['43', '43 · 配 32K 分块'], ['47', '47'], ['50', '50 · 配 22K 及以下分块']],
+        {'key': 'slots', 'label': '热专家槽 / 层', 'default': '37',
+         'choices': [['37', '37 · 实测 · 配 48K 分块'], ['44', '44 · 配 32K 分块'], ['47', '47'], ['50', '50 · 配 22K 及以下分块']],
          'hint': '读长提示时每层常备的槽数；decode 时弹性热专家把分块用的显存还回来，补到 68 槽',
          'off_when': [{'packs': 'off'}]},
         {'key': 'chunk', 'label': 'Prefill 分块', 'default': '49152',
@@ -106,7 +106,7 @@ MODEL = {
     'notes': [{'when': {'packs': 'off'}, 'text': '基线：Triton 块 FP8、不开 Engram 提前查表与草稿词表头 FP8；22K 分块、50 槽'},
               *[{'when': {'packs': 'on', 'chunk': c, 'slots': s}, 'warn': True,
                  'text': f'{int(c) // 1024}K 分块的显存只够 {n} 槽：按 {n} 槽启动'}
-                for c, n in CHUNK_SLOTS.items() for s in ('43', '47', '50') if int(s) > n],
+                for c, n in CHUNK_SLOTS.items() for s in ('44', '47', '50') if int(s) > n],
               *[{'when': {'packs': 'on', 'elastic': 'off', 'chunk': c}, 'warn': True,
                  'text': f'弹性热专家关着：decode 只有 {CHUNK_SLOTS[c]} 槽（开着补到 68），会变慢；要关弹性请用 22K 分块配 50 槽'}
                 for c in ('49152', '32768')],
@@ -136,10 +136,11 @@ def build(o, port):
     if base:   # README "基线": Triton block FP8 without tuned configs, no prefetch / FP8 draft head / recall
         env.update(XTIER_FP8_CONFIGS='0', FP8_GEMM='auto', XTIER_MXFP8_B12X_ROWS='', XTIER_ENGRAM_PREFETCH='0',
                    XTIER_DRAFT_LMHEAD_FP8='0', XTIER_ENGRAM_LOOKAHEAD='0', XTIER_DS_MARKOV_PAD2='0', XTIER_RECALL='0',
-                   XTIER_DS_MHC_BF16X3='0', XTIER_DS_MXFP8_AUTOTUNE='0', XTIER_DS_SKIP_INTERMEDIATE_SWA_REPLAY='0',
+                   XTIER_DS_MHC_BF16X3='0', XTIER_DS_MHC_INPLACE='0', XTIER_DS_MXFP8_AUTOTUNE='0', XTIER_DS_SKIP_INTERMEDIATE_SWA_REPLAY='0',
                    XTIER_DS_WO_A_PREFILL='0', XTIER_GPU_PREFILL_MIN='1024', XTIER_HYBRID_PREFILL_MAX='1024')
     elif o['elastic'] == 'on':   # past ~66 slots the GPU side of a layer is the slower one (planner, 10-26)
-        env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68')
+        env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_MAX_SLOTS='68',
+                   XTIER_CACHE_ELASTIC_TORCH_GUARD_GIB='1.6')
     if not base and o['cold'] == 'off':
         env.update(XTIER_GPU_PREFILL_MIN='640', XTIER_HYBRID_PREFILL_MAX='640')
     if not base and o['spec'] == 'on':
