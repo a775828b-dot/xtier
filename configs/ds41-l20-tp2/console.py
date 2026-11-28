@@ -22,7 +22,7 @@ SM — the PRO 5000 production tile (128 wide) does not fit. The L20 tuned FP8 G
 configs live in the pack (xtier/packs/deepseek_v4/fp8_configs, device_name=NVIDIA_L20)
 and are tuned per M (decode's M is batch × top-k, 1..48).
 
-The measured numbers are from this box (docs/reports/2026-11-20-l20-tp2-tuning.md).
+The measured numbers are from this box (configs/ds41-l20-tp2/README.md).
 
 Standalone `python -m xtier.console` auto-discovers every configs/*/console.py, so this
 2x-L20 TP=2 card also appears on single-GPU hosts. It needs both cards on separate NUMA
@@ -33,7 +33,7 @@ allowlist the cards a host can actually run.
 import os
 from pathlib import Path
 
-from xtier.console.core import (common_options, elastic_option, interleave_args, interleave_option, interleave_tags,
+from xtier.console.core import (common_options, elastic_option, interleave_option, interleave_tags,
                                 kv_offload_args, kv_offload_env, kv_offload_option, kv_offload_tags,
                                 share_env, share_option, share_tags)
 
@@ -41,7 +41,7 @@ HERE = Path(__file__).resolve().parent
 RUN = HERE / 'run-ds-xtier.sh'      # this config's launch script
 SPS_TABLE = HERE / 'sps-table.json'  # DSpark cost table measured on this box
 
-# The KV pool of all requests together (--max-total-tokens). 1,573, = 6 × 262144:
+# The KV pool of all requests together (--max-total-tokens). 1,572,864 = 6 × 262144:
 # six agents with a 256K context each stay resident. 1,673 bytes a token, so the
 # pool is 2.45 GiB — the expert cache, not the KV pool, is what the VRAM goes to.
 POOL = 1572864
@@ -75,6 +75,10 @@ MODEL = {
          'choices': [['compact', '变长（compact）· 实测'], ['static', '固定（static）· SM89 不可用']],
          'hint': '变长：按本机实测的成本表（sps-table.json）决定每个请求验证几个草稿 token。固定（static）在 SM89 上不可用：'
                  '它要 deep_gemm 的 get_paged_mqa_logits_metadata，而那个在 SM89 上返回 None'},
+        {'key': 'recall', 'label': '上下文草稿检索', 'default': 'on', 'switch': True,
+         'choices': [['on', '开 · 上下文记忆草稿'], ['off', '关']],
+         'hint': '在内存中索引本会话与近期回复的后缀，并与 DSpark 草稿尾部串接续写；主模型验证 100% 无损',
+         'off_when': [{'packs': 'off'}, {'spec': 'off'}]},
         {'key': 'engram', 'label': 'Engram 行缓存', 'default': '4',
          'choices': [['4', '4 GiB · 实测'], ['8', '8 GiB'], ['16', '16 GiB']]},
         elastic_option('on', 'decode 时把只有 prefill 才用的显存借给热专家，prefill 前先还回。'
@@ -119,10 +123,17 @@ def build(o, port):
            'DSPARK': '1' if spec else '0', 'XTIER_ENGRAM_CACHE_GIB': o['engram'],
            'CHUNK': chunk, 'PREFILL_TOKENS': chunk, 'XTIER_CACHE_SLOTS': o['slots'],
            'PDI': '0' if o['interleave'] == 'off' else o['interleave']}
-    if base:   # the README baseline: no elastic cache and no CPU-prefill pack
-        env.update(XTIER_CACHE_ELASTIC='0', XTIER_GPU_PREFILL_MIN='1024')
+    if base:   # the README baseline: no elastic cache, no Recall, no CPU-prefill pack
+        env.update(XTIER_CACHE_ELASTIC='0', XTIER_RECALL='0', XTIER_GPU_PREFILL_MIN='1024')
     else:
-        env['XTIER_CACHE_ELASTIC'] = '1' if o['elastic'] == 'on' else '0'
+        if o['elastic'] == 'on':
+            # Override run-ds-xtier.sh defaults (0.5 / 64) so `slots` is the true resident count and ceiling is 128
+            env.update(XTIER_CACHE_ELASTIC='1', XTIER_CACHE_ELASTIC_BASE='1.0',
+                       XTIER_CACHE_ELASTIC_MAX_SLOTS='128')
+        else:
+            env['XTIER_CACHE_ELASTIC'] = '0'
+        if spec:
+            env['XTIER_RECALL'] = '1' if o.get('recall', 'on') == 'on' else '0'
         env.update(share_env(o))
         if spec and o['verify'] == 'compact':   # sps-table.json budgets compact verification
             env.update(SGLANG_RAGGED_VERIFY_MODE='compact', SPS_TABLE=str(SPS_TABLE))
@@ -141,5 +152,7 @@ def tags(o):
             out.append('elastic')
         if o['spec'] == 'on' and o['verify'] == 'compact':
             out.append('compact verify')
+        if o['spec'] == 'on' and o.get('recall', 'on') == 'on':
+            out.append('Recall')
         out += share_tags(o)
     return out + interleave_tags(o) + kv_offload_tags(o)

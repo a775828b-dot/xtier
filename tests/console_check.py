@@ -171,6 +171,11 @@ assert console.build('ds41', {**ds, 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '
 assert console.build('ds41', {**ds, 'chunk': '32768', 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '44'
 assert console.build('ds41', {**ds, 'chunk': '22528', 'slots': '50'})[0]['XTIER_CACHE_SLOTS'] == '50'
 assert console.build('ds41', {**ds, 'chunk': '22528'})[0]['XTIER_CACHE_SLOTS'] == '37'
+l20 = console.defaults('ds41-l20')
+l20_env = console.build('ds41-l20', l20)[0]
+assert l20_env['XTIER_CACHE_SLOTS'] == '32' and l20_env['XTIER_CACHE_ELASTIC_BASE'] == '1.0'
+assert l20_env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '128' and l20_env['XTIER_RECALL'] == '1'
+assert console.build('ds41-l20', {**l20, 'packs': 'off'})[0]['XTIER_RECALL'] == '0'
 env0 = console.build('ds41', {**ds, 'packs': 'off'})[0]
 assert env0['BATCH'] == '22528' and env0['XTIER_CACHE_SLOTS'] == '50'
 assert env['XTIER_CACHE_ELASTIC'] == '1' and env['XTIER_CACHE_ELASTIC_MAX_SLOTS'] == '68'
